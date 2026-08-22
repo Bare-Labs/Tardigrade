@@ -65,12 +65,14 @@ const Scenario = enum {
                 .rationale = "header-heavy buffered proxy response parsing owns filtered metadata in an arena; serialization writes through caller-owned buffers",
             },
             // Location matching reads process/config-owned route metadata and
-            // returns borrowed slices. A request workspace would be the wrong
-            // owner for these references.
+            // returns borrowed route slices. Regex matching now routes Zig
+            // scratch through the request allocator so this budget can observe
+            // the allocation boundary; POSIX regcomp may still allocate
+            // internally through libc.
             .mixed_route_selection => .{
-                .max_allocations_per_request = 0,
-                .max_bytes_per_request = 0,
-                .rationale = "mixed route selection borrows immutable config-owned location blocks and allocates no request memory",
+                .max_allocations_per_request = 12,
+                .max_bytes_per_request = 1024,
+                .rationale = "mixed route selection borrows config-owned locations; regex scratch is request-allocator-owned while libc regcomp remains external",
             },
             // Rejections are not the steady-state success path; JSON payload and
             // response headers are intentionally allocated for clear client errors.
@@ -268,7 +270,7 @@ fn measureScenario(allocator: std.mem.Allocator, requests: usize, scenario: Scen
             .static_304_conditional => try runStaticNotModified(fixture, measured_allocator),
             .proxy_keepalive_warm => try runProxyKeepaliveWarm(measured_allocator),
             .proxy_header_heavy_response => try runProxyHeaderHeavyResponse(measured_allocator),
-            .mixed_route_selection => try runMixedRouteSelection(),
+            .mixed_route_selection => try runMixedRouteSelection(measured_allocator),
             .rejected_overload => try runRejectedOverload(measured_allocator),
         }
     }
@@ -377,7 +379,7 @@ fn runProxyHeaderHeavyResponse(allocator: std.mem.Allocator) !void {
     if (std.mem.find(u8, out, "{\"ok\":true}\n") == null) return error.ProxyHeaderHeavyMissingBody;
 }
 
-fn runMixedRouteSelection() !void {
+fn runMixedRouteSelection(allocator: std.mem.Allocator) !void {
     const blocks = [_]http.location_router.LocationBlock{
         .{
             .match_type = .prefix,
@@ -411,16 +413,16 @@ fn runMixedRouteSelection() !void {
         },
     };
 
-    const exact = http.location_router.matchLocation("/status/metrics?format=prom", &blocks) orelse return error.MixedRouteSelectionMissedExact;
+    const exact = http.location_router.matchLocation(allocator, "/status/metrics?format=prom", &blocks) orelse return error.MixedRouteSelectionMissedExact;
     if (exact.index != 3) return error.MixedRouteSelectionWrongExact;
 
-    const priority = http.location_router.matchLocation("/api/private/users", &blocks) orelse return error.MixedRouteSelectionMissedPriority;
+    const priority = http.location_router.matchLocation(allocator, "/api/private/users", &blocks) orelse return error.MixedRouteSelectionMissedPriority;
     if (priority.index != 2) return error.MixedRouteSelectionWrongPriority;
 
-    const regex = http.location_router.matchLocation("/assets/site.css?v=1", &blocks) orelse return error.MixedRouteSelectionMissedRegex;
+    const regex = http.location_router.matchLocation(allocator, "/assets/site.css?v=1", &blocks) orelse return error.MixedRouteSelectionMissedRegex;
     if (regex.index != 4) return error.MixedRouteSelectionWrongRegex;
 
-    const prefix = http.location_router.matchLocation("/api/users", &blocks) orelse return error.MixedRouteSelectionMissedPrefix;
+    const prefix = http.location_router.matchLocation(allocator, "/api/users", &blocks) orelse return error.MixedRouteSelectionMissedPrefix;
     if (prefix.index != 1) return error.MixedRouteSelectionWrongPrefix;
 }
 
