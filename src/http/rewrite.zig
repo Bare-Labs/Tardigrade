@@ -123,7 +123,12 @@ pub fn regexMatches(pattern: []const u8, input: []const u8) bool {
 }
 
 pub fn regexMatchesOptions(pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
-    const allocator = std.heap.page_allocator;
+    return regexMatchesOptionsAlloc(std.heap.page_allocator, pattern, input, case_insensitive);
+}
+
+pub fn regexMatchesOptionsAlloc(allocator: std.mem.Allocator, pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
+    if (anchoredLiteralPrefixCannotMatch(pattern, input, case_insensitive)) return false;
+
     var prepared = preparePattern(allocator, pattern) catch return false;
     defer prepared.deinit();
 
@@ -145,6 +150,28 @@ pub fn regexMatchesOptions(pattern: []const u8, input: []const u8, case_insensit
     if (compile_rc != 0) return false;
     defer regfree(&regex);
     return regexec(&regex, input_z_ptr, 0, null, 0) == 0;
+}
+
+fn anchoredLiteralPrefixCannotMatch(pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
+    if (case_insensitive) return false;
+    const prefix = anchoredLiteralPrefix(pattern);
+    if (prefix.len == 0) return false;
+    if (input.len < prefix.len) return true;
+    return !std.mem.eql(u8, input[0..prefix.len], prefix);
+}
+
+fn anchoredLiteralPrefix(pattern: []const u8) []const u8 {
+    if (pattern.len < 2 or pattern[0] != '^') return "";
+    if (std.mem.indexOfScalar(u8, pattern, '|') != null) return "";
+    var end: usize = 1;
+    while (end < pattern.len) : (end += 1) {
+        switch (pattern[end]) {
+            '*', '?', '{' => return "",
+            '.', '[', ']', '(', ')', '}', '+', '$', '^', '\\' => break,
+            else => {},
+        }
+    }
+    return pattern[1..end];
 }
 
 pub fn evaluate(
@@ -373,6 +400,16 @@ test "regexMatches supports simple pattern" {
 test "regexMatchesOptions supports case-insensitive matches" {
     try std.testing.expect(regexMatchesOptions("^example\\.com$", "Example.COM", true));
     try std.testing.expect(!regexMatchesOptions("^example\\.com$", "Example.COM", false));
+}
+
+test "regexMatchesOptions skips anchored literal prefix misses" {
+    try std.testing.expect(anchoredLiteralPrefixCannotMatch("^/assets/.+\\.css$", "/prefix/health", false));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/assets/.+\\.css$", "/assets/site.css", false));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("/assets/.+\\.css$", "/prefix/health", false));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^Example", "other", true));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^Ä", "äpfel", true));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/assets|/prefix", "/prefix/health", false));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/prefix/?health$", "/prefixhealth", false));
 }
 
 test "evaluate applies rewrite and return rules" {
