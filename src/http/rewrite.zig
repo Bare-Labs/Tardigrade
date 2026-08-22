@@ -153,12 +153,11 @@ pub fn regexMatchesOptionsAlloc(allocator: std.mem.Allocator, pattern: []const u
 }
 
 fn anchoredLiteralPrefixCannotMatch(pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
+    if (case_insensitive) return false;
     const prefix = anchoredLiteralPrefix(pattern);
     if (prefix.len == 0) return false;
     if (input.len < prefix.len) return true;
-    const input_prefix = input[0..prefix.len];
-    if (!case_insensitive) return !std.mem.eql(u8, input_prefix, prefix);
-    return !std.ascii.eqlIgnoreCase(input_prefix, prefix);
+    return !std.mem.eql(u8, input[0..prefix.len], prefix);
 }
 
 fn anchoredLiteralPrefix(pattern: []const u8) []const u8 {
@@ -407,8 +406,8 @@ test "regexMatchesOptions skips anchored literal prefix misses" {
     try std.testing.expect(anchoredLiteralPrefixCannotMatch("^/assets/.+\\.css$", "/prefix/health", false));
     try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/assets/.+\\.css$", "/assets/site.css", false));
     try std.testing.expect(!anchoredLiteralPrefixCannotMatch("/assets/.+\\.css$", "/prefix/health", false));
-    try std.testing.expect(anchoredLiteralPrefixCannotMatch("^Example", "other", true));
-    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^Example", "example-path", true));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^Example", "other", true));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^Ä", "äpfel", true));
     try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/assets|/prefix", "/prefix/health", false));
     try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/prefix/?health$", "/prefixhealth", false));
 }
