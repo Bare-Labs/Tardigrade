@@ -1658,20 +1658,35 @@ fn decodeChunkedBody(allocator: std.mem.Allocator, encoded: []const u8, max_byte
     }
 }
 
-/// Whether `transport` already has decrypted/decoded bytes buffered above
-/// the raw fd (e.g. a TLS record layer that read more of the socket than one
-/// call needed, or over-read past the handshake into the first response
-/// bytes). Polling the raw fd for *new* readability in that case is wrong —
-/// the peer may have nothing further to send until it gets our next
-/// request, so the poll would starve out its own deadline waiting for bytes
-/// that already arrived. Mirrors `upstream_h2.zig`'s existing `if
-/// (transport.pending() > 0) return;` guard. `transport` types without a
-/// `pending()` method (e.g. `compat.NetStream`, the plaintext transport)
-/// have nothing to buffer above the fd, so they always poll normally.
+/// Whether `transport`'s next `read()` call is already known to return
+/// without needing the raw fd to become readable first. Two cases:
+///
+/// 1. `transport` already has decrypted/decoded bytes buffered above the raw
+///    fd (e.g. a TLS record layer that read more of the socket than one call
+///    needed, or over-read past the handshake into the first response
+///    bytes). Polling the raw fd for *new* readability in that case is wrong
+///    — the peer may have nothing further to send until it gets our next
+///    request, so the poll would starve out its own deadline waiting for
+///    bytes that already arrived. Mirrors `upstream_h2.zig`'s existing `if
+///    (transport.pending() > 0) return;` guard.
+/// 2. `transport` already knows its next `read()` returns `0` regardless of
+///    the fd — e.g. a TLS transport that has already seen the peer's
+///    `close_notify`. `close_notify` is a half-close signal (RFC 8446 §6.1):
+///    the peer's raw TCP socket often stays open afterward (waiting for this
+///    side's own `close_notify`), so the raw fd can legitimately never show
+///    readable even though `read()` itself would return immediately —
+///    observed as a close-delimited streamed body hanging for the full
+///    deadline instead of completing (#634). Transports that know this
+///    expose it as `readReady()`, preferred over `pending()` when present.
+///
+/// `transport` types with neither method (e.g. `compat.NetStream`, the
+/// plaintext transport) have no buffering/half-close distinction above the
+/// fd, so they always poll normally.
 fn transportHasBufferedInput(transport: anytype) bool {
     const T = @TypeOf(transport);
     const info = @typeInfo(T);
     const Target = if (info == .pointer) info.pointer.child else T;
+    if (@hasDecl(Target, "readReady")) return transport.readReady();
     if (!@hasDecl(Target, "pending")) return false;
     return transport.pending() > 0;
 }

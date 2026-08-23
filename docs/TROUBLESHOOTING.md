@@ -657,6 +657,15 @@ coverage gap, not a misconfiguration, and disabling verification is still not
 the fix. Until the native matrix is extended, such an origin needs
 `-Dtls-profile=general` (OpenSSL) to be proxied with verification enabled.
 
+Independently of signature support, the native handshake engine also caps
+each peer certificate entry at 2048 DER bytes and the whole handshake
+message at 8 KiB (`src/tls/tls13_backend.zig`'s `max_certificate_len`/
+`max_message_len`). An origin whose certificate/chain exceeds either bound
+fails closed here even with an otherwise-supported signature algorithm — a
+plain Ed25519 leaf with a large SAN set, or a multi-certificate chain, can
+cross this. Same remedy as above: `-Dtls-profile=general` until the bound is
+raised.
+
 #### Verify the fix
 
 ```bash

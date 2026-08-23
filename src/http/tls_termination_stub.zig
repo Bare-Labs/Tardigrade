@@ -623,6 +623,27 @@ pub const UpstreamTlsConn = struct {
         return self.state.record.inbound_plaintext.len;
     }
 
+    /// Whether the next `read()` call is guaranteed to return without
+    /// needing the raw fd to become readable first: either there is already
+    /// buffered plaintext (`pending() > 0`), or the peer has already sent a
+    /// clean TLS shutdown (`close_notify`), in which case `read()` returns
+    /// `0` immediately regardless of the fd.
+    ///
+    /// This second case matters because `close_notify` is a *half-close*
+    /// signal (RFC 8446 §6.1): the peer's raw TCP socket often stays open
+    /// afterward, e.g. waiting for this side to send its own `close_notify`
+    /// back — which this client does not currently do. A caller that
+    /// `poll()`s the raw fd for readability before calling `read()` (as
+    /// `gateway_proxy.zig`'s close-delimited-body relay does, to avoid
+    /// starving its own deadline against buffered-but-unpolled bytes) would
+    /// otherwise wait out its *entire* deadline on every such connection,
+    /// even though `read()` itself would not block at all. Observed as a
+    /// streamed close-delimited response hanging for the full upstream
+    /// response timeout instead of completing immediately (#634).
+    pub fn readReady(self: *const UpstreamTlsConn) bool {
+        return self.state.record.inbound_plaintext.len > 0 or self.state.record.peer_closed;
+    }
+
     /// The ALPN protocol validated immediately after the handshake completed.
     pub fn negotiatedProtocol(self: *const UpstreamTlsConn) NegotiatedProtocol {
         return self.protocol;

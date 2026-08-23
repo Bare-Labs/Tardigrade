@@ -329,7 +329,10 @@ signatures made with Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 only
 (the pre-existing #343 native signature matrix); an origin signed with
 classic RSA PKCS#1 v1.5 or another unsupported algorithm fails verification
 even with a correct CA bundle and hostname (see `docs/TROUBLESHOOTING.md`).
-`general` has no such restriction.
+Independently, `appliance`/`native` also caps each peer certificate entry at
+2048 DER bytes and the whole handshake message at 8 KiB; a certificate or
+chain exceeding either bound fails even when its signature algorithm is
+otherwise supported. `general` has neither restriction.
 
 ### Health Checks And Circuit Breaking
 

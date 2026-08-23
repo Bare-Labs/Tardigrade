@@ -96,7 +96,19 @@ the binary. There is no runtime switch and no fallback between profiles.
   signature matrix to cover RSA PKCS#1 v1.5 (and other common public-CA
   variants) is tracked separately; until then, native-profile upstream HTTPS
   is production-ready only against origins whose certificate chain uses one
-  of the three supported signature algorithms.
+  of the three supported signature algorithms — **and even then, only within
+  the size caveat below.**
+  **Certificate/handshake size caveat:** independently of the signature
+  matrix, `src/tls/tls13_backend.zig` hard-caps every peer `CertificateEntry`
+  at `max_certificate_len` (2048 bytes) and the whole handshake message at
+  `max_message_len` (8 KiB), rejected before the signature/verifier code
+  ever runs. A certificate does not need an unsupported algorithm to cross
+  this: an Ed25519 leaf — already supported — can exceed 2 KiB DER with a
+  moderately large SAN set, and a multi-certificate public chain can exceed
+  the aggregate 8 KiB bound even with small individual certificates. So
+  closing #645 alone does not make native-profile upstream HTTPS
+  production-ready against arbitrary ordinary public HTTPS origins; this is
+  a second, independent blocker, tracked by #646.
 - Must not link `libssl`, `libcrypto`, or any other foreign TLS, crypto, QUIC,
   HTTP/3, or certificate library — audited identically to the appliance
   profile.
@@ -222,17 +234,28 @@ alongside the release assets and SBOM.
 - [ ] Native upstream HTTPS/TLS client is **production-ready against ordinary
       public HTTPS origins** (#634's actual upstream criterion) — **not yet
       true, and this is a partial implementation until this box is checked.**
-      Verification currently authenticates only Ed25519, ECDSA P-256/SHA-256,
-      and RSA-PSS/SHA-256 certificate-chain signatures (the pre-existing #343
-      matrix, see the caveat above); a public origin signed with classic RSA
-      PKCS#1 v1.5 — still common among public CAs — or another unsupported
-      algorithm fails closed with a native-profile 502 even with a correct CA
-      bundle and hostname. Tracked by #645.
+      Two independent, tracked gaps currently block it:
+      1. Verification currently authenticates only Ed25519, ECDSA
+         P-256/SHA-256, and RSA-PSS/SHA-256 certificate-chain signatures (the
+         pre-existing #343 matrix, see the caveat above); a public origin
+         signed with classic RSA PKCS#1 v1.5 — still common among public CAs
+         — or another unsupported algorithm fails closed with a
+         native-profile 502 even with a correct CA bundle and hostname.
+         Tracked by #645.
+      2. Independently of signature support, the shared handshake engine's
+         `max_certificate_len` (2048 bytes/entry) and `max_message_len`
+         (8 KiB total) bounds reject some otherwise-valid, already-supported
+         public certificates/chains purely on size (see the caveat above).
+         Tracked by #646.
+      Both #645 and #646 must land before this box can be checked — closing
+      either one alone is not sufficient.
 - [ ] Native certificate-signature matrix (`src/pki/verify.zig`) extended to
       cover classic RSA PKCS#1 v1.5 (and other common public-WebPKI signature
       variants) so native-profile upstream verification is not restricted to
-      a subset of real-world certificate authorities. Closing this item also
-      closes the one directly above (#645).
+      a subset of real-world certificate authorities (#645).
+- [ ] Native handshake engine's client-role certificate/message size bounds
+      made practical for ordinary public WebPKI chains without weakening the
+      fail-closed posture for genuinely oversized ones (#646).
 - [x] Default downstream identity SAN/SNI eligibility: a default certificate
       may satisfy a requested SNI its own SAN actually covers, without
       requiring an explicit `TARDIGRADE_TLS_SNI_CERTS` entry; explicit

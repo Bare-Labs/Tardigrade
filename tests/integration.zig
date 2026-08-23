@@ -17497,6 +17497,126 @@ test "native upstream https: verified request to a trusted upstream succeeds" {
     try assertContains(response.body, "native-upstream-trusted-body");
 }
 
+// Proves the native upstream client's mTLS wiring end-to-end: this PR is the
+// first place that loads a client identity and installs a
+// `FixedCredentialProvider` onto `UpstreamTlsConn` (`connect()`'s
+// `opts.client_cert_path`/`client_key_path` handling), so engine-level
+// coverage of the shared TLS 1.3 client-auth flight
+// (`CertificateRequest` -> `beginClientAuthFlight` -> Certificate/
+// CertificateVerify) does not by itself prove this adapter/config path
+// actually presents a certificate. `openssl s_server -Verify 1` refuses any
+// peer without one, so a successful exchange proves the configured
+// certificate was presented, and the control case without it proves the
+// success isn't explained by an origin that merely requests but doesn't
+// require one.
+test "native upstream https: client certificate (mTLS) required by the origin" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    var origin_dir = try GenericFixtureDir.create(allocator, "native-upstream-mtls");
+    defer origin_dir.deinit();
+    try origin_dir.writeRel("hello.txt", "native-upstream-mtls-body");
+
+    // The origin's own server identity (what our client verifies via
+    // WebPkiVerifier) is the same Ed25519 fixture the other native upstream
+    // tests use -- within the currently-supported native signature matrix
+    // (#645), so this test isolates mTLS wiring from that unrelated gap.
+    const leaf_cert = try upstreamTlsFixture("native_ed25519_chain.crt", allocator);
+    defer allocator.free(leaf_cert);
+    const leaf_key = try upstreamTlsFixture("native_ed25519.key", allocator);
+    defer allocator.free(leaf_key);
+    const server_ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
+    defer allocator.free(server_ca_cert);
+    // The client certificate's own signature algorithm is verified by
+    // openssl (the origin), never by our native client, so reusing the
+    // existing RSA downstream-mTLS fixtures here is unaffected by #645 --
+    // this exercises the native client's own CertificateVerify *signing*
+    // path (RSA-PSS over this RSA key), a different operation from chain
+    // signature verification.
+    const client_ca_cert = try applianceFixturePath(allocator, "ca.crt");
+    defer allocator.free(client_ca_cert);
+    const client_cert = try applianceFixturePath(allocator, "client.crt");
+    defer allocator.free(client_cert);
+    const client_key = try applianceFixturePath(allocator, "client.key");
+    defer allocator.free(client_key);
+
+    var origin = try OpensslUpstreamServer.start(allocator, origin_dir.dir_abs, &.{
+        "-cert",   leaf_cert,
+        "-key",    leaf_key,
+        "-Verify", "1",
+        "-CAfile", client_ca_cert,
+    });
+    defer origin.stop();
+
+    const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
+    defer allocator.free(upstream_url);
+
+    // With the client certificate configured: the handshake presents it and
+    // the proxied request succeeds.
+    {
+        var tardigrade = try TardigradeProcess.start(allocator, .{
+            .config_text =
+            \\location /secure/ {
+            \\    proxy_pass /;
+            \\}
+            ,
+            .extra_env = &.{
+                .{ .name = "TARDIGRADE_UPSTREAM_BASE_URL", .value = upstream_url },
+                .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+                .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = server_ca_cert },
+                .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT", .value = client_cert },
+                .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", .value = client_key },
+                // `openssl s_server -WWW`'s response is close-delimited (no
+                // Content-Length, see `startNativeUpstreamTardigrade`'s doc
+                // comment above) -- the buffered upstream reader expects a
+                // definite length, so this needs the streaming relay, which
+                // already handles close-delimited bodies (#196).
+                .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            },
+        });
+        defer tardigrade.stop();
+
+        var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/secure/hello.txt",
+            .body = null,
+            .headers = &.{},
+        }, 10_000);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status_code);
+        try assertContains(response.body, "native-upstream-mtls-body");
+    }
+
+    // Control: without a configured client certificate, the origin's
+    // `-Verify 1` refuses the handshake, so the proxied request must fail
+    // closed with a bounded gateway error.
+    {
+        var tardigrade = try TardigradeProcess.start(allocator, .{
+            .config_text =
+            \\location /secure/ {
+            \\    proxy_pass /;
+            \\}
+            ,
+            .extra_env = &.{
+                .{ .name = "TARDIGRADE_UPSTREAM_BASE_URL", .value = upstream_url },
+                .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+                .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = server_ca_cert },
+            },
+        });
+        defer tardigrade.stop();
+
+        var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/secure/hello.txt",
+            .body = null,
+            .headers = &.{},
+        }, 10_000);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 502), response.status_code);
+    }
+}
+
 test "native upstream https: hostname mismatch fails closed" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
