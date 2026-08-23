@@ -8,11 +8,16 @@
 //! Usage:
 //!   h3_interop_tool server --port N --cert cert.der --key key.pkcs8.der \
 //!       [--response-body STR] [--requests N] [--expect-hrr] [--verbose] \
-//!       [--qlog-dir DIR] [--keylog-path FILE]
+//!       [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]
 //!   h3_interop_tool client --host A.B.C.D --port N --authority NAME \
 //!       --path /p [--body STR] [--empty-initial-key-share] \
 //!       [--expect-hrr] [--insecure | --pin cert.der] [--verbose] \
-//!       [--qlog-dir DIR] [--keylog-path FILE]
+//!       [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]
+//!
+//! `--qlog-dialect` defaults to `current` (the standard `QlogFileSeq`
+//! header). Pass `qvis-legacy` only when generating an artifact meant to be
+//! opened in the hosted qvis tool's older `.sqlog` loader (#625) — it is not
+//! a standard-schema declaration and should not be used for other purposes.
 //!
 //! The client exits 0 once it has received a complete response (status and
 //! body are printed to stdout). The server exits 0 after serving --requests
@@ -57,6 +62,7 @@ const ArtifactSink = struct {
         keylog_path: []const u8,
         mode: Args.Mode,
         group_id: []const u8,
+        qlog_dialect: quic.qlog.HeaderDialect,
     ) !ArtifactSink {
         var sink = ArtifactSink{};
         errdefer sink.deinit();
@@ -76,7 +82,7 @@ const ArtifactSink = struct {
                 .group_id = group_id,
                 .title = "tardigrade-h3-interop",
                 .description = "Tardigrade HTTP/3 external interop debug trace",
-            }, &header_buf);
+            }, qlog_dialect, &header_buf);
             try file.writeAll(header);
             sink.qlog_file = file;
         }
@@ -272,6 +278,10 @@ const Args = struct {
     empty_initial_key_share: bool = false,
     expect_hrr: bool = false,
     qlog_dir: []const u8 = "",
+    /// #625: `.current` (default) is the standard `QlogFileSeq` header; pass
+    /// `--qlog-dialect qvis-legacy` only when the artifact is meant to be
+    /// opened in the hosted qvis tool's older `.sqlog` loader.
+    qlog_dialect: quic.qlog.HeaderDialect = .current,
     keylog_path: []const u8 = "",
     /// #338: the shared conformance-matrix negotiation tuple. Left empty, the
     /// tool offers QUIC's ordinary default policy exactly as before.
@@ -381,6 +391,14 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
             args.expect_alpn = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, arg, "--qlog-dir")) {
             args.qlog_dir = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, arg, "--qlog-dialect")) {
+            const value = it.next() orelse return error.MissingValue;
+            args.qlog_dialect = if (std.mem.eql(u8, value, "current"))
+                .current
+            else if (std.mem.eql(u8, value, "qvis-legacy"))
+                .qvis_legacy
+            else
+                return error.UnknownQlogDialect;
         } else if (std.mem.eql(u8, arg, "--keylog-path")) {
             args.keylog_path = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else {
@@ -776,8 +794,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(allocator, init.args) catch |err| {
         std.debug.print(
             "h3-interop: bad arguments ({s})\n" ++
-                "usage: h3_interop_tool server --port N --cert cert.pem --key key.pem [--requests N] [--expect-hrr] [--qlog-dir DIR] [--keylog-path FILE]\n" ++
-                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der] [--qlog-dir DIR] [--keylog-path FILE]\n" ++
+                "usage: h3_interop_tool server --port N --cert cert.pem --key key.pem [--requests N] [--expect-hrr] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
+                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
                 "\nnegotiation (#338, shared vocabulary with tls_interop_tool):\n" ++
                 matrix.flag_usage,
             .{@errorName(err)},
@@ -801,7 +819,7 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     var odcid: [8]u8 = undefined;
     randomBytes(&odcid);
     var group_id_buf: [16]u8 = undefined;
-    var artifacts = try ArtifactSink.init(allocator, args.qlog_dir, args.keylog_path, .client, cidHex(&odcid, &group_id_buf));
+    var artifacts = try ArtifactSink.init(allocator, args.qlog_dir, args.keylog_path, .client, cidHex(&odcid, &group_id_buf), args.qlog_dialect);
     defer artifacts.deinit();
     defer artifacts.reportDiagnostics();
     if (args.keylog_path.len > 0) {
@@ -984,7 +1002,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         const crypto_provider = crypto_provider_state.cryptoProvider();
         var backend = tls_backend.Tls13Backend.initServerWithPolicy(randomEntropy(), crypto_provider, identity, quicPolicy(&args));
         var group_id_buf: [16]u8 = undefined;
-        var artifacts = try ArtifactSink.init(allocator, args.qlog_dir, args.keylog_path, .server, cidHex(parsed.dcid, &group_id_buf));
+        var artifacts = try ArtifactSink.init(allocator, args.qlog_dir, args.keylog_path, .server, cidHex(parsed.dcid, &group_id_buf), args.qlog_dialect);
         defer artifacts.deinit();
         defer artifacts.reportDiagnostics();
         if (args.keylog_path.len > 0) {
@@ -1116,13 +1134,13 @@ test "artifact sink appends keylog lines across repeated connection sinks" {
     const secret_a = [_]u8{0xaa} ** 32;
     const secret_b = [_]u8{0xbb} ** 32;
 
-    var first = try ArtifactSink.init(allocator, "", keylog_path, .server, "first");
+    var first = try ArtifactSink.init(allocator, "", keylog_path, .server, "first", .current);
     var first_context = first.keylogContext(.server);
     try first_context.setClientRandom(&random_a);
     first_context.emitSecret(.handshake, .write, &secret_a);
     first.deinit();
 
-    var second = try ArtifactSink.init(allocator, "", keylog_path, .server, "second");
+    var second = try ArtifactSink.init(allocator, "", keylog_path, .server, "second", .current);
     var second_context = second.keylogContext(.server);
     try second_context.setClientRandom(&random_b);
     second_context.emitSecret(.handshake, .write, &secret_b);
@@ -1146,7 +1164,7 @@ test "artifact sink writes qlog header connection start and representative event
     const qlog_dir = try std.fmt.allocPrint(allocator, "{s}/qlog", .{root});
     defer allocator.free(qlog_dir);
 
-    var sink = try ArtifactSink.init(allocator, qlog_dir, "", .server, "0011223344556677");
+    var sink = try ArtifactSink.init(allocator, qlog_dir, "", .server, "0011223344556677", .current);
     sink.emitQuicQlog(.{ .connection_started = .{
         .odcid_len = 8,
         .scid_len = 8,

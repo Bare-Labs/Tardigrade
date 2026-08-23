@@ -1167,10 +1167,10 @@ test "qlog composition root interleaves transport and h3 records under one heade
     const header = try qlog.writeTraceHeader(.{
         .vantage_point = .server,
         .group_id = "0011223344556677",
-    }, file[len..]);
+    }, .current, file[len..]);
     len += header.len;
 
-    try expectQlogRecord(header, "{\"file_schema\":\"urn:ietf:params:qlog:file:sequential\",\"serialization_format\":\"application/qlog+json-seq\",\"qlog_version\":\"0.3\",\"qlog_format\":\"JSON-SEQ\",\"title\":\"tardigrade-quic\",\"description\":\"Tardigrade QUIC/HTTP-3 debug trace\",\"trace\":{\"common_fields\":{\"group_id\":\"0011223344556677\",\"time_format\":\"relative_to_epoch\",\"reference_time\":{\"clock_type\":\"monotonic\",\"epoch\":\"unknown\"}},\"vantage_point\":{\"type\":\"server\"},\"event_schemas\":[\"urn:ietf:params:qlog:events:quic-13\",\"urn:ietf:params:qlog:events:http3-13\",\"https://bare.systems/tardigrade/qlog/events/debug-1\"]}}");
+    try expectQlogRecord(header, "{\"file_schema\":\"urn:ietf:params:qlog:file:sequential\",\"serialization_format\":\"application/qlog+json-seq\",\"title\":\"tardigrade-quic\",\"description\":\"Tardigrade QUIC/HTTP-3 debug trace\",\"trace\":{\"common_fields\":{\"group_id\":\"0011223344556677\",\"time_format\":\"relative_to_epoch\",\"reference_time\":{\"clock_type\":\"monotonic\",\"epoch\":\"unknown\"}},\"vantage_point\":{\"type\":\"server\"},\"event_schemas\":[\"urn:ietf:params:qlog:events:quic-13\",\"urn:ietf:params:qlog:events:http3-13\",\"https://bare.systems/tardigrade/qlog/events/debug-1\"]}}");
 
     const connection_started = try qlog.writeJson(.{
         .time_us = 500,

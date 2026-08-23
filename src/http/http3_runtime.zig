@@ -670,7 +670,7 @@ pub const ObservabilityArtifacts = struct {
             const header = try quic.qlog.writeTraceHeader(.{
                 .group_id = try std.fmt.bufPrint(&group_buf, "{x:0>16}", .{handle}),
                 .vantage_point = .server,
-            }, &header_buf);
+            }, .current, &header_buf);
             try file.writeAll(header);
             const trace = try state.allocator.create(Trace);
             trace.* = .{ .path = path, .file = file };
