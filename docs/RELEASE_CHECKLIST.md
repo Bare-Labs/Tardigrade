@@ -28,6 +28,11 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] Confirm `scripts/release-metadata.sh` resolves the intended tag/version
 - [ ] Update `docs/SUPPORT_MATRIX.md` when public behavior or maturity claims changed
 - [ ] Run `./scripts/test-install.sh` against a ReleaseFast native build (`-Dtls-profile=native`)
+- [ ] Render the Homebrew formula from this release's
+      `tardigrade-checksums.txt` with `./scripts/update-homebrew-formula.sh`,
+      run `ruby -c packaging/homebrew/tardigrade.rb`, and run
+      `./scripts/test-homebrew-formula.sh` on each Homebrew environment the
+      release honestly supports
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker
 - [ ] Run `./scripts/test-rpm-package.sh` on a Linux host with Docker
 - [ ] Verify release packaging paths and checksums, including the Linux
@@ -40,6 +45,10 @@ Use this checklist before tagging and distributing a Tardigrade release.
       no forbidden foreign TLS/crypto/QUIC/H3 dependency
 - [ ] Verify published DEB/RPM metadata does not declare OpenSSL/libssl/libcrypto
       as a Tardigrade runtime dependency
+- [ ] Copy the rendered Homebrew formula and README into
+      `Bare-Systems/homebrew-tap` with `--tap-dir`, review the tap diff, and
+      publish it only after the referenced release assets are visible and the
+      install smoke passes
 - [ ] Verify both Darwin archives have matching SPDX SBOMs and
       `dependency-inventory-*.json` artifacts, and verify archive provenance
       with `gh attestation verify <archive> --repo Bare-Systems/Tardigrade`
@@ -51,9 +60,9 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] Close #463 only after the first published Darwin assets, checksums,
       inventories, SBOMs, attestations, native-only linkage, installer path,
       alias, and runtime smoke all verify on both macOS architectures
-- [ ] Note in the release that Homebrew tap publication and launchd lifecycle
-      validation are separate from the raw Darwin archives until #466/#467
-      close
+- [ ] Note any Homebrew platform limitation in the release notes; do not
+      advertise macOS Homebrew until the published release includes Darwin
+      archives and the tap formula references their real checksums
 - [ ] Confirm changelog entries for operator-visible changes are complete
 
 ## Branch Hygiene

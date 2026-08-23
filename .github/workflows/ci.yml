@@ -60,6 +60,14 @@ jobs:
           benchmarks/competitive/netem-impair.sh
           benchmarks/test-h3-benchmark.sh
 
+      - name: Validate Homebrew formula renderer
+        run: |
+          ./scripts/update-homebrew-formula.sh \
+            --version 0.5.0 \
+            --checksums-url https://github.com/Bare-Systems/Tardigrade/releases/download/v0.5.0/tardigrade-checksums.txt
+          ruby -c packaging/homebrew/tardigrade.rb
+          git diff --exit-code -- packaging/homebrew/tardigrade.rb
+
   # ── TLS dependency audit ──────────────────────────────────────────────────────
   # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3
   # dependency names must not be configured, OpenSSL must stay behind the
@@ -482,7 +490,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
-        run: sudo apt-get install -y libssl-dev
+        run: sudo apt-get install -y build-essential curl file git libssl-dev procps
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -498,11 +506,24 @@ jobs:
             zig-packaging-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
             zig-packaging-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build ReleaseFast binary
-        run: zig build -Doptimize=ReleaseFast
+      - name: Build native ReleaseFast binary
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native
 
       - name: Smoke test install script
         run: ./scripts/test-install.sh
+
+      - name: Install Homebrew
+        env:
+          NONINTERACTIVE: "1"
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew --version
+
+      - name: Smoke test Homebrew formula
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          ./scripts/test-homebrew-formula.sh
 
       - name: Smoke test DEB package
         run: ./scripts/test-deb-package.sh
