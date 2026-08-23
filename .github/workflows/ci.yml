@@ -72,6 +72,12 @@ jobs:
             --version 0.0.0-renderer-fixture \
             --checksums "$tmpdir/tardigrade-checksums.txt" \
             --formula "$tmpdir/tardigrade.rb"
+          if ./scripts/update-homebrew-formula.sh \
+            --version 0.0.0-renderer-fixture \
+            --checksums "$tmpdir/tardigrade-checksums.txt"; then
+            echo "fixture render unexpectedly overwrote canonical formula" >&2
+            exit 1
+          fi
           ruby -c "$tmpdir/tardigrade.rb"
           ruby -c packaging/homebrew/tardigrade.rb
 

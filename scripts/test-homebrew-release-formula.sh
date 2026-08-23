@@ -13,13 +13,14 @@ usage() {
     cat <<'EOF'
 Usage: test-homebrew-release-formula.sh [--formula PATH]
 
-Installs the provided formula through Homebrew, runs brew test, and audits the
-installed binary. Use this only after packaging/homebrew/tardigrade.rb has been
-rendered from a real native release tag.
+Installs the provided formula through Homebrew, runs brew test, audits the
+installed binary, and exercises a startup/request smoke. Use this only after
+packaging/homebrew/tardigrade.rb has been rendered from a real native release
+tag.
 EOF
 }
 
-# shellcheck disable=SC2329 # invoked by trap
+# shellcheck disable=SC2317,SC2329 # invoked by trap
 cleanup() {
     if [ "$INSTALLED_FORMULA" = true ]; then
         brew uninstall --formula "$TAP_NAME/tardigrade" >/dev/null 2>&1 || true
@@ -85,4 +86,30 @@ test -x "$installed"
     --profile native \
     --output "$TMPDIR/dependency-inventory.json"
 
-printf 'Homebrew release formula smoke passed\n'
+cat > "$TMPDIR/tardigrade.conf" <<EOF
+listen 18089;
+server_name localhost;
+
+location = /health {
+    return 200 homebrew-release-smoke;
+}
+EOF
+
+"$installed" check "$TMPDIR/tardigrade.conf" >/dev/null
+"$installed" run -c "$TMPDIR/tardigrade.conf" >"$TMPDIR/server.log" 2>&1 &
+pid="$!"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS -H 'Host: localhost' http://127.0.0.1:18089/health | grep -F "homebrew-release-smoke" >/dev/null; then
+        kill "$pid"
+        wait "$pid" 2>/dev/null || true
+        printf 'Homebrew release formula smoke passed\n'
+        exit 0
+    fi
+    sleep 0.5
+done
+
+cat "$TMPDIR/server.log" >&2
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+echo "Tardigrade did not serve the release Homebrew smoke request" >&2
+exit 1

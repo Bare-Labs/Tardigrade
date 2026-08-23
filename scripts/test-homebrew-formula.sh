@@ -8,7 +8,7 @@ TAP_NAME="bare-systems/tardigrade-smoke"
 INSTALLED_FORMULA=false
 TAP_CREATED=false
 
-# shellcheck disable=SC2329 # invoked by trap
+# shellcheck disable=SC2317,SC2329 # invoked by trap
 cleanup() {
     if [ "$INSTALLED_FORMULA" = true ]; then
         brew uninstall --formula "$TAP_NAME/tardigrade" >/dev/null 2>&1 || true
@@ -126,7 +126,7 @@ EOF
 "$installed" run -c "$TMPDIR/tardigrade.conf" >"$TMPDIR/server.log" 2>&1 &
 pid="$!"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if curl -fsS http://127.0.0.1:18089/health | grep -F "homebrew-smoke" >/dev/null; then
+    if curl -fsS -H 'Host: localhost' http://127.0.0.1:18089/health | grep -F "homebrew-smoke" >/dev/null; then
         kill "$pid"
         wait "$pid" 2>/dev/null || true
         printf 'Homebrew formula smoke passed\n'

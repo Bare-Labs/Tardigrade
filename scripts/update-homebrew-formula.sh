@@ -7,7 +7,9 @@ TAG=""
 VERSION=""
 CHECKSUMS_PATH=""
 CHECKSUMS_URL=""
-FORMULA_PATH="${REPO_ROOT}/packaging/homebrew/tardigrade.rb"
+DEFAULT_FORMULA_PATH="${REPO_ROOT}/packaging/homebrew/tardigrade.rb"
+FORMULA_PATH="$DEFAULT_FORMULA_PATH"
+FORMULA_EXPLICIT=false
 TAP_DIR=""
 REPO="Bare-Systems/Tardigrade"
 
@@ -32,7 +34,7 @@ while [ "$#" -gt 0 ]; do
         --version) VERSION="$2"; shift 2 ;;
         --checksums) CHECKSUMS_PATH="$2"; shift 2 ;;
         --checksums-url) CHECKSUMS_URL="$2"; shift 2 ;;
-        --formula) FORMULA_PATH="$2"; shift 2 ;;
+        --formula) FORMULA_PATH="$2"; FORMULA_EXPLICIT=true; shift 2 ;;
         --tap-dir) TAP_DIR="$2"; shift 2 ;;
         --repo) REPO="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -58,10 +60,28 @@ else
         echo "--checksums-url is only supported through --tag-derived release metadata" >&2
         exit 2
     fi
+    if [ -n "$TAP_DIR" ]; then
+        echo "fixture mode cannot write to --tap-dir; use --tag for tap updates" >&2
+        exit 2
+    fi
+    if [ "$FORMULA_EXPLICIT" != true ]; then
+        echo "fixture mode requires an explicit non-canonical --formula output path" >&2
+        exit 2
+    fi
+fi
+
+canonical_path() {
+    dir="$(cd "$(dirname "$1")" && pwd)"
+    printf '%s/%s\n' "$dir" "$(basename "$1")"
+}
+
+if [ -z "$TAG" ] && [ "$(canonical_path "$FORMULA_PATH")" = "$(canonical_path "$DEFAULT_FORMULA_PATH")" ]; then
+    echo "fixture mode cannot overwrite the canonical formula; use --tag for packaging/homebrew/tardigrade.rb" >&2
+    exit 2
 fi
 
 tmpdir="$(mktemp -d)"
-# shellcheck disable=SC2329 # invoked by trap
+# shellcheck disable=SC2317,SC2329 # invoked by trap
 cleanup() {
     rm -rf "$tmpdir"
 }

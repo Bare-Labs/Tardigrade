@@ -301,7 +301,7 @@ Run a host-native Homebrew install smoke against a local release-shaped archive
 after building a native release binary:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtls-profile=native
+zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=0.0.0-homebrew-smoke
 ./scripts/test-homebrew-formula.sh
 ```
 
