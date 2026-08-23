@@ -49,9 +49,10 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 # Keep package metadata aligned with the exact artifact being packaged.
-# Official releases pass --tls-backend native explicitly. Host-native local
-# builds can auto-detect; cross-compiled binaries remain packageable by passing
-# the backend explicitly rather than attempting to execute a foreign-arch file.
+# Host-native binaries (including the official release binary after its native
+# linkage audit) are inferred from their self-report. Cross-compiled binaries
+# remain packageable by passing the backend explicitly rather than attempting
+# to infer it by executing a foreign-architecture file.
 if [[ -z "$TLS_BACKEND" ]]; then
     if [[ ! -x "$BINARY" ]]; then
         echo "Binary is not executable on this host; pass --tls-backend native or --tls-backend openssl-adapter" >&2

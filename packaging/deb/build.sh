@@ -56,9 +56,9 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 # Package dependency metadata follows the artifact actually being packaged.
-# Official releases pass --tls-backend native explicitly. For ordinary
-# host-native local builds, infer from the binary's self-report. Cross-compiled
-# binaries that cannot execute on the packaging host remain supported by passing
+# Host-native binaries (including the official release binary after its native
+# linkage audit) are inferred from their self-report. Cross-compiled binaries
+# that cannot execute on the packaging host remain supported by passing
 # --tls-backend explicitly instead of guessing from the target filename.
 if [[ -z "$TLS_BACKEND" ]]; then
     if [[ ! -x "$BINARY" ]]; then

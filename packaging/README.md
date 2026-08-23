@@ -11,8 +11,8 @@ versus what is a local-build-only tool.
 | --- | --- | --- |
 | Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, per-arch SPDX SBOMs, dependency inventories, and provenance. Releases containing #476 build these official artifacts with `-Dtls-profile=native`; older already-published releases may predate that cutover. |
 | macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Implemented in #476; awaiting first release** | #476 adds `macos-15-intel` and `macos-15` release rows for `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux. Both rows build `-Dtls-profile=native` without Homebrew OpenSSL, audit out foreign TLS/crypto/QUIC/H3 linkage, assert the Mach-O architecture, package/extract the archive, verify native build identity, run a real static-site startup/request smoke from the extracted artifact, and exercise the checksum-verifying installer path. The currently published latest release still predates #476, so these assets are not public until the first intentional release containing it. |
-| DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. The builder inspects `tardi version`: native binaries declare no OpenSSL runtime dependency, while a transitional local `general`/OpenSSL binary still gets the dependency it actually needs. |
-| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. The spec's OpenSSL runtime dependency is conditional on the packaged binary reporting the transitional OpenSSL adapter; official native release packages do not declare it. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
+| DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. Host-native builds infer dependency metadata from `tardi version`; cross-compiled binaries can declare `--tls-backend native|openssl-adapter` explicitly. Native binaries declare no OpenSSL runtime dependency, while a transitional local `general`/OpenSSL binary still gets the dependency it actually needs. |
+| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Host-native builds infer the backend and cross-compiled builds can pass it explicitly. The spec's OpenSSL runtime dependency is conditional on the packaged binary/backend; official native release packages do not declare it. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | The Darwin archive pipeline does not install or exercise launchd. #467 owns a real macOS `launchctl` bootstrap/health/bootout smoke and the final `tardi`/compatibility-alias service contract. |
 | Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present; public tap exists but is not usable yet** | `Bare-Systems/homebrew-tap` exists, but #466 owns seeding/automating it. The checked-in formula is not currently installable: its release version is stale and SHA-256 values are placeholders. #466 must consume the native Darwin artifacts and must not declare OpenSSL as a Tardigrade runtime dependency. |
@@ -33,12 +33,12 @@ artifact links `libssl`, `libcrypto`, or another forbidden foreign
 TLS/crypto/QUIC/H3 implementation and verifies that `tardi version` reports
 `tls-profile=native, tls-backend=native`.
 
-Linux DEB/RPM packages are built from that same audited binary. The release job
-then inspects package metadata and fails if either native package declares an
-OpenSSL/libssl/libcrypto runtime dependency. The package builders remain useful
-for local transitional `general` builds by detecting the packaged binary's
-self-reported backend and adding OpenSSL metadata only when it is genuinely
-required.
+Linux DEB/RPM packages are built from that same audited host-native binary. The
+package builders infer its backend from `tardi version`, and the release job then
+inspects the resulting package metadata and fails if either native package
+declares an OpenSSL/libssl/libcrypto runtime dependency. Local cross-compiled
+packages can provide `--tls-backend native|openssl-adapter` explicitly when the
+target binary cannot execute on the packaging host.
 
 ## Quick install (recommended)
 
@@ -104,8 +104,12 @@ the native profile for a shipping-equivalent package:
 # 1. Build the binary first (cross-compile for the target arch as needed)
 zig build -Doptimize=ReleaseFast -Dtls-profile=native
 
-# 2. Build the DEB
-./packaging/deb/build.sh --version 0.50 --arch amd64
+# 2. Build the DEB. Passing the backend explicitly also works when the target
+#    binary is for a different architecture than the packaging host.
+./packaging/deb/build.sh \
+  --version 0.50 \
+  --arch amd64 \
+  --tls-backend native
 
 # Output: dist/tardigrade_0.50_amd64.deb
 ```
@@ -116,10 +120,13 @@ sudo apt install ./dist/tardigrade_0.50_amd64.deb
 sudo systemctl enable --now tardigrade
 ```
 
-The DEB builder inspects the binary's `tardi version` output. Native binaries
-have no OpenSSL package dependency; a transitional local binary reporting
-`tls-backend=openssl-adapter` gets `Depends: libssl3 | libssl1.1`. An unknown
-backend fails packaging rather than generating ambiguous dependency metadata.
+When `--tls-backend` is omitted, the DEB builder infers it from an executable
+host-native binary's `tardi version` output. Native binaries have no OpenSSL
+package dependency; a transitional local binary reporting
+`tls-backend=openssl-adapter` gets `Depends: libssl3 | libssl1.1`. Unknown
+backends fail rather than generating ambiguous dependency metadata. For a
+foreign-architecture binary, pass `--tls-backend native` or
+`--tls-backend openssl-adapter` explicitly.
 
 The DEB package:
 - Installs the binary to `/usr/bin/tardi`
@@ -169,8 +176,11 @@ dnf install rpm-build
 # 2. Build the binary
 zig build -Doptimize=ReleaseFast -Dtls-profile=native
 
-# 3. Build the RPM
-./packaging/rpm/build.sh --version 0.50
+# 3. Build the RPM. Passing the backend explicitly also works for a
+#    foreign-architecture binary.
+./packaging/rpm/build.sh \
+  --version 0.50 \
+  --tls-backend native
 
 # Output: dist/tardigrade-0.50-1.x86_64.rpm
 ```
@@ -181,10 +191,10 @@ sudo rpm -i dist/tardigrade-0.50-1.x86_64.rpm
 sudo systemctl enable --now tardigrade
 ```
 
-Like the DEB builder, the RPM builder derives dependency metadata from the
-binary's self-report. Native binaries omit `Requires: openssl-libs`; a local
-transitional OpenSSL-adapter binary retains it, and an unknown backend fails
-packaging.
+Like the DEB builder, the RPM builder auto-detects the backend for executable
+host-native binaries and accepts an explicit backend for cross-compiled input.
+Native binaries omit `Requires: openssl-libs`; a local transitional
+OpenSSL-adapter binary retains it, and an unknown backend fails packaging.
 
 Like the DEB package, the RPM installs a starter
 `/etc/tardigrade/tardigrade.conf`, creates `/var/lib/tardigrade` (the
