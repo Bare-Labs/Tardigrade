@@ -613,15 +613,15 @@ test "#368 Slice 3: hotReloadConfig rejects a combined replay+protocol-policy re
     // pure `earlyDataReplayConfigChanged` comparator above, so it actually
     // proves the ordering, not just the comparator's logic.
     //
-    // Skipped under the appliance TLS profile (`-Dtls-profile=appliance`):
-    // that build swaps `http.tls_termination.TlsTerminator` for
-    // `tls_termination_stub.zig`, whose `init()` unconditionally returns
-    // `error.ContextInitFailed` — the appliance profile never constructs
-    // the generic OpenSSL terminator this test exercises, so there is
-    // nothing appliance-specific to prove here. `earlyDataReplayConfigChanged`
-    // above still covers the ordering-independent comparator logic in every
-    // profile.
-    if (edge_config.is_appliance_tls_profile) return;
+    // Skipped under the native-TLS profiles (`-Dtls-profile=appliance` and
+    // `-Dtls-profile=native`): those builds swap
+    // `http.tls_termination.TlsTerminator` for `tls_termination_stub.zig`,
+    // whose `init()` unconditionally returns `error.ContextInitFailed` —
+    // they never construct the generic OpenSSL terminator this test
+    // exercises, so there is nothing profile-specific to prove here.
+    // `earlyDataReplayConfigChanged` above still covers the
+    // ordering-independent comparator logic in every profile.
+    if (edge_config.is_native_tls_build) return;
     const allocator = std.testing.allocator;
 
     var current_cfg = try edge_config.loadFromEnv(allocator);

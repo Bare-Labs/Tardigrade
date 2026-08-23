@@ -56,7 +56,13 @@ appliance builds; these are OpenSSL-terminator-only features this owner
 never constructs); and if `http3_enabled` is set, a complete identity must
 also be configured and `http3_enable_0rtt`/`http3_connection_migration` must
 be off, and `http3_retry_policy` must remain `off`. Each violation is a
-distinct `UnsupportedApplianceConfiguration` failure, not a silent no-op.
+distinct deterministic failure, not a silent no-op: the OpenSSL-only
+capability checks (version pin, ciphers, mTLS, session cache/tickets,
+OCSP, CRL, ACME, credential watcher, PROXY protocol) are shared with the
+`native` profile and fail with `UnsupportedNativeTlsConfiguration` (#634),
+while the appliance-only policy checks (identity cardinality, server-name
+coupling, HTTP/3 restrictions) fail with
+`UnsupportedApplianceConfiguration`.
 
 ### SNI behavior
 
@@ -201,8 +207,8 @@ into a generic bootstrap error:
 `CertificateKeyUsageViolation`, `CertificateExtendedKeyUsageViolation`,
 `UnhandledCriticalCertificateExtension`, `DuplicateCertificateEntry`,
 `InvalidCertificateChainOrder`, `CertificateSignatureInvalid`,
-`UnsupportedApplianceConfiguration`, `ProviderPublicationFailed`,
-`FileNotFound`, `AccessDenied`, `OutOfMemory`.
+`UnsupportedApplianceConfiguration`, `UnsupportedNativeTlsConfiguration`,
+`ProviderPublicationFailed`, `FileNotFound`, `AccessDenied`, `OutOfMemory`.
 
 Error output never includes key bytes, seeds, DER, signatures, or
 key-derived identifiers.

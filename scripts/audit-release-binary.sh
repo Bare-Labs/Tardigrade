@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# TLS/crypto binary linkage audit and dependency inventory (#379, epic #327).
+# TLS/crypto binary linkage audit and dependency inventory (#379, epic #327,
+# cutover #634).
 #
 # Inspects a produced tardi binary's dynamic dependencies and emits a
-# machine-readable inventory. For the Bare Systems appliance profile it fails
-# if the binary links OpenSSL, libcrypto, or any other foreign TLS/crypto/
-# QUIC/H3/certificate library, and confirms the binary self-reports the
-# native TLS path. For the general profile it records whether the OpenSSL
-# adapter was selected and lists the full dependency set.
+# machine-readable inventory. For the native-only profiles (`appliance` and
+# `native`) it fails if the binary links OpenSSL, libcrypto, or any other
+# foreign TLS/crypto/QUIC/H3/certificate library, and confirms the binary
+# self-reports the native TLS path. For the transitional general profile it
+# records whether the OpenSSL adapter was selected and lists the full
+# dependency set.
 #
 # Usage:
-#   audit-release-binary.sh --binary PATH --profile {general|appliance} \
+#   audit-release-binary.sh --binary PATH --profile {general|appliance|native} \
 #       [--output inventory.json]
 #
 # Exit code 0 means the audit passed. A forbidden linkage, or a profile that
@@ -23,7 +25,7 @@ OUTPUT=""
 
 usage() {
     cat <<'EOF'
-Usage: audit-release-binary.sh --binary PATH --profile {general|appliance} [--output FILE]
+Usage: audit-release-binary.sh --binary PATH --profile {general|appliance|native} [--output FILE]
 EOF
 }
 
@@ -62,16 +64,17 @@ if [ ! -f "$BINARY" ]; then
     exit 2
 fi
 case "$PROFILE" in
-general | appliance) ;;
+general | appliance | native) ;;
 *)
-    echo "invalid profile: $PROFILE (expected general or appliance)" >&2
+    echo "invalid profile: $PROFILE (expected general, appliance, or native)" >&2
     exit 2
     ;;
 esac
 
 # Foreign TLS/crypto/QUIC/H3/certificate libraries that must never appear in a
 # Tardigrade link graph. openssl/crypto are handled separately: forbidden in
-# the appliance profile, the approved adapter in the general profile.
+# the native-only profiles (appliance/native), the approved transitional
+# adapter in the general profile.
 FORBIDDEN_LIB_PATTERNS='ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libtls|libressl|botan|s2n'
 
 # ── Collect dynamic dependencies across platforms ────────────────────────────
@@ -170,12 +173,12 @@ if [ "$reported_profile" != "$PROFILE" ]; then
     violations+=("artifact self-reports tls-profile '$reported_profile' but was audited as '$PROFILE'")
 fi
 
-if [ "$PROFILE" = "appliance" ]; then
+if [ "$PROFILE" = "appliance" ] || [ "$PROFILE" = "native" ]; then
     if [ "$links_openssl" = true ]; then
-        violations+=("appliance artifact links OpenSSL (libssl/libcrypto)")
+        violations+=("$PROFILE artifact links OpenSSL (libssl/libcrypto)")
     fi
     if [ "$reported_backend" != "native" ]; then
-        violations+=("appliance artifact does not self-report the native TLS path (got '$reported_backend')")
+        violations+=("$PROFILE artifact does not self-report the native TLS path (got '$reported_backend')")
     fi
 else
     # General profile: OpenSSL is permitted, but the binary's self-report must

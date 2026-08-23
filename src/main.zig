@@ -648,6 +648,7 @@ fn isConfigValidationError(err: anyerror) bool {
         error.InvalidCertificateChainOrder,
         error.CertificateSignatureInvalid,
         error.UnsupportedApplianceConfiguration,
+        error.UnsupportedNativeTlsConfiguration,
         => true,
         else => false,
     };

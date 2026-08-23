@@ -397,9 +397,9 @@ pub const entries = [_]ConfigEntry{
         .name = "tls_min_version",
         .contexts = CTX_TOP,
         .value_type = "enum",
-        .default_value = "1.2 (general profile); 1.3 (appliance profile)",
+        .default_value = "1.2 (general profile); 1.3 (appliance and native profiles)",
         .valid_values = &.{ "1.2", "1.3" },
-        .description = "Minimum negotiated TLS protocol version. The appliance TLS profile requires 1.3 for both min and max.",
+        .description = "Minimum negotiated TLS protocol version. The native-TLS builds (appliance and native profiles) require 1.3 for both min and max.",
         .example = "tls_min_version 1.2;",
         .env_vars = &.{"TARDIGRADE_TLS_MIN_VERSION"},
         .docs = &.{"docs/TLS_INTEROP_MATRIX.md"},
@@ -409,7 +409,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "enum",
         .default_value = "1.3",
-        .valid_values = &.{"1.2, 1.3 (general profile); 1.3 only (appliance profile -- must match tls_min_version)"},
+        .valid_values = &.{"1.2, 1.3 (general profile); 1.3 only (appliance and native profiles -- must match tls_min_version)"},
         .description = "Maximum negotiated TLS protocol version.",
         .example = "tls_max_version 1.3;",
         .env_vars = &.{"TARDIGRADE_TLS_MAX_VERSION"},
@@ -422,7 +422,7 @@ pub const entries = [_]ConfigEntry{
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
         .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
-        .description = "Requires and verifies client certificates (mTLS). Rejected by the appliance TLS profile: true is not a valid value in appliance builds.",
+        .description = "Requires and verifies client certificates (mTLS). Rejected by the native-TLS builds: true is not a valid value in appliance or native profile builds.",
         .example = "tls_client_verify true;",
         .env_vars = &.{"TARDIGRADE_TLS_CLIENT_VERIFY"},
         .docs = &.{"docs/PENTEST_PLAYBOOK.md"},
@@ -444,7 +444,7 @@ pub const entries = [_]ConfigEntry{
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
         .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
-        .description = "Enables OCSP stapling responses. Not supported when the binary is built with the appliance TLS profile.",
+        .description = "Enables OCSP stapling responses. Not supported when the binary is built with the appliance or native TLS profiles.",
         .example = "tls_ocsp_stapling true;",
         .env_vars = &.{"TARDIGRADE_TLS_OCSP_STAPLING"},
         .docs = &.{"docs/PKI_REVOCATION.md"},
@@ -1825,7 +1825,7 @@ test "writeExplanation represents profile-dependent tls_min_version truthfully" 
     try writeExplanation(&out.writer, lookup("tls_min_version").?);
     const written = out.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "general profile") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "appliance profile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "appliance and native profiles") != null);
 }
 
 test "writeUnknown names the query and suggests a close match" {

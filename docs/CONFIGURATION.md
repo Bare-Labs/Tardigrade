@@ -248,7 +248,7 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_HTTP1_ENABLED` | bool | `true` | Enables HTTP/1.1. At least one of HTTP/1.1 or HTTP/2 must stay enabled; plaintext listeners require HTTP/1.1 because downstream h2c is not supported. | `TARDIGRADE_HTTP1_ENABLED=true` |
 | `TARDIGRADE_HTTP2_ENABLED` | bool | `true` | Enables HTTP/2 where supported. HTTP/2-only downstream listeners require TLS. | `TARDIGRADE_HTTP2_ENABLED=true` |
 | `TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK` | bool | `false` | Allows HTTP/1.1 on TLS clients that omit ALPN. | `TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK=true` |
-| `TARDIGRADE_PROXY_PROTOCOL` | enum | `off` | `off`, `auto`, `v1`, `v2`. Appliance TLS profile requires `off`. | `TARDIGRADE_PROXY_PROTOCOL=auto` |
+| `TARDIGRADE_PROXY_PROTOCOL` | enum | `off` | `off`, `auto`, `v1`, `v2`. Appliance/native TLS profiles require `off` when TLS is configured. | `TARDIGRADE_PROXY_PROTOCOL=auto` |
 | `TARDIGRADE_PROXY_STREAMING_MODE` | enum | `off` | `off`/`buffered`, `response`/`responses`, `full`/`request_response`/`request-response`. | `TARDIGRADE_PROXY_STREAMING_MODE=response` |
 | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` | bytes | `16384` | 1-1048576; must fit proxy buffer hard limit. | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE=65536` |
 | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` | bool | `false` | Stream all upstream statuses instead of mapping non-200 responses. | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES=true` |
@@ -343,33 +343,36 @@ the primary `PROBE_*` names bypass file/secret lookup.
 
 ### TLS Termination
 
-General release binaries use the OpenSSL-backed TLS profile. The
-appliance/native profile has a stricter TLS 1.3-only subset.
+General release binaries use the transitional OpenSSL-backed TLS profile
+(`-Dtls-profile=general`). The native-TLS builds (`-Dtls-profile=appliance`
+and the general-purpose `-Dtls-profile=native`, #634) have a stricter
+TLS 1.3-only subset and deterministically reject OpenSSL-adapter-only
+settings.
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_TLS_CERT_PATH` | path | `""` | Required for TLS; must be paired with key path. | `TARDIGRADE_TLS_CERT_PATH=/etc/tls/fullchain.pem` |
 | `TARDIGRADE_TLS_KEY_PATH` | path | `""` | Required for TLS; must be paired with cert path. | `TARDIGRADE_TLS_KEY_PATH=/etc/tls/privkey.pem` |
-| `TARDIGRADE_TLS_MIN_VERSION` | string | `1.2` general, `1.3` appliance | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance requires `1.3`. | `TARDIGRADE_TLS_MIN_VERSION=1.2` |
-| `TARDIGRADE_TLS_MAX_VERSION` | string | `1.3` | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance requires `1.3`. | `TARDIGRADE_TLS_MAX_VERSION=1.3` |
-| `TARDIGRADE_TLS_CIPHER_LIST` | string | `""` | OpenSSL TLS <=1.2 cipher list. Appliance profile requires empty. | `TARDIGRADE_TLS_CIPHER_LIST=ECDHE+AESGCM` |
-| `TARDIGRADE_TLS_CIPHER_SUITES` | string | `""` | TLS 1.3 cipher suites. Appliance profile requires empty. | `TARDIGRADE_TLS_CIPHER_SUITES=TLS_AES_256_GCM_SHA384` |
+| `TARDIGRADE_TLS_MIN_VERSION` | string | `1.2` general, `1.3` appliance/native | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance/native require `1.3`. | `TARDIGRADE_TLS_MIN_VERSION=1.2` |
+| `TARDIGRADE_TLS_MAX_VERSION` | string | `1.3` | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance/native require `1.3`. | `TARDIGRADE_TLS_MAX_VERSION=1.3` |
+| `TARDIGRADE_TLS_CIPHER_LIST` | string | `""` | OpenSSL TLS <=1.2 cipher list. Appliance/native profiles require empty. | `TARDIGRADE_TLS_CIPHER_LIST=ECDHE+AESGCM` |
+| `TARDIGRADE_TLS_CIPHER_SUITES` | string | `""` | TLS 1.3 cipher suites. Appliance/native profiles require empty. | `TARDIGRADE_TLS_CIPHER_SUITES=TLS_AES_256_GCM_SHA384` |
 | `TARDIGRADE_TLS_SERVER_NAME` | DNS name | `""` | Unused by the general/OpenSSL terminator. Appliance requires one non-wildcard DNS name when TLS is enabled; appliance credential/name changes require restart. | `TARDIGRADE_TLS_SERVER_NAME=edge.example.com` |
 | `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name:cert:key&#124;name2:cert2:key2</code>. Appliance profile requires empty. | `TARDIGRADE_TLS_SNI_CERTS=api.example.com:/a.crt:/a.key` |
-| `TARDIGRADE_TLS_SESSION_CACHE` | bool | `true` general, `false` appliance | OpenSSL session cache. Appliance profile rejects true. | `TARDIGRADE_TLS_SESSION_CACHE=true` |
+| `TARDIGRADE_TLS_SESSION_CACHE` | bool | `true` general, `false` appliance/native | OpenSSL session cache. Appliance/native profiles reject true (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | `TARDIGRADE_TLS_SESSION_CACHE=true` |
 | `TARDIGRADE_TLS_SESSION_CACHE_SIZE` | u32 | `20480` | OpenSSL session cache size. | `TARDIGRADE_TLS_SESSION_CACHE_SIZE=40960` |
 | `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS` | u32 | `300` | OpenSSL session timeout. | `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS=600` |
-| `TARDIGRADE_TLS_SESSION_TICKETS` | bool | `true` general, `false` appliance | OpenSSL ticket support. Appliance profile rejects true. | `TARDIGRADE_TLS_SESSION_TICKETS=true` |
+| `TARDIGRADE_TLS_SESSION_TICKETS` | bool | `true` general, `false` appliance/native | OpenSSL ticket support. Appliance/native profiles reject true (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | `TARDIGRADE_TLS_SESSION_TICKETS=true` |
 | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS` | u32 ms | `5000` | TLS handshake read timeout. `0` falls back to keep-alive timeout. | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS=3000` |
-| `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` | u64 ms | `5000` general, `0` appliance | OpenSSL cert/key watcher interval. Appliance profile requires `0`. | `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS=5000` |
+| `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` | u64 ms | `5000` general, `0` appliance/native | OpenSSL cert/key watcher interval. Appliance/native profiles require `0`. | `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS=5000` |
 | `TARDIGRADE_TLS_CLIENT_CA_PATH` | path | `""` | Required when `TARDIGRADE_TLS_CLIENT_VERIFY=true`. | `TARDIGRADE_TLS_CLIENT_CA_PATH=/etc/tls/clients.pem` |
-| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Downstream client cert verification. Appliance profile rejects true. | `TARDIGRADE_TLS_CLIENT_VERIFY=true` |
+| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Downstream client cert verification. Appliance/native profiles reject true. | `TARDIGRADE_TLS_CLIENT_VERIFY=true` |
 | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Client certificate chain depth. | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH=4` |
 | `TARDIGRADE_TLS_CRL_PATH` | path | `""` | CRL file. | `TARDIGRADE_TLS_CRL_PATH=/etc/tls/revoked.pem` |
-| `TARDIGRADE_TLS_CRL_CHECK` | bool | `false` | Enable CRL checking. Appliance profile rejects true. | `TARDIGRADE_TLS_CRL_CHECK=true` |
-| `TARDIGRADE_TLS_OCSP_STAPLING` | bool | `false` | Enable OCSP stapling. Appliance profile rejects true. | `TARDIGRADE_TLS_OCSP_STAPLING=true` |
+| `TARDIGRADE_TLS_CRL_CHECK` | bool | `false` | Enable CRL checking. Appliance/native profiles reject true. | `TARDIGRADE_TLS_CRL_CHECK=true` |
+| `TARDIGRADE_TLS_OCSP_STAPLING` | bool | `false` | Enable OCSP stapling. Appliance/native profiles reject true. | `TARDIGRADE_TLS_OCSP_STAPLING=true` |
 | `TARDIGRADE_TLS_OCSP_RESPONSE_PATH` | path | `""` | DER OCSP response path. | `TARDIGRADE_TLS_OCSP_RESPONSE_PATH=/var/cache/ocsp.der` |
-| `TARDIGRADE_TLS_OCSP_AUTO_REFRESH` | bool | `false` | Refresh OCSP response automatically. Appliance profile rejects true. | `TARDIGRADE_TLS_OCSP_AUTO_REFRESH=true` |
+| `TARDIGRADE_TLS_OCSP_AUTO_REFRESH` | bool | `false` | Refresh OCSP response automatically. Appliance/native profiles reject true. | `TARDIGRADE_TLS_OCSP_AUTO_REFRESH=true` |
 | `TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS` | u64 ms | `3600000` | OCSP refresh interval. | `TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS=1800000` |
 | `TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS` | u32 ms | `10000` | OCSP refresh timeout. | `TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS=5000` |
 
@@ -417,7 +420,7 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_TLS_ACME_ENABLED` | bool | `false` | Enable ACME. Appliance profile rejects true. | `TARDIGRADE_TLS_ACME_ENABLED=true` |
+| `TARDIGRADE_TLS_ACME_ENABLED` | bool | `false` | Enable ACME. Appliance/native profiles reject true (native ACME is tracked by #634). | `TARDIGRADE_TLS_ACME_ENABLED=true` |
 | `TARDIGRADE_TLS_ACME_CERT_DIR` | path | `""` | Certificate storage directory. | `TARDIGRADE_TLS_ACME_CERT_DIR=/var/lib/tardigrade/acme` |
 | `TARDIGRADE_TLS_ACME_DIRECTORY_URL` | URL | `https://acme-v02.api.letsencrypt.org/directory` | ACME directory URL. | `TARDIGRADE_TLS_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory` |
 | `TARDIGRADE_TLS_ACME_DOMAINS` | CSV DNS names | `[]` | Domains to obtain/renew. Empty logs a warning when ACME is enabled. | `TARDIGRADE_TLS_ACME_DOMAINS=example.com,www.example.com` |

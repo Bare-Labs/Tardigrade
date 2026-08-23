@@ -853,6 +853,13 @@ default build, and conflating them leads to false confidence:
    additionally runs the appliance credential preflight (PEM parse,
    chain shape, leaf/key match, validity-window checks), so it catches
    the supported material/validity failures earlier, at `check` time.
+5. **Native general-purpose profile (`-Dtls-profile=native`, #634):**
+   `tardi check` is config-shape validation like the general profile, but
+   OpenSSL-adapter-only settings (TLS 1.2, cipher overrides, mTLS, session
+   cache/tickets, OCSP, CRL, ACME, the credential watcher, PROXY protocol
+   with TLS) are rejected deterministically at `check` time. Credential
+   parse/mismatch failures surface when `tardi run` loads the files into
+   the native credential store at startup.
 
 Confirm which profile you're running with `tardi version` (it prints
 `tls-profile=...`) before assuming which of the above applies.

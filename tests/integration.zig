@@ -2944,6 +2944,17 @@ fn requireNativeTlsProfile() !void {
     if (build_options.tls_openssl_adapter) return error.SkipZigTest;
 }
 
+/// #634: cases asserting the Bare appliance *product policy* — the strict
+/// Ed25519 single-identity loader, `check`/startup credential preflight,
+/// unknown-SNI handshake rejection, restart-owned credential rotation —
+/// hold only on `-Dtls-profile=appliance`. The general-purpose `native`
+/// profile shares the adapter-free native TLS engine
+/// (`requireNativeTlsProfile` passes there too) but uses the permissive
+/// generic credential store, so these behaviors are intentionally absent.
+fn requireApplianceTlsProfile() !void {
+    if (!std.mem.eql(u8, build_options.tls_profile, "appliance")) return error.SkipZigTest;
+}
+
 /// #522: the appliance TLS profile explicitly forbids
 /// `TARDIGRADE_HTTP3_ENABLE_0RTT` (`edge_config.zig`'s
 /// `validateApplianceTlsProfile` rejects it outright as an unsupported
@@ -6408,8 +6419,8 @@ test "interop.openssl.sni_mismatch" {
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
-    // The appliance TLS profile (the only profile the native listener builds
-    // under, see `requireNativeTlsProfile`) supports exactly one identity --
+    // The appliance TLS profile (the profile this suite runs under in CI,
+    // see `requireNativeTlsProfile`) supports exactly one identity --
     // `TARDIGRADE_TLS_SNI_CERTS` is rejected outright at startup. So "SNI
     // mismatch" here means the only meaningful, honest external case: a
     // client presenting any SNI other than the configured one, ticket or
@@ -8649,7 +8660,7 @@ test "rotation.persistent.n_to_n_plus_1" {
 //
 // This test does not additionally attempt to bundle a TLS credential change
 // into a failing SIGHUP: `requireNativeTlsProfile` gates every test in this
-// file to the appliance TLS profile build (the only profile where
+// file to the native-TLS builds (`-Dtls-profile=appliance`/`native`, where
 // `build_options.tls_openssl_adapter` is false), and inspecting
 // `edge_gateway.run`/`gateway_shutdown.hotReloadConfig` shows the appliance
 // profile's real served identity (`appliance_credentials.ApplianceCredentials`,
@@ -16788,6 +16799,7 @@ fn expectApplianceStartupFailure(
 }
 
 test "native TLS listener appliance identity serves the exact configured SNI" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -16827,6 +16839,28 @@ test "#488: native TLS listener resumes and serves HTTP traffic with production 
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
+    // #634: this test's client handshakes with SNI "tardigrade.test". On
+    // the appliance profile the strict owner serves that name because it is
+    // the configured `TARDIGRADE_TLS_SERVER_NAME`; on the general-purpose
+    // `native` profile the generic credential store's default bundle only
+    // covers absent SNI (unknown names fail closed), so the same identity
+    // must be registered for the name explicitly via
+    // `TARDIGRADE_TLS_SNI_CERTS` — which the appliance profile in turn
+    // rejects outright, hence the per-profile env below.
+    const is_appliance = comptime std.mem.eql(u8, build_options.tls_profile, "appliance");
+    const sni_certs_value = try std.fmt.allocPrint(allocator, "tardigrade.test:{s}:{s}", .{ tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(sni_certs_value);
+    const shared_env = [_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+    };
+    var native_env: [shared_env.len + 1]EnvPair = undefined;
+    @memcpy(native_env[0..shared_env.len], &shared_env);
+    native_env[shared_env.len] = .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs_value };
+
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .config_text =
         \\location = /healthz {
@@ -16835,13 +16869,7 @@ test "#488: native TLS listener resumes and serves HTTP traffic with production 
         ,
         .ready_https_insecure = true,
         .ready_path = "/healthz",
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
-            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
-            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
-            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
-        },
+        .extra_env = if (is_appliance) &shared_env else &native_env,
     });
     defer tardigrade.stop();
 
@@ -16952,6 +16980,7 @@ test "#488: native TLS listener resumes and serves HTTP traffic with production 
 }
 
 test "native TLS listener appliance rejects unknown SNI before HTTP dispatch" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17004,18 +17033,21 @@ test "native TLS listener appliance rejects unknown SNI before HTTP dispatch" {
 }
 
 test "native TLS listener appliance refuses startup with a mismatched key" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     try expectApplianceStartupFailure(allocator, "native_ed25519_mismatch.key", "error.KeyCertificateMismatch");
 }
 
 test "native TLS listener appliance refuses startup with an unsupported key algorithm" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     try expectApplianceStartupFailure(allocator, "native_p256.key", "error.UnsupportedPrivateKeyAlgorithm");
 }
 
 test "appliance run --daemon rejects a mismatched key synchronously, without ever backgrounding" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17073,6 +17105,7 @@ test "appliance run --daemon rejects a mismatched key synchronously, without eve
 }
 
 test "appliance master mode rejects a mismatched key before writing a PID file or spawning workers" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17131,6 +17164,7 @@ test "appliance master mode rejects a mismatched key before writing a PID file o
 }
 
 test "native TLS listener appliance check command validates credentials without binding" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17204,6 +17238,7 @@ test "native TLS listener appliance check command validates credentials without 
 }
 
 test "appliance hot reload rejects turning TLS on for a server that started plaintext" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17271,6 +17306,7 @@ test "appliance hot reload rejects turning TLS on for a server that started plai
 }
 
 test "appliance hot reload rejects turning TLS off for a server that started with TLS" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
