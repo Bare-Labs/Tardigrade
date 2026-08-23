@@ -60,6 +60,13 @@ const UpstreamResponseSpec = struct {
     /// Emit neither `Content-Length` nor `Transfer-Encoding`, so the body is
     /// delimited by the connection close (HTTP/1.0-style framing).
     close_delimited: bool = false,
+    /// After writing a truncated body, force the connection closed with
+    /// `SO_LINGER{onoff=1, linger=0}` (an RST) instead of the normal
+    /// graceful FIN. A clean close mid-body is a *known* incomplete
+    /// response (the relay reports it as `aborted`, not a thrown error); an
+    /// RST is what a genuinely failed/reset upstream connection looks like
+    /// on the wire, exercising the relay's actual error path instead.
+    reset_after_truncate: bool = false,
 };
 
 const FastCgiResponseSpec = struct {
@@ -1856,6 +1863,12 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection)
             } else {
                 try conn.stream.writer().writeAll(body_to_write);
             }
+        }
+
+        if (response_spec.reset_after_truncate) {
+            var l = std.c.linger{ .onoff = 1, .linger = 0 };
+            _ = std.c.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, @ptrCast(&l), @sizeOf(std.c.linger));
+            return;
         }
 
         if (headerHasToken(req.headers_raw, "Connection", "close") or
@@ -12808,6 +12821,77 @@ test "proxy streaming mode records upstream abort after partial body" {
     defer metrics.deinit();
     const upstream_aborts = prometheusMetricValue(metrics.body, "tardigrade_proxy_upstream_aborts_total") orelse return error.InvalidHttpResponse;
     try std.testing.expect(upstream_aborts >= 1);
+}
+
+test "proxy streaming mode never serializes a second HTTP response after the downstream head is committed" {
+    const allocator = std.testing.allocator;
+
+    // `.chunked = true` + `.truncate_body_after` + `.reset_after_truncate`:
+    // the origin writes a valid chunked head and one data chunk (committing
+    // Tardigrade to a chunked downstream response), then RSTs the
+    // connection instead of sending the terminating chunk. That is a
+    // genuine failure *after* commitment (a thrown error from the relay's
+    // read), distinct from the graceful early-close case the sibling test
+    // above covers (`relayUpstreamBody` reports that one as `.aborted`, no
+    // error is ever thrown). This reproduces a real bug found on #643: the
+    // streaming proxy's post-commit error path used to call `sendApiError`
+    // unconditionally, appending a second raw "HTTP/1.1 ..." status line
+    // after the already-started chunked body -- corrupting the response the
+    // client is mid-way through reading.
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "abcdef",
+        .chunked = true,
+        .truncate_body_after = 3,
+        .reset_after_truncate = true,
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Read the raw response directly rather than through the higher-level
+    // HTTP client helpers: those already reject a malformed response, which
+    // would just reproduce the client-side symptom again rather than let
+    // this test assert on the server-side cause directly.
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /proxy/reset HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+
+    var raw = std.array_list.Managed(u8).init(allocator);
+    defer raw.deinit();
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = readSocketWithPoll(stream.handle, &tmp, 5_000) catch |err| switch (err) {
+            error.ConnectionResetByPeer => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        try raw.appendSlice(tmp[0..n]);
+    }
+
+    // Exactly one status line: the downstream response was never
+    // re-serialized after the upstream's post-commit failure.
+    var status_line_count: usize = 0;
+    var it = std.mem.splitSequence(u8, raw.items, "\r\n");
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "HTTP/1.1 ")) status_line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), status_line_count);
+    try assertContains(raw.items, "HTTP/1.1 200 OK");
 }
 
 test "proxy full streaming mode relays fixed-length upload beyond request buffer cap" {

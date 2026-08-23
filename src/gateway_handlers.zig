@@ -841,7 +841,8 @@ fn executeLocationAction(
     const writer = conn.writer();
     switch (matched.block.action) {
         .proxy_pass => |target| {
-            return try handleLocationProxyPass(
+            var downstream_broken = false;
+            const status = try handleLocationProxyPass(
                 allocator,
                 conn,
                 writer,
@@ -862,7 +863,10 @@ fn executeLocationAction(
                 matched.block.pattern,
                 matched.block,
                 streaming_request_body,
+                &downstream_broken,
             );
+            if (downstream_broken) keep_alive.* = false;
+            return status;
         },
         .fastcgi_pass => |upstream| {
             return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);

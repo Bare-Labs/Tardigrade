@@ -2534,6 +2534,16 @@ pub fn executeStreamingHttpProxyRequest(
     pool: ?*http.upstream_pool.UpstreamPool,
     /// Optional per-origin HTTP/2 multiplexing pool (#145).
     h2_pool: ?*http.upstream_h2.H2ConnPool,
+    /// Set true on an error return once the downstream response head has
+    /// already been written (`streamProxyOverTransport`'s own
+    /// `wrote_downstream` reached true before the failure). Callers must not
+    /// serialize a second HTTP response onto `downstream_writer` when this is
+    /// true -- doing so corrupts an already-started response (e.g. appending
+    /// a raw status line after a chunked head, breaking the client's framing
+    /// mid-stream) rather than reporting the failure cleanly. Left `false`
+    /// (the caller's initial value is never read, only overwritten) for
+    /// every failure that occurs before any response byte is committed.
+    downstream_committed: *bool,
 ) !StreamingProxyResult {
     if (cancelStopped(cancel_token)) return error.RequestCancelled;
 
@@ -2720,6 +2730,7 @@ pub fn executeStreamingHttpProxyRequest(
                 if (active_pool) |p| p.recordStaleRetry(key);
                 continue;
             }
+            downstream_committed.* = wrote_downstream;
             return err;
         };
 
