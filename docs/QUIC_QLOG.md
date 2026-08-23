@@ -25,7 +25,10 @@ capture remains opt-in.
   from a captured trace, not just from ad-hoc `std.log` lines.
 - Provide the primitives (trace-header + event-line + keylog-line writers) so
   that composition roots and interop/failure harnesses (#247) can save
-  `*.sqlog` / `*.keys` artifacts that qvis / Wireshark consume directly.
+  `*.sqlog` / `*.keys` artifacts that a current-schema qlog consumer /
+  Wireshark can load directly. The hosted qvis tool's `.sqlog` loader
+  requires an explicit opt-in compatibility dialect — see
+  [External H3 interop artifacts](#external-h3-interop-artifacts) (#625).
 - Keep everything **off by default** and cheap when off.
 - Keep HTTP/3 out of `src/quic` (the #255 layering constraint).
 
@@ -219,10 +222,17 @@ TARDIGRADE_HTTP3_KEYLOG_PATH=/tmp/tardigrade-qlog/http3.keys
 - Changing either destination on hot reload is rejected; restart the HTTP/3
   listener so the socket, open files, and trace map agree.
 
-Use `.sqlog` files with qvis. Use the `.keys` file with Wireshark only together
-with packet captures from traffic you own and are authorized to decrypt. Delete
-both artifacts after the debugging session unless your incident-retention
-policy explicitly says otherwise.
+The production `.sqlog` files always use the standards-conformant `current`
+header dialect (`quic.qlog.HeaderDialect`, #625) — this destination has no
+dialect option, by design (see below). **The hosted qvis tool's `.sqlog`
+loader rejects that header**, so a production trace will not load there
+as-is; use a current-schema-aware qlog viewer, or regenerate an equivalent
+exchange through `scripts/interop/run-interop.sh` with
+`INTEROP_QLOG_DIALECT=qvis-legacy` if you specifically need to view it in
+hosted qvis. Use the `.keys` file with Wireshark only together with packet
+captures from traffic you own and are authorized to decrypt. Delete both
+artifacts after the debugging session unless your incident-retention policy
+explicitly says otherwise.
 
 ### External H3 interop artifacts
 
@@ -243,6 +253,25 @@ matrix case. `INTEROP_KEYLOG=1` additionally passes `--keylog-path`, writes a
 per-role `.keys` file beside the qlog files, and creates a
 `SENSITIVE-KEYLOG.txt` marker. Keylog capture is deliberately separate from
 qlog because the `.keys` file permits decrypting packet captures.
+
+By default these `.sqlog` files use the standards-conformant `current`
+header dialect, same as the production destination above, and the hosted
+qvis tool cannot load them (#625). Set `INTEROP_QLOG_DIALECT=qvis-legacy`
+to select `h3_interop_tool --qlog-dialect qvis-legacy` instead, which adds
+the fields that tool's older loader requires and reports a Tardigrade-owned
+`file_schema` rather than claiming standard-schema conformance:
+
+```sh
+INTEROP_QLOG=1 \
+INTEROP_QLOG_DIALECT=qvis-legacy \
+INTEROP_ARTIFACT_DIR=/tmp/tardigrade-h3-artifacts \
+NGTCP2_EXAMPLES_DIR=/path/to/ngtcp2/build/examples \
+scripts/interop/run-interop.sh
+```
+
+Only use `qvis-legacy` artifacts with that specific hosted tool; keep the
+`current` default for anything else, including any standards-conformant
+qlog consumer.
 
 If any matrix row fails and an artifact root is active, the script prints the
 artifact directory once at the end:
@@ -364,8 +393,9 @@ and absent."
   `src/tls/keylog.zig` / `src/tls/transport.zig`.
 - **Integration**: drive a handshake and assert a produced `.sqlog` contains
   the expected event classes; snapshot metrics on common error paths.
-- **Manual**: load a saved `.sqlog` in qvis and a capture + `.keys` in Wireshark
-  once enough transport exists to produce real flows.
+- **Manual**: load a saved `.sqlog` (`--qlog-dialect qvis-legacy` for the
+  hosted tool, #625) in qvis, and a capture + `.keys` in Wireshark, once
+  enough transport exists to produce real flows.
 
 ## References
 

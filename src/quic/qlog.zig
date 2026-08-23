@@ -46,6 +46,38 @@ pub const file_schema_uri = "urn:ietf:params:qlog:file:sequential";
 pub const serialization_format = "application/qlog+json-seq";
 pub const sqlog_suffix = ".sqlog";
 
+/// `.qvis_legacy` dialect header fields (#625). qvis's hosted `.sqlog` loader
+/// (`TextSequenceJSONToQlog`, as of its `QlogSchema02` active schema)
+/// hard-rejects any json-seq header lacking `qlog_version` and
+/// `qlog_format: "JSON-SEQ"` — fields that are not part of the current
+/// `QlogFileSeq` schema (draft-ietf-quic-qlog-main-schema-14) and that qvis's
+/// own `versionAliases` table maps to draft-02, not the draft-13 event
+/// schemas and current sequential-file shape Tardigrade actually emits. A
+/// header carrying these fields is therefore not a truthful current-schema
+/// declaration and must not also claim `file_schema_uri` above — see
+/// `qvis_legacy_file_schema_uri`.
+pub const legacy_qlog_version = "0.3";
+pub const legacy_qlog_format = "JSON-SEQ";
+/// Tardigrade-owned file-schema identifier for the `.qvis_legacy` dialect.
+/// Deliberately distinct from `file_schema_uri`: that URN identifies the
+/// standard `QlogFileSeq` schema, which this dialect's extra legacy fields
+/// are not part of.
+pub const qvis_legacy_file_schema_uri = "https://bare.systems/tardigrade/qlog/file/qvis-legacy-1";
+
+/// Which header shape `writeTraceHeader` emits.
+pub const HeaderDialect = enum {
+    /// The standard, current `QlogFileSeq` header (draft-ietf-quic-qlog-main-schema-14):
+    /// `file_schema` + `serialization_format` only. Use this for all normal
+    /// `.sqlog` output, including the production H3 qlog destination.
+    current,
+    /// Adds the legacy `qlog_version`/`qlog_format` fields (and swaps in
+    /// `qvis_legacy_file_schema_uri`) so the file also satisfies the hosted
+    /// qvis tool's older `.sqlog` loader (#625). Opt-in only: never the
+    /// default for production artifacts, since it is not a standard-schema
+    /// declaration.
+    qvis_legacy,
+};
+
 /// qlog event namespace this transport emits. Application (`http3`) events are
 /// intentionally absent: they belong to `src/http3`.
 pub const Namespace = enum {
@@ -637,11 +669,20 @@ pub const TraceHeader = struct {
 /// Serialize the qlog file header as the first JSON-SEQ record. A composition
 /// root writes this once, then appends `writeJson` event records (from both
 /// `quic` and `http3`) to form a complete `.sqlog` file qvis can consume.
-/// Returns the written slice; a 512-byte buffer is enough.
-pub fn writeTraceHeader(header: TraceHeader, out: []u8) error{NoSpaceLeft}![]const u8 {
+/// `dialect` selects `.current` (standard `QlogFileSeq`, use for all normal
+/// output) or `.qvis_legacy` (adds compatibility fields for the hosted qvis
+/// tool's older loader, #625) — see `HeaderDialect`. Returns the written
+/// slice; a 512-byte buffer is enough.
+pub fn writeTraceHeader(header: TraceHeader, dialect: HeaderDialect, out: []u8) error{NoSpaceLeft}![]const u8 {
     var b = Buf{ .buf = out };
     try b.add("{c}", .{record_separator});
-    try b.add("{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"title\":", .{ file_schema_uri, serialization_format });
+    switch (dialect) {
+        .current => try b.add("{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"title\":", .{ file_schema_uri, serialization_format }),
+        .qvis_legacy => try b.add(
+            "{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"qlog_version\":\"{s}\",\"qlog_format\":\"{s}\",\"title\":",
+            .{ qvis_legacy_file_schema_uri, serialization_format, legacy_qlog_version, legacy_qlog_format },
+        ),
+    }
     try writeJsonString(&b, header.title);
     try b.add(",\"description\":", .{});
     try writeJsonString(&b, header.description);
@@ -793,7 +834,7 @@ test "trace header escapes free-form text fields" {
         .group_id = "0011deadbeef",
         .title = "test \"trace\"",
         .description = "debug \\ trace\nnext",
-    }, &buf);
+    }, .current, &buf);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, header[1 .. header.len - 1], .{});
     defer parsed.deinit();
     const root = parsed.value.object;
@@ -851,7 +892,7 @@ test "lost packet summaries stay aggregate and Tardigrade-namespaced" {
 
 test "trace header then event forms a two-record JSON-SEQ stream" {
     var buf: [1024]u8 = undefined;
-    const header = try writeTraceHeader(.{ .vantage_point = .server, .group_id = "0011deadbeef" }, &buf);
+    const header = try writeTraceHeader(.{ .vantage_point = .server, .group_id = "0011deadbeef" }, .current, &buf);
     const event = try writeJson(.{ .time_us = 2_500, .event = .{ .packet_sent = .{ .packet_type = .initial, .packet_number = 0, .length = 1200 } } }, buf[header.len..]);
     // Exactly two record separators, one per record.
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, buf[0 .. header.len + event.len], &[_]u8{record_separator}));
@@ -862,6 +903,36 @@ test "trace header then event forms a two-record JSON-SEQ stream" {
     try testing.expect(std.mem.indexOf(u8, header, "\"vantage_point\":{\"type\":\"server\"}") != null);
     try testing.expect(std.mem.indexOf(u8, header, "\"group_id\":\"0011deadbeef\"") != null);
     try testing.expect(std.mem.indexOf(u8, event, "quic:packet_sent") != null);
+}
+
+test "current dialect never carries the qvis-legacy compatibility fields" {
+    // The default/production header must stay a truthful, standard
+    // `QlogFileSeq` declaration: no `qlog_version`/`qlog_format`, and the
+    // real IETF file-schema URN, not the Tardigrade compatibility one.
+    var buf: [1024]u8 = undefined;
+    const header = try writeTraceHeader(.{ .vantage_point = .server, .group_id = "0011deadbeef" }, .current, &buf);
+    try testing.expect(std.mem.indexOf(u8, header, "\"qlog_version\"") == null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"qlog_format\"") == null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"file_schema\":\"" ++ file_schema_uri ++ "\"") != null);
+}
+
+test "qvis_legacy dialect satisfies qvis's json-seq header check without claiming the standard schema (#625)" {
+    // qvis's hosted `.sqlog` loader (quiclog/qvis
+    // visualizations/src/components/filemanager/newlineconverter/textsequencejsontoqlog.ts,
+    // active schema QlogSchema02) rejects the whole file with "did not start
+    // with the proper qlog header" unless the first record has a defined
+    // `qlog_version`, `qlog_format === "JSON-SEQ"`, and a `trace` object.
+    // Confirmed against a real trace generated by h3_interop_tool
+    // (--qlog-dialect qvis-legacy) and loaded into https://qvis.quictools.info/.
+    var buf: [1024]u8 = undefined;
+    const header = try writeTraceHeader(.{ .vantage_point = .client, .group_id = "ac75373edb249fe6" }, .qvis_legacy, &buf);
+    try testing.expect(std.mem.indexOf(u8, header, "\"qlog_version\":\"0.3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"qlog_format\":\"JSON-SEQ\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"trace\":{") != null);
+    // Must not falsely identify as the standard schema while carrying
+    // non-standard top-level fields.
+    try testing.expect(std.mem.indexOf(u8, header, "\"file_schema\":\"" ++ qvis_legacy_file_schema_uri ++ "\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"file_schema\":\"" ++ file_schema_uri ++ "\"") == null);
 }
 
 test "default sink is a no-op and log() stamps time" {
