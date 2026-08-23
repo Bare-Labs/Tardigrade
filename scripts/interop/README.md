@@ -136,6 +136,28 @@ also passes `--keylog-path`, writes per-role `.keys` files, and places a
 `SENSITIVE-KEYLOG.txt` marker beside them. Keylogs permit decrypting packet
 captures and must not be uploaded to public CI artifacts, logs, or issues.
 
+By default the retained `.sqlog` files use the standards-conformant
+`current` qlog header (`quic.qlog.HeaderDialect`, #625) — the same shape
+every other `.sqlog` consumer should expect. The hosted
+[qvis](https://qvis.quictools.info/) tool's `.sqlog` loader is older and
+rejects that header outright. To produce artifacts that specific tool
+accepts, also set `INTEROP_QLOG_DIALECT=qvis-legacy`:
+
+```sh
+INTEROP_QLOG=1 \
+INTEROP_QLOG_DIALECT=qvis-legacy \
+INTEROP_ARTIFACT_DIR=/tmp/tardigrade-h3-artifacts \
+NGTCP2_EXAMPLES_DIR=/tmp/tardigrade-h3-peer/client/build/examples \
+scripts/interop/run-interop.sh
+```
+
+`qvis-legacy` artifacts add the legacy fields hosted qvis requires and
+identify themselves with a Tardigrade-owned `file_schema` (not the
+standard IETF one) rather than falsely claiming standard-schema
+conformance — see `HeaderDialect` in `src/quic/qlog.zig` for details. Do
+not use `qvis-legacy` artifacts for anything other than that specific
+hosted tool.
+
 When any row fails and artifacts were enabled, the script prints the artifact
 root once after the summary so the directory can be collected:
 
