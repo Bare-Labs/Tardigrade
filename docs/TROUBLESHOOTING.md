@@ -640,7 +640,31 @@ certificate validation for every request to that origin. Instead fix the
 origin's certificate, supply the correct CA bundle via
 `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE`, or correct
 `TARDIGRADE_UPSTREAM_TLS_SERVER_NAME` if SNI doesn't match what the origin
-presents.
+presents. This applies identically on every `-Dtls-profile` build (#634):
+`appliance`/`native` upstream HTTPS goes through the native TLS/PKI stack
+(`src/http/tls_termination_stub.zig`'s `UpstreamTlsConn`), not OpenSSL, but
+the same knobs, the same 502-on-failure mapping, and the same "fix the
+certificate, don't disable verification" guidance apply.
+
+**Native-profile-specific cause:** under `-Dtls-profile=native`/`appliance`,
+certificate chain verification only authenticates signatures made with
+Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 (`src/pki/verify.zig`, #343).
+An origin whose chain is signed with classic RSA PKCS#1 v1.5
+(`sha256WithRSAEncryption`, still common among public CAs) or another
+unsupported combination (e.g. ECDSA/SHA-384) fails closed here even with a
+correct CA bundle and hostname — this is a native signature-algorithm
+coverage gap, not a misconfiguration, and disabling verification is still not
+the fix. Until the native matrix is extended, such an origin needs
+`-Dtls-profile=general` (OpenSSL) to be proxied with verification enabled.
+
+Independently of signature support, the native handshake engine also caps
+each peer certificate entry at 2048 DER bytes and the whole handshake
+message at 8 KiB (`src/tls/tls13_backend.zig`'s `max_certificate_len`/
+`max_message_len`). An origin whose certificate/chain exceeds either bound
+fails closed here even with an otherwise-supported signature algorithm — a
+plain Ed25519 leaf with a large SAN set, or a multi-certificate chain, can
+cross this. Same remedy as above: `-Dtls-profile=general` until the bound is
+raised.
 
 #### Verify the fix
 

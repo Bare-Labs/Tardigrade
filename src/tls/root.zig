@@ -36,6 +36,7 @@ pub const transcript = @import("transcript.zig");
 pub const transport = @import("transport.zig");
 pub const tls13_backend = @import("tls13_backend.zig");
 pub const tls13_transport = @import("tls13_transport.zig");
+pub const webpki_verifier = @import("webpki_verifier.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

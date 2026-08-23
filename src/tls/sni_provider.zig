@@ -10,6 +10,7 @@ const std = @import("std");
 const std_crypto = std.crypto;
 const crypto_pkg = @import("crypto");
 const crypto_provider = crypto_pkg.provider;
+const pki = @import("pki");
 const credentials = @import("credentials.zig");
 const dns_name = @import("dns_name.zig");
 
@@ -23,8 +24,22 @@ pub const AbsentSniPolicy = enum {
 };
 
 pub const UnknownSniPolicy = enum {
+    /// Blindly serve the default identity for any SNI with no explicit
+    /// pattern match, regardless of whether its certificate actually covers
+    /// the requested hostname. Kept for existing callers/tests; weakens
+    /// certificate-name semantics and is not the native listener's default.
     use_default,
     fail_handshake,
+    /// #634: serve the default identity for an SNI with no explicit pattern
+    /// match only when its own certificate's subjectAltName actually covers
+    /// the requested hostname (RFC 9525 matching via `pki.identity`, the same
+    /// machinery downstream/upstream hostname verification uses elsewhere —
+    /// no ad-hoc string matching). An explicit exact or wildcard pattern
+    /// (`TARDIGRADE_TLS_SNI_CERTS`) always wins first; this is consulted only
+    /// once no explicit pattern matches. A default identity that is absent,
+    /// malformed, or carries no matching SAN entry never satisfies the SNI
+    /// under this policy — it falls through exactly like `fail_handshake`.
+    use_default_when_identity_matches,
 };
 
 pub const SnapshotOptions = struct {
@@ -276,7 +291,9 @@ pub const Snapshot = struct {
             if (bundles[index].is_default) default_count += 1;
         }
         if (default_count > 1) return error.DuplicateDefaultBundle;
-        if (default_count == 0 and (options.absent_sni_policy == .use_default or options.unknown_sni_policy == .use_default))
+        if (default_count == 0 and (options.absent_sni_policy == .use_default or
+            options.unknown_sni_policy == .use_default or
+            options.unknown_sni_policy == .use_default_when_identity_matches))
             return error.NoUsableDefaultBundle;
 
         snapshot.bundles = bundles;
@@ -351,10 +368,38 @@ pub const Snapshot = struct {
         }
         if (best) |suffix| return .{ .wildcard = suffix };
 
+        // No explicit (`TARDIGRADE_TLS_SNI_CERTS`) pattern matched. #634:
+        // under `use_default_when_identity_matches`, the default identity
+        // may still be eligible if its own certificate's SAN actually covers
+        // `name` -- checked last, after every explicit pattern has already
+        // had first refusal, so an explicit mapping always wins.
+        if (self.options.unknown_sni_policy == .use_default_when_identity_matches) {
+            for (self.bundles) |bundle| {
+                if (bundle.is_default and self.defaultIdentitySatisfiesSni(&bundle, name)) return .default;
+            }
+        }
+
         return switch (self.options.unknown_sni_policy) {
             .use_default => .default,
-            .fail_handshake => null,
+            .fail_handshake, .use_default_when_identity_matches => null,
         };
+    }
+
+    /// Whether the default bundle's leaf certificate's subjectAltName covers
+    /// `name` (already lowercased/validated by the caller), via the same
+    /// RFC 9525 SAN/identity machinery `pki.identity` provides for
+    /// downstream mTLS and native upstream HTTPS hostname verification --
+    /// not ad-hoc wildcard/string matching. A default identity with an empty
+    /// chain, malformed leaf DER, or a SAN that simply does not cover `name`
+    /// all resolve to `false`: nothing here can accidentally satisfy an SNI
+    /// the certificate was never issued for.
+    fn defaultIdentitySatisfiesSni(self: *const Snapshot, bundle: *const CredentialBundle, name: []const u8) bool {
+        const leaf_der = if (bundle.chain.len > 0) bundle.chain[0] else return false;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const leaf = pki.x509.Certificate.parse(arena_state.allocator(), leaf_der, .{}) catch return false;
+        const verdict = pki.identity.verifyHost(&leaf, name) catch return false;
+        return verdict.isMatch();
     }
 };
 

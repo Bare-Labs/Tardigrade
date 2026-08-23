@@ -313,6 +313,27 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | path | `""` | PEM client certificate for upstream mTLS. | `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT=/etc/tardigrade/upstream.crt` |
 | `TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY` | path | `""` | PEM client private key for upstream mTLS. | `TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY=/etc/tardigrade/upstream.key` |
 
+Behavior is identical across all three `-Dtls-profile` builds (#634): `general`
+uses the OpenSSL adapter's upstream client, `appliance`/`native` use the
+native upstream TLS client (`src/http/tls_termination_stub.zig`'s
+`UpstreamTlsConn`) — same knobs, same semantics, no OpenSSL. "System defaults"
+for an empty `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE` means the OpenSSL default
+verify paths on `general`, or the first readable well-known system CA bundle
+file (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+`/etc/ssl/cert.pem`, and similar OS-standard locations) on `appliance`/
+`native`; if neither an explicit bundle nor a well-known location is usable,
+verification fails deterministically rather than silently trusting nothing.
+
+`appliance`/`native` verification currently authenticates certificate chain
+signatures made with Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 only
+(the pre-existing #343 native signature matrix); an origin signed with
+classic RSA PKCS#1 v1.5 or another unsupported algorithm fails verification
+even with a correct CA bundle and hostname (see `docs/TROUBLESHOOTING.md`).
+Independently, `appliance`/`native` also caps each peer certificate entry at
+2048 DER bytes and the whole handshake message at 8 KiB; a certificate or
+chain exceeding either bound fails even when its signature algorithm is
+otherwise supported. `general` has neither restriction.
+
 ### Health Checks And Circuit Breaking
 
 For active-probe aliases, `TARDIGRADE_UPSTREAM_PROBE_*` names are preferred only
@@ -358,7 +379,7 @@ settings.
 | `TARDIGRADE_TLS_CIPHER_LIST` | string | `""` | OpenSSL TLS <=1.2 cipher list. Appliance/native profiles require empty. | `TARDIGRADE_TLS_CIPHER_LIST=ECDHE+AESGCM` |
 | `TARDIGRADE_TLS_CIPHER_SUITES` | string | `""` | TLS 1.3 cipher suites. Appliance/native profiles require empty. | `TARDIGRADE_TLS_CIPHER_SUITES=TLS_AES_256_GCM_SHA384` |
 | `TARDIGRADE_TLS_SERVER_NAME` | DNS name | `""` | Unused by the general/OpenSSL terminator. Appliance requires one non-wildcard DNS name when TLS is enabled; appliance credential/name changes require restart. | `TARDIGRADE_TLS_SERVER_NAME=edge.example.com` |
-| `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name:cert:key&#124;name2:cert2:key2</code>. Appliance profile requires empty. | `TARDIGRADE_TLS_SNI_CERTS=api.example.com:/a.crt:/a.key` |
+| `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name:cert:key&#124;name2:cert2:key2</code>. Appliance profile requires empty. On `native`, an explicit entry always wins for its hostname; for any hostname with no entry, the default (`tls_cert_path`/`tls_key_path`) identity is served instead if its own certificate's SAN already covers that hostname (#634), otherwise the handshake fails closed. | `TARDIGRADE_TLS_SNI_CERTS=api.example.com:/a.crt:/a.key` |
 | `TARDIGRADE_TLS_SESSION_CACHE` | bool | `true` general, `false` appliance/native | OpenSSL session cache. Appliance/native profiles reject true (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | `TARDIGRADE_TLS_SESSION_CACHE=true` |
 | `TARDIGRADE_TLS_SESSION_CACHE_SIZE` | u32 | `20480` | OpenSSL session cache size. | `TARDIGRADE_TLS_SESSION_CACHE_SIZE=40960` |
 | `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS` | u32 | `300` | OpenSSL session timeout. | `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS=600` |

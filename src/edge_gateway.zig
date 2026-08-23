@@ -217,7 +217,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.warn(null, "upstream TLS certificate verification disabled", .{});
     }
     if (cfg.upstream_tls_client_cert.len > 0 or cfg.upstream_tls_server_name.len > 0) {
-        state.logger.info(null, "upstream mTLS client cert and/or SNI override configured; applies to OpenSSL-backed connections", .{});
+        state.logger.info(null, "upstream mTLS client cert and/or SNI override configured; applies to every upstream TLS connection regardless of -Dtls-profile", .{});
     }
 
     // Appliance TLS profile (#392): load and fully validate the one
@@ -3084,6 +3084,28 @@ fn respondHttp2Stream(
                 }
                 state.metricsRecordErrorCode(rejection.code);
             },
+            .return_response => |plan| {
+                switch (plan) {
+                    .method_not_allowed => {
+                        status_code = 405;
+                        body_alloc = try gp.buildApiErrorJson(allocator, "invalid_request", "Method Not Allowed", correlation_id);
+                        body = body_alloc.?;
+                        state.metricsRecordErrorCode("invalid_request");
+                    },
+                    .redirect => |r| {
+                        status_code = r.status;
+                        body = "";
+                        try response_headers.append(.{ .name = "location", .value = r.location });
+                        try response_headers.append(.{ .name = "content-type", .value = "text/plain; charset=utf-8" });
+                    },
+                    .body => |b| {
+                        status_code = b.status;
+                        body_alloc = try allocator.dupe(u8, b.body);
+                        body = body_alloc.?;
+                        try response_headers.append(.{ .name = "content-type", .value = "text/plain; charset=utf-8" });
+                    },
+                }
+            },
         }
     }
 
@@ -3134,6 +3156,7 @@ fn respondHttp2Stream(
 const Http2ProxyRouteResult = union(enum) {
     response: gp.BufferedUpstreamResponse,
     local_rejection: Http2LocalRejection,
+    return_response: ghandlers.ReturnResponsePlan,
 };
 
 const Http2LocalRejection = struct {
@@ -3197,6 +3220,10 @@ fn executeHttp2ProxyRoute(
     } };
     const target = switch (matched.block.action) {
         .proxy_pass => |value| value,
+        .return_response => |ret| {
+            const is_get_or_head = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
+            return .{ .return_response = ghandlers.planReturnResponse(is_get_or_head, ret.status, ret.body) };
+        },
         else => return null,
     };
     if (h2UnsupportedProxyOrchestration(route_cfg, matched)) return .{ .local_rejection = .{

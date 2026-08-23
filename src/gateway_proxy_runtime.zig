@@ -521,6 +521,13 @@ pub fn handleLocationProxyPass(
     location_id: []const u8,
     matched_block: *const edge_config.EdgeConfig.LocationBlock,
     streaming_request_body: ?StreamingRequestBody,
+    /// Set true when a streaming upstream failure happened after the
+    /// downstream response head was already committed to `writer` -- the
+    /// caller must force the connection closed (never keep it alive for a
+    /// pipelined request) rather than treat `keep_alive`'s original value as
+    /// still valid, since the client can no longer reliably parse anything
+    /// sent after this response's truncated body.
+    downstream_broken: *bool,
 ) !u16 {
     if (ctx.early_data.replayExposed()) {
         ctx.early_data_action = .forwarded;
@@ -582,6 +589,7 @@ pub fn handleLocationProxyPass(
             };
             state.recordUpstreamAttemptStart(selection.base_url);
             const proxy_buffer_observer = state.proxyBufferObserver();
+            var downstream_committed = false;
             const streamed = executeStreamingHttpProxyRequest(
                 allocator,
                 cfg,
@@ -609,6 +617,7 @@ pub fn handleLocationProxyPass(
                 state.proxyBufferGlobalAccount(),
                 &state.upstream_pool,
                 &state.h2_pool,
+                &downstream_committed,
             ) catch |err| {
                 state.recordUpstreamAttemptEnd(selection.base_url);
                 if (err == error.ClientAborted) {
@@ -666,8 +675,17 @@ pub fn handleLocationProxyPass(
                         state.recordProxyUpstreamFailure(cfg, selection.base_url, circuit_permit);
                     }
                     if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
-                    try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
+                    if (downstream_committed) {
+                        // Cancellation can fire mid-relay, after the response
+                        // head already went downstream (e.g. the h2-pool
+                        // path's own `cancelStopped` check inside its body
+                        // loop) -- never serialize a second response onto an
+                        // already-committed connection (#643).
+                        downstream_broken.* = true;
+                        return @intFromEnum(http.Status.gateway_timeout);
+                    }
+                    try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
                     return @intFromEnum(http.Status.gateway_timeout);
                 }
                 if (err == error.OutOfMemory) {
@@ -686,7 +704,22 @@ pub fn handleLocationProxyPass(
                 const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
                 const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
                 state.logger.warn(correlation_id, "streaming upstream request failed: {}", .{err});
-                try sendApiError(allocator, writer, err_status, err_code, err_msg, correlation_id, false, state);
+                if (downstream_committed) {
+                    // The failure happened after streamProxyOverTransport had
+                    // already written the downstream response head (its own
+                    // `wrote_downstream` reached true) -- writing a second
+                    // HTTP response here would corrupt the one already in
+                    // flight (e.g. a raw status line landing where the client
+                    // expects the next chunk-size line, breaking chunked
+                    // framing mid-stream). Record the failure for
+                    // metrics/health without touching `writer` again;
+                    // `downstream_broken` tells the caller to force the
+                    // connection closed instead of keeping it alive for a
+                    // pipelined request the client can no longer parse.
+                    downstream_broken.* = true;
+                } else {
+                    try sendApiError(allocator, writer, err_status, err_code, err_msg, correlation_id, false, state);
+                }
                 ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(err_status), 0);
                 return @intFromEnum(err_status);
             };
