@@ -6,7 +6,6 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARTIFACT_DIR=""
 TEMPLATE="${REPO_ROOT}/packaging/launchd/io.baresystems.tardigrade.plist"
 LABEL="io.baresystems.tardigrade"
-BOOTSTRAPPED=0
 TEMP_ROOT=""
 AGENT_PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 RENDERED_PLIST=""
@@ -91,6 +90,28 @@ capture_pid() {
     print_job | awk -F'= ' '/^[[:space:]]*pid = / { print $2; exit }'
 }
 
+job_summary() {
+    print_job | awk '
+        /^[[:space:]]*path = / && !seen_path++ { print; next }
+        /^[[:space:]]*state = / && !seen_state++ { print; next }
+        /^[[:space:]]*program = / && !seen_program++ { print; next }
+        /^[[:space:]]*working directory = / && !seen_workdir++ { print; next }
+        /^[[:space:]]*stdout path = / && !seen_stdout++ { print; next }
+        /^[[:space:]]*stderr path = / && !seen_stderr++ { print; next }
+        /^[[:space:]]*runs = / && !seen_runs++ { print; next }
+        /^[[:space:]]*pid = / && !seen_pid++ { print; next }
+        /^[[:space:]]*last exit code = / && !seen_exit++ { print; next }
+    '
+}
+
+job_runs() {
+    print_job | awk -F'= ' '/^[[:space:]]*runs = / { print $2; exit }'
+}
+
+job_last_exit_code() {
+    print_job | awk -F'= ' '/^[[:space:]]*last exit code = / { print $2; exit }'
+}
+
 diagnostics() {
     status="$1"
     if [[ "$status" -eq 0 ]]; then
@@ -112,9 +133,11 @@ diagnostics() {
             printf '  StandardErrorPath=%s\n' "$(plist_read :StandardErrorPath 2>/dev/null || true)"
         } >&2
     fi
-    if job_is_loaded; then
-        echo "launchctl print gui/${UID}/${LABEL}:" >&2
-        print_job >&2
+    if job_is_owned_by_smoke; then
+        echo "launchctl summary gui/${UID}/${LABEL}:" >&2
+        job_summary >&2
+    elif job_is_loaded; then
+        echo "pre-existing ${LABEL} job present; launchctl details suppressed" >&2
     fi
     if [[ -n "$TEMP_ROOT" ]]; then
         for log in "$TEMP_ROOT/var/log/tardigrade/stdout.log" "$TEMP_ROOT/var/log/tardigrade/stderr.log"; do
@@ -130,7 +153,7 @@ cleanup() {
     if job_is_owned_by_smoke; then
         launchctl bootout "gui/${UID}/${LABEL}" >/dev/null 2>&1 || true
     fi
-    if [[ -f "$AGENT_PLIST" && -n "$RENDERED_PLIST" ]] && cmp -s "$AGENT_PLIST" "$RENDERED_PLIST"; then
+    if [[ -f "$AGENT_PLIST" && ! -L "$AGENT_PLIST" && -n "$RENDERED_PLIST" ]] && cmp -s "$AGENT_PLIST" "$RENDERED_PLIST"; then
         rm -f "$AGENT_PLIST"
     fi
     if [[ -n "$TEMP_ROOT" ]]; then
@@ -155,7 +178,7 @@ if job_is_loaded; then
     exit 1
 fi
 
-if [[ -e "$AGENT_PLIST" ]]; then
+if [[ -e "$AGENT_PLIST" || -L "$AGENT_PLIST" ]]; then
     echo "Refusing to overwrite pre-existing LaunchAgent plist: $AGENT_PLIST" >&2
     exit 1
 fi
@@ -255,23 +278,37 @@ test -d "$LOG_DIR"
 
 install -m 0644 "$RENDERED_PLIST" "$AGENT_PLIST"
 launchctl bootstrap "gui/${UID}" "$AGENT_PLIST"
-BOOTSTRAPPED=1
 
 echo "launchctl print after bootstrap:"
-print_job
+job_summary
 
 ready=false
 body=""
-for _ in {1..100}; do
+deadline=$((SECONDS + 20))
+reported_exit=false
+while (( SECONDS < deadline )); do
     TARDI_PID="$(capture_pid || true)"
-    if body="$(curl -fsS -H 'Host: localhost' "http://127.0.0.1:${PORT}/" 2>/dev/null)"; then
+    if body="$(curl -fsS --connect-timeout 1 --max-time 2 -H 'Host: localhost' "http://127.0.0.1:${PORT}/" 2>/dev/null)"; then
         ready=true
         break
     fi
     if job_is_loaded; then
-        state="$(print_job)"
-        if printf '%s\n' "$state" | grep -E 'last exit code|exited|crashed' >/dev/null 2>&1; then
-            printf '%s\n' "$state" >&2
+        runs="$(job_runs || true)"
+        last_exit="$(job_last_exit_code || true)"
+        if [[ "$last_exit" =~ ^[0-9]+$ && "$last_exit" -ne 0 && -z "$TARDI_PID" ]]; then
+            echo "launchd job exited before readiness: last exit code $last_exit" >&2
+            job_summary >&2
+            exit 1
+        fi
+        if [[ "$runs" =~ ^[0-9]+$ && "$runs" -ge 5 ]]; then
+            echo "launchd job restarted repeatedly before readiness: runs=$runs" >&2
+            job_summary >&2
+            exit 1
+        fi
+        if [[ "$reported_exit" != true && "$last_exit" =~ ^[0-9]+$ && "$last_exit" -ne 0 ]]; then
+            echo "launchd job reported non-zero exit before readiness: last exit code $last_exit" >&2
+            job_summary >&2
+            reported_exit=true
         fi
     else
         echo "launchd job disappeared before readiness" >&2
@@ -286,14 +323,13 @@ if [[ "$ready" != true ]]; then
 fi
 
 assert_equals "$body" '<h1>launchd smoke</h1>' "root response body"
-assert_equals "$(curl -fsS -H 'Host: localhost' "http://127.0.0.1:${PORT}/health")" "ok" "health response body"
+assert_equals "$(curl -fsS --connect-timeout 1 --max-time 2 -H 'Host: localhost' "http://127.0.0.1:${PORT}/health")" "ok" "health response body"
 
 if [[ -z "$TARDI_PID" ]]; then
     TARDI_PID="$(capture_pid || true)"
 fi
 
 launchctl bootout "gui/${UID}/${LABEL}"
-BOOTSTRAPPED=0
 
 for _ in {1..50}; do
     if ! job_is_loaded; then
