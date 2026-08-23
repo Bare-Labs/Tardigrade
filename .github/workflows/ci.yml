@@ -62,11 +62,18 @@ jobs:
 
       - name: Validate Homebrew formula renderer
         run: |
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          cat > "$tmpdir/tardigrade-checksums.txt" <<'EOF'
+          1111111111111111111111111111111111111111111111111111111111111111  /tmp/release/tardigrade-linux-aarch64.tar.gz
+          2222222222222222222222222222222222222222222222222222222222222222  /tmp/release/tardigrade-linux-x86_64.tar.gz
+          EOF
           ./scripts/update-homebrew-formula.sh \
-            --version 0.5.0 \
-            --checksums-url https://github.com/Bare-Systems/Tardigrade/releases/download/v0.5.0/tardigrade-checksums.txt
+            --version 0.0.0-renderer-fixture \
+            --checksums "$tmpdir/tardigrade-checksums.txt" \
+            --formula "$tmpdir/tardigrade.rb"
+          ruby -c "$tmpdir/tardigrade.rb"
           ruby -c packaging/homebrew/tardigrade.rb
-          git diff --exit-code -- packaging/homebrew/tardigrade.rb
 
   # ── TLS dependency audit ──────────────────────────────────────────────────────
   # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3
@@ -490,7 +497,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
-        run: sudo apt-get install -y build-essential curl file git libssl-dev procps
+        run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -506,11 +513,55 @@ jobs:
             zig-packaging-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
             zig-packaging-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build native ReleaseFast binary
-        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native
+      - name: Build ReleaseFast binary
+        run: zig build -Doptimize=ReleaseFast
 
       - name: Smoke test install script
         run: ./scripts/test-install.sh
+
+      - name: Smoke test DEB package
+        run: ./scripts/test-deb-package.sh
+
+      - name: Smoke test RPM package
+        run: ./scripts/test-rpm-package.sh
+
+      - name: Smoke test Docker image
+        run: ./scripts/test-docker-image.sh
+
+  homebrew-formula-smoke:
+    name: Homebrew formula smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: sudo apt-get install -y build-essential curl file git procps
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-homebrew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-homebrew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-homebrew-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build native ReleaseFast binary
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=0.0.0-homebrew-smoke
 
       - name: Install Homebrew
         env:
@@ -524,15 +575,6 @@ jobs:
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           ./scripts/test-homebrew-formula.sh
-
-      - name: Smoke test DEB package
-        run: ./scripts/test-deb-package.sh
-
-      - name: Smoke test RPM package
-        run: ./scripts/test-rpm-package.sh
-
-      - name: Smoke test Docker image
-        run: ./scripts/test-docker-image.sh
 
   # ── Performance smoke ────────────────────────────────────────────────────────
   # Shared-runner loopback benchmark with conservative floors and a 30s default

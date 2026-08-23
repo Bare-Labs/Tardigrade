@@ -98,30 +98,35 @@ TAP_CREATED=true
 
 HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$TAP_NAME/tardigrade" --force --verbose
 INSTALLED_FORMULA=true
+HOMEBREW_NO_AUTO_UPDATE=1 brew test "$TAP_NAME/tardigrade" --verbose
 
-command -v tardi >/dev/null
-tardi version >/dev/null
-test -e "$(brew --prefix)/bin/tardigrade"
+installed="$(brew --prefix)/bin/tardi"
+alias_path="$(brew --prefix)/bin/tardigrade"
+test -x "$installed"
+test -e "$alias_path"
+"$installed" version >/dev/null
 
 "$REPO_ROOT/scripts/audit-release-binary.sh" \
-    --binary "$(brew --prefix)/bin/tardi" \
+    --binary "$installed" \
     --profile native \
     --output "$TMPDIR/dependency-inventory.json"
 
 mkdir -p "$TMPDIR/site"
 printf '%s\n' '<h1>homebrew smoke</h1>' > "$TMPDIR/site/index.html"
 cat > "$TMPDIR/tardigrade.conf" <<EOF
-server {
-  listen 127.0.0.1:18089;
-  root $TMPDIR/site;
+listen 18089;
+server_name localhost;
+
+location = /health {
+    return 200 homebrew-smoke;
 }
 EOF
 
-tardi check "$TMPDIR/tardigrade.conf" >/dev/null
-tardi run -c "$TMPDIR/tardigrade.conf" >"$TMPDIR/server.log" 2>&1 &
+"$installed" check "$TMPDIR/tardigrade.conf" >/dev/null
+"$installed" run -c "$TMPDIR/tardigrade.conf" >"$TMPDIR/server.log" 2>&1 &
 pid="$!"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if curl -fsS http://127.0.0.1:18089/ | grep -F "homebrew smoke" >/dev/null; then
+    if curl -fsS http://127.0.0.1:18089/health | grep -F "homebrew-smoke" >/dev/null; then
         kill "$pid"
         wait "$pid" 2>/dev/null || true
         printf 'Homebrew formula smoke passed\n'

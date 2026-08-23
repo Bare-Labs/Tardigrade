@@ -3,61 +3,88 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TAG=""
 VERSION=""
 CHECKSUMS_PATH=""
 CHECKSUMS_URL=""
 FORMULA_PATH="${REPO_ROOT}/packaging/homebrew/tardigrade.rb"
 TAP_DIR=""
+REPO="Bare-Systems/Tardigrade"
 
 usage() {
     cat <<'EOF'
-Usage: update-homebrew-formula.sh --version VERSION (--checksums PATH | --checksums-url URL) [--formula PATH] [--tap-dir DIR]
+Usage:
+  update-homebrew-formula.sh --tag vX.Y.Z [--formula PATH] [--tap-dir DIR]
+  update-homebrew-formula.sh --version VERSION --checksums PATH [--formula PATH]
 
-Renders packaging/homebrew/tardigrade.rb from a release checksum manifest.
-When --tap-dir is provided, also writes Formula/tardigrade.rb and README.md
-into a checkout of Bare-Systems/homebrew-tap.
+Production updates must use --tag. That mode resolves one GitHub release,
+downloads that release's tardigrade-checksums.txt, verifies every emitted
+archive exists in the same release, and renders the formula from that single
+source.
+
+The --version/--checksums mode is only for local release-shaped smoke fixtures.
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --tag) TAG="$2"; shift 2 ;;
         --version) VERSION="$2"; shift 2 ;;
         --checksums) CHECKSUMS_PATH="$2"; shift 2 ;;
         --checksums-url) CHECKSUMS_URL="$2"; shift 2 ;;
         --formula) FORMULA_PATH="$2"; shift 2 ;;
         --tap-dir) TAP_DIR="$2"; shift 2 ;;
+        --repo) REPO="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-if [ -z "$VERSION" ]; then
-    echo "--version is required" >&2
-    exit 2
-fi
-if [ -n "$CHECKSUMS_PATH" ] && [ -n "$CHECKSUMS_URL" ]; then
-    echo "use only one of --checksums or --checksums-url" >&2
-    exit 2
-fi
-if [ -z "$CHECKSUMS_PATH" ] && [ -z "$CHECKSUMS_URL" ]; then
-    echo "--checksums or --checksums-url is required" >&2
-    exit 2
+if [ -n "$TAG" ]; then
+    if [ -n "$VERSION" ] || [ -n "$CHECKSUMS_PATH" ] || [ -n "$CHECKSUMS_URL" ]; then
+        echo "--tag cannot be combined with --version, --checksums, or --checksums-url" >&2
+        exit 2
+    fi
+    case "$TAG" in
+        v*) VERSION="${TAG#v}" ;;
+        *) echo "--tag must be a release tag like v1.2.3" >&2; exit 2 ;;
+    esac
+else
+    if [ -z "$VERSION" ] || [ -z "$CHECKSUMS_PATH" ]; then
+        echo "use --tag vX.Y.Z for production updates or --version VERSION --checksums PATH for local smoke fixtures" >&2
+        exit 2
+    fi
+    if [ -n "$CHECKSUMS_URL" ]; then
+        echo "--checksums-url is only supported through --tag-derived release metadata" >&2
+        exit 2
+    fi
 fi
 
 tmpdir="$(mktemp -d)"
+# shellcheck disable=SC2329 # invoked by trap
 cleanup() {
     rm -rf "$tmpdir"
 }
 trap cleanup EXIT
 
 manifest="$CHECKSUMS_PATH"
-if [ -n "$CHECKSUMS_URL" ]; then
+assets_path="$tmpdir/assets.txt"
+if [ -n "$TAG" ]; then
+    release_json="$tmpdir/release.json"
+    gh release view "$TAG" --repo "$REPO" --json tagName,assets > "$release_json"
+    jq -r '.assets[].name' "$release_json" | sort > "$assets_path"
+    if ! grep -Fx 'tardigrade-checksums.txt' "$assets_path" >/dev/null; then
+        echo "release $TAG does not contain tardigrade-checksums.txt" >&2
+        exit 1
+    fi
     manifest="$tmpdir/tardigrade-checksums.txt"
-    curl -fsSL "$CHECKSUMS_URL" -o "$manifest"
-fi
-if [ ! -f "$manifest" ]; then
-    echo "checksum manifest not found: $manifest" >&2
-    exit 2
+    gh release download "$TAG" --repo "$REPO" --pattern tardigrade-checksums.txt --dir "$tmpdir" --clobber
+else
+    if [ ! -f "$manifest" ]; then
+        echo "checksum manifest not found: $manifest" >&2
+        exit 2
+    fi
+    : > "$assets_path"
 fi
 
 checksum_for() {
@@ -85,6 +112,39 @@ validate_sha() {
     fi
 }
 
+validate_release_asset() {
+    asset="$1"
+    if [ -n "$TAG" ] && ! grep -Fx "$asset" "$assets_path" >/dev/null; then
+        echo "release $TAG does not contain formula asset $asset" >&2
+        exit 1
+    fi
+}
+
+validate_native_inventory() {
+    asset="$1"
+    if [ -z "$TAG" ]; then
+        return
+    fi
+
+    archive_name="${asset%.tar.gz}"
+    inventory_asset="dependency-inventory-${archive_name}.json"
+    if ! grep -Fx "$inventory_asset" "$assets_path" >/dev/null; then
+        echo "release $TAG does not contain native dependency inventory $inventory_asset" >&2
+        exit 1
+    fi
+
+    gh release download "$TAG" --repo "$REPO" --pattern "$inventory_asset" --dir "$tmpdir" --clobber
+    inventory_path="$tmpdir/$inventory_asset"
+    if [ "$(jq -r '.profile' "$inventory_path")" != "native" ] ||
+        [ "$(jq -r '.reported_profile' "$inventory_path")" != "native" ] ||
+        [ "$(jq -r '.reported_backend' "$inventory_path")" != "native" ] ||
+        [ "$(jq -r '.links_openssl' "$inventory_path")" != "false" ] ||
+        [ "$(jq -r '.status' "$inventory_path")" != "pass" ]; then
+        echo "release $TAG inventory $inventory_asset does not prove native, OpenSSL-free artifact status" >&2
+        exit 1
+    fi
+}
+
 emit_branch() {
     arch_dsl="$1"
     asset="$2"
@@ -92,7 +152,7 @@ emit_branch() {
 
     cat <<EOF
     ${arch_dsl} do
-      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v${VERSION}/${asset}"
+      url "https://github.com/${REPO}/releases/download/v${VERSION}/${asset}"
       sha256 "${sha}"
     end
 EOF
@@ -120,7 +180,11 @@ for pair in \
     "$darwin_intel_asset:$darwin_intel_sha"; do
     asset="${pair%%:*}"
     sha="${pair#*:}"
-    [ -z "$sha" ] || validate_sha "$asset" "$sha"
+    if [ -n "$sha" ]; then
+        validate_sha "$asset" "$sha"
+        validate_release_asset "$asset"
+        validate_native_inventory "$asset"
+    fi
 done
 
 mkdir -p "$(dirname "$FORMULA_PATH")"
@@ -133,7 +197,7 @@ formula_tmp="$tmpdir/tardigrade.rb"
 
 class Tardigrade < Formula
   desc "Small Zig edge server for static file serving, reverse proxying, and TLS termination"
-  homepage "https://github.com/Bare-Systems/Tardigrade"
+  homepage "https://github.com/${REPO}"
   version "${VERSION}"
   license "Apache-2.0"
 
@@ -167,7 +231,10 @@ EOF
   end
 
   test do
-    assert_match "Tardigrade", shell_output("#{bin}/tardi version")
+    output = shell_output("#{bin}/tardi version")
+    assert_match version.to_s, output
+    assert_match "tls-profile=native", output
+    assert_match "tls-backend=native", output
     assert_equal (bin/"tardi").realpath, (bin/"tardigrade").realpath
   end
 end

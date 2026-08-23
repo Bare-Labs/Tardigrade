@@ -15,7 +15,7 @@ versus what is a local-build-only tool.
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Host-native builds infer the backend and cross-compiled builds can pass it explicitly. The spec's OpenSSL runtime dependency is conditional on the packaged binary/backend; official native release packages do not declare it. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **CI-validated user LaunchAgent template** | The Darwin release-smoke workflow renders the checked-in host-style `/usr/local/...` template into an isolated prefix on the `macos-15` Apple Silicon runner, stages the native Darwin archive's `tardi` binary plus `tardigrade -> tardi` compatibility alias, and proves a real `launchctl bootstrap` -> readiness/request -> `bootout` lifecycle in the current user's launchd domain. |
-| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Canonical formula source; Linux release-backed today** | `packaging/homebrew/tardigrade.rb` is generated from one release checksum manifest by `scripts/update-homebrew-formula.sh` and is the source copied into `Bare-Systems/homebrew-tap/Formula/tardigrade.rb`. The current public `v0.5.0` release has Linux archives only, so the rendered formula intentionally declares `depends_on :linux` and exposes no macOS branch until a release publishes real Darwin archives. The formula installs `tardi`, preserves the packaged `tardigrade` alias, and declares no OpenSSL runtime dependency for Tardigrade. |
+| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Preparatory; awaiting native release** | `scripts/update-homebrew-formula.sh` renders the formula from one release tag and verifies the referenced archives exist in that same release. The current public `v0.5.0` release predates the native #634 shipping cutover and old/new archive-layout switch, so it must not be used for the public tap formula. Generate and publish the tap formula only after a release publishes native audited archives with canonical `tardi` plus the `tardigrade` alias. |
 | Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. Docker's remaining OpenSSL cutover is tracked by #634 and is separate from the raw release/archive lane in #476. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
 
 ## Official release implementation
@@ -259,36 +259,41 @@ isn't a complete pre-flight check on its own (it doesn't load
 
 ## Homebrew (macOS and Linux)
 
-The canonical formula source is
-[`packaging/homebrew/tardigrade.rb`](homebrew/tardigrade.rb). It is rendered
-deterministically from one release checksum manifest by
-[`scripts/update-homebrew-formula.sh`](../scripts/update-homebrew-formula.sh),
-then copied into the existing public `Bare-Systems/homebrew-tap` repository.
-Do not hand-maintain a second authoritative formula in the tap.
+Homebrew publication is intentionally preparatory. The currently published
+latest release, `v0.5.0`, predates the native #634 shipping cutover and uses the
+old archive layout, so it must not be used for the public tap formula even
+though it has real Linux archive checksums.
 
-The current public `v0.5.0` release publishes Linux x86_64/aarch64 archives
-only, so the checked-in formula is release-backed for Homebrew on Linux and
-intentionally does not advertise macOS. After a release publishes
-`tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz` with
-matching entries in `tardigrade-checksums.txt`, the same renderer will add the
-macOS branches. The formula has no `openssl@3` dependency; native release
-artifacts are audited by `scripts/audit-release-binary.sh`.
+The intended ownership model is:
 
-Render and validate from a published release:
+```text
+Tardigrade release tag
+        -> scripts/update-homebrew-formula.sh
+        -> packaging/homebrew/tardigrade.rb
+        -> Bare-Systems/homebrew-tap/Formula/tardigrade.rb
+```
+
+The companion tap work must not keep an independent formula updater if this
+repository remains canonical. If the tap becomes canonical instead, remove this
+renderer and checked-in formula source so there are not two update paths.
+
+Render and validate from the first published native release:
 
 ```bash
 ./scripts/update-homebrew-formula.sh \
-  --version 0.5.0 \
-  --checksums-url https://github.com/Bare-Systems/Tardigrade/releases/download/v0.5.0/tardigrade-checksums.txt
+  --tag vX.Y.Z
 ruby -c packaging/homebrew/tardigrade.rb
 ```
+
+`--tag` resolves that exact GitHub release, downloads its
+`tardigrade-checksums.txt`, and verifies every emitted formula archive is
+present in the same release before writing URLs and SHA-256 values.
 
 Copy the formula and tap README into a tap checkout:
 
 ```bash
 ./scripts/update-homebrew-formula.sh \
-  --version 0.5.0 \
-  --checksums-url https://github.com/Bare-Systems/Tardigrade/releases/download/v0.5.0/tardigrade-checksums.txt \
+  --tag vX.Y.Z \
   --tap-dir ../homebrew-tap
 ```
 
@@ -300,8 +305,16 @@ zig build -Doptimize=ReleaseFast -Dtls-profile=native
 ./scripts/test-homebrew-formula.sh
 ```
 
+After rendering `packaging/homebrew/tardigrade.rb` from a real native release
+tag, run the release-backed smoke too. This installs the exact formula
+URL/checksum bytes through Homebrew and audits the installed binary:
+
+```bash
+./scripts/test-homebrew-release-formula.sh
+```
+
 Once the tap has been updated for a release whose formula supports the target
-host, the public install shape is:
+host and the release-backed formula smoke passes, the public install shape is:
 
 ```bash
 brew tap Bare-Systems/tap

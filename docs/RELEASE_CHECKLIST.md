@@ -28,9 +28,10 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] Confirm `scripts/release-metadata.sh` resolves the intended tag/version
 - [ ] Update `docs/SUPPORT_MATRIX.md` when public behavior or maturity claims changed
 - [ ] Run `./scripts/test-install.sh` against a ReleaseFast native build (`-Dtls-profile=native`)
-- [ ] Render the Homebrew formula from this release's
-      `tardigrade-checksums.txt` with `./scripts/update-homebrew-formula.sh`,
+- [ ] Render the Homebrew formula from this release tag with
+      `./scripts/update-homebrew-formula.sh --tag <tag>`,
       run `ruby -c packaging/homebrew/tardigrade.rb`, and run
+      `./scripts/test-homebrew-release-formula.sh` plus
       `./scripts/test-homebrew-formula.sh` on each Homebrew environment the
       release honestly supports
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker

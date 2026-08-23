@@ -1,24 +1,24 @@
 # Tardigrade Homebrew Formula
 
-This directory is the canonical source for the public
-`Bare-Systems/homebrew-tap` formula. Do not maintain a second independent
-formula in the tap repository.
+This directory contains the preparatory Homebrew formula source and renderer.
+Do not copy `packaging/homebrew/tardigrade.rb` into `Bare-Systems/homebrew-tap`
+until a release exists that satisfies the native #634 shipping contract and the
+current archive layout.
 
 Release publication flow:
 
-1. Publish Tardigrade release archives and `tardigrade-checksums.txt`.
-2. Render the formula from that release manifest:
+1. Publish native Tardigrade release archives and `tardigrade-checksums.txt`.
+2. Render the formula from that release tag:
 
    ```bash
-   ./scripts/update-homebrew-formula.sh \
-     --version 0.5.0 \
-     --checksums-url https://github.com/Bare-Systems/Tardigrade/releases/download/v0.5.0/tardigrade-checksums.txt
+   ./scripts/update-homebrew-formula.sh --tag vX.Y.Z
    ```
 
 3. Validate the rendered formula:
 
    ```bash
    ruby -c packaging/homebrew/tardigrade.rb
+   ./scripts/test-homebrew-release-formula.sh
    ./scripts/test-homebrew-formula.sh
    ```
 
@@ -27,16 +27,15 @@ Release publication flow:
 
    ```bash
    ./scripts/update-homebrew-formula.sh \
-     --version 0.5.0 \
-     --checksums-url https://github.com/Bare-Systems/Tardigrade/releases/download/v0.5.0/tardigrade-checksums.txt \
+     --tag vX.Y.Z \
      --tap-dir ../homebrew-tap
    ```
 
 The renderer only emits platform/architecture branches whose archive names are
-present in the checksum manifest. The current public `v0.5.0` release has Linux
-archives only, so the generated formula is Linux-only. Darwin branches must wait
-for a release manifest containing `tardigrade-darwin-x86_64.tar.gz` and
-`tardigrade-darwin-arm64.tar.gz`.
+present in the release's checksum manifest and asset list. The current public
+`v0.5.0` release predates the native cutover and must not be rendered into the
+tap formula. Darwin branches must wait for a release manifest containing
+`tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`.
 
 The formula installs `tardi` and the packaged `tardigrade` compatibility alias.
 It intentionally declares no `openssl@3` dependency; native release artifacts

@@ -4,6 +4,15 @@ Homebrew formulas for Bare Systems projects.
 
 ## Tardigrade
 
+Tardigrade Homebrew publication is not generally supported yet. Do not publish
+generic install instructions until the formula points at a release that passes
+the native release-backed Homebrew smoke. The current public `v0.5.0` release
+predates the native shipping cutover and must not be used as the tap formula
+source; macOS Homebrew also remains unsupported until real Darwin archives are
+published.
+
+Expected shape after that release:
+
 ```bash
 brew tap Bare-Systems/tap
 brew install tardigrade

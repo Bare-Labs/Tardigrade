@@ -98,10 +98,10 @@ still use the transitional OpenSSL-backed profile.
 
 The initial Darwin archives are unsigned and not notarized; see the Gatekeeper
 note in [packaging/README.md](packaging/README.md) before redistributing
-browser-downloaded artifacts. Homebrew currently has a release-backed Linux
-formula source in this repository; the public tap should not be advertised for
-macOS until a release publishes real Darwin archives and the tap formula points
-at their checksums. Launchd lifecycle validation (#467) is a separate follow-up.
+browser-downloaded artifacts. Homebrew publication remains preparatory until a
+release publishes native audited archives with the current `tardi` archive
+layout and the tap formula points at that release's checksums. Launchd lifecycle
+validation (#467) is a separate follow-up.
 
 Other install paths:
 
@@ -109,8 +109,10 @@ Other install paths:
 - Native DEB/RPM packages (published on every release) and systemd/launchd
   service files — see [packaging/README.md](packaging/README.md) for
   current status and install/build instructions.
-- Homebrew formula source for Linux release archives, plus the tap publication
-  workflow — see [packaging/README.md](packaging/README.md#homebrew-macos-and-linux).
+- Homebrew formula generation and tap publication workflow — see
+  [packaging/README.md](packaging/README.md#homebrew-macos-and-linux). Do not
+  advertise `brew install tardigrade` until the formula points at a native
+  release that passes the release-backed smoke.
 - Build from source (see below).
 
 For running Tardigrade as a managed service — systemd unit, filesystem
