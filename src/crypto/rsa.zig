@@ -1,4 +1,8 @@
-//! Strict RSA-PSS-RSAE-SHA256 verification.
+//! Strict RSA-PSS-RSAE-SHA256 verification, plus strict RSA PKCS#1 v1.5
+//! (EMSA-PKCS1-v1_5) verification for X.509 certificate-chain signatures
+//! (#645). The two schemes share every RSA primitive below (DER key
+//! parsing, accepted modulus sizes, `std.crypto.ff.Modulus` exponentiation)
+//! and differ only in how the recovered encoded message is validated.
 
 const std = @import("std");
 const crypto = std.crypto;
@@ -7,6 +11,7 @@ const secrets = @import("crypto_secrets");
 const provider = @import("provider.zig");
 
 const Sha256 = crypto.hash.sha2.Sha256;
+const Sha384 = crypto.hash.sha2.Sha384;
 pub const max_modulus_bits = 4096;
 pub const max_modulus_bytes = max_modulus_bits / 8;
 const test_modulus_bytes = 256;
@@ -46,6 +51,26 @@ pub const testdata = struct {
     pub const private_key_pkcs1_der: []const u8 = &private_key_pkcs1_bytes;
     /// `RSAPublicKey` DER — the format `verifyPssSha256` accepts directly.
     pub const public_key_der: []const u8 = &public_key_bytes;
+
+    const pkcs1_signature_sha256_bytes = hexBytes(
+        "1e00b575be6a75cb23a9098792edb981302aee63ecc75175b9b33e06015defe104b01d5093896191df6442d23fc0b449b1541990fa45ccea613f4d1fb520de9fb5e3b692c3055c70247cfba045f6f5404f29500fb7704e13efb90af4520326c092cdac659aee61555db47cad9e86d7cc2cdaebfa8b1713322330ad0e4937de2636492b73e37adde06f4a16dc2e3608f1df573f34eaf0dd316bd2ccf1d670851bb7ffd4ebb67713ae6d08efab2bb25895acc81dbd5f7170f3ea0d73643da007162f9423a6870f6fdee063142a5f2f8b8634e78466f17569c3bb79ab03a1f46e3a63e686f4bfdb23b4b8bedfc845429f92db1b41361ae0b66172418848bf117b55",
+    );
+    const pkcs1_signature_sha384_bytes = hexBytes(
+        "5c5423c36b3101a52f13e6feeafed962c1b6e92ee0f45bfd1d6d21908f9bf9198916ce8d9c031efc705f41025895b7a7010eb47023808fe1bfc51c8cfe6497af6201ac7d60d27744637e34295031b0c02260b6b94f7782bd734907d101461ae70420f39a8e92c46fbad3b4d4eac80e8939aadeeb35ff84c4394cd6ade4037c85aa84fad0f3a7805019163d59d0dce1bffefd67332a8e0c7abd783f36a409fc4ae1aa11a66cc4a1cae6c6e94e20ae7a92bcd449216fd8b2bab7d597f2a16a55d2a4f25a400deaec2d1375d517b66d1ea1c8120b36438a5a55b2b9b12f41e5176cce8cd777b6c6c46d163ebdb7ffbb3a083da1ca5627321072c09320bdd545d226",
+    );
+
+    /// Message `pkcs1_signature_sha256`/`pkcs1_signature_sha384` below sign,
+    /// for `verifyPkcs1v15Sha256`/`verifyPkcs1v15Sha384` positive fixtures.
+    pub const pkcs1_message = "the quick brown fox jumps over the lazy dog";
+
+    /// `openssl dgst -sha256 -sign` over `private_key_pkcs1_der` and
+    /// `pkcs1_message` — real EMSA-PKCS1-v1_5/SHA-256, so a successful
+    /// verification is a differential check against OpenSSL's own signer.
+    pub const pkcs1_signature_sha256: []const u8 = &pkcs1_signature_sha256_bytes;
+
+    /// `openssl dgst -sha384 -sign` over `private_key_pkcs1_der` and
+    /// `pkcs1_message` — real EMSA-PKCS1-v1_5/SHA-384.
+    pub const pkcs1_signature_sha384: []const u8 = &pkcs1_signature_sha384_bytes;
 };
 
 const PublicKey = struct {
@@ -194,6 +219,108 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
     var encoded: [max_modulus_bytes]u8 = undefined;
     recovered.toBytes(encoded[0..key.modulus.len], .big) catch return error.InvalidInput;
     verifyPss(encoded[0..key.modulus.len], key.bits - 1, message) catch return error.AuthenticationFailed;
+}
+
+// ---------------------------------------------------------------------------
+// RSA PKCS#1 v1.5 (EMSA-PKCS1-v1_5) verification.
+// ---------------------------------------------------------------------------
+
+/// RFC 8017 Appendix A.2.4 `DigestInfo` DER prefix (the `SEQUENCE { SEQUENCE
+/// { OID, NULL }, OCTET STRING }` header up to but excluding the digest
+/// bytes) for SHA-256: `id-sha256` with the mandatory NULL
+/// `AlgorithmIdentifier` parameter EMSA-PKCS1-v1_5 requires. A well-known,
+/// fixed constant — not computed — so a strict verifier can require it
+/// byte-for-byte rather than reparsing the recovered block's ASN.1.
+const digest_info_prefix_sha256 = [_]u8{
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+    0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+};
+
+/// Same as `digest_info_prefix_sha256` for `id-sha384`.
+const digest_info_prefix_sha384 = [_]u8{
+    0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+    0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+};
+
+/// Verify an EMSA-PKCS1-v1_5-encoded signature for `Hash` against
+/// `digest_info_prefix`. Shared by `verifyPkcs1v15Sha256`/
+/// `verifyPkcs1v15Sha384` so there is exactly one verification path, not one
+/// per hash.
+///
+/// After public-exponent modular exponentiation, the expected encoded
+/// message is *constructed* for the exact modulus width — `0x00 || 0x01 ||
+/// PS(0xff, at least 8 bytes) || 0x00 || digest_info_prefix ||
+/// Hash(message)` — and compared to the recovered block with the
+/// repository's constant-time helper, rather than parsing the recovered
+/// block permissively. This rejects any BER-ish, partial, prefix-only, or
+/// otherwise non-canonical EMSA-PKCS1-v1_5 encoding: only the single exact
+/// byte string is accepted.
+fn verifyPkcs1v15(
+    comptime Hash: type,
+    digest_info_prefix: []const u8,
+    public_key_der: []const u8,
+    message: []const u8,
+    signature: []const u8,
+) (error{ InvalidInput, AuthenticationFailed })!void {
+    const key = parsePublicKey(public_key_der) catch return error.InvalidInput;
+    if (signature.len != key.modulus.len) return error.InvalidInput;
+
+    var modulus_fe = ff.Modulus(max_modulus_bits).fromBytes(key.modulus, .big) catch return error.InvalidInput;
+    const signature_fe = ff.Modulus(max_modulus_bits).Fe.fromBytes(modulus_fe, signature, .big) catch |err| switch (err) {
+        error.NonCanonical => return error.AuthenticationFailed,
+        else => return error.InvalidInput,
+    };
+    const recovered = modulus_fe.powWithEncodedPublicExponent(signature_fe, key.exponent, .big) catch return error.InvalidInput;
+    var encoded: [max_modulus_bytes]u8 = undefined;
+    recovered.toBytes(encoded[0..key.modulus.len], .big) catch return error.InvalidInput;
+
+    // The full encoded message (`EM`) is exactly one modulus wide: 0x00,
+    // 0x01, the 0xff padding string `PS`, a 0x00 separator, then
+    // `DigestInfo`. `PS` must be at least 8 bytes (RFC 8017 §9.2 step 3), so
+    // a modulus too small to hold that plus the fixed 3 bytes and this
+    // hash's `DigestInfo` cannot validly encode anything — a config/key
+    // mismatch, not a forgeable signature.
+    const digest_info_len = digest_info_prefix.len + Hash.digest_length;
+    const fixed_len = 3 + digest_info_len;
+    const min_ps_len = 8;
+    if (key.modulus.len < fixed_len + min_ps_len) return error.InvalidInput;
+    const ps_len = key.modulus.len - fixed_len;
+
+    var expected: [max_modulus_bytes]u8 = undefined;
+    expected[0] = 0x00;
+    expected[1] = 0x01;
+    @memset(expected[2 .. 2 + ps_len], 0xff);
+    expected[2 + ps_len] = 0x00;
+    const digest_info_offset = 3 + ps_len;
+    @memcpy(expected[digest_info_offset .. digest_info_offset + digest_info_prefix.len], digest_info_prefix);
+    const digest_offset = digest_info_offset + digest_info_prefix.len;
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash(message, &digest, .{});
+    @memcpy(expected[digest_offset .. digest_offset + Hash.digest_length], &digest);
+    std.debug.assert(digest_offset + Hash.digest_length == key.modulus.len);
+
+    if (!secrets.constantTimeEqual(encoded[0..key.modulus.len], expected[0..key.modulus.len])) {
+        return error.AuthenticationFailed;
+    }
+}
+
+/// Verify an RSA PKCS#1 v1.5 (`sha256WithRSAEncryption`/`rsa_pkcs1_sha256`)
+/// signature. `public_key_der` is a DER `RSAPublicKey` with a 2048-, 3072-,
+/// or 4096-bit modulus; `signature` must be exactly one modulus wide.
+/// Malformed keys and wrong-sized signatures return `error.InvalidInput`; a
+/// structurally valid signature whose integer is out of range or whose
+/// EMSA-PKCS1-v1_5 encoding does not match returns
+/// `error.AuthenticationFailed`. This is X.509 certificate-chain signature
+/// verification only — never wire this into TLS 1.3 `CertificateVerify`
+/// signing/negotiation (RFC 8446 §4.2.3 forbids `rsa_pkcs1` there).
+pub fn verifyPkcs1v15Sha256(public_key_der: []const u8, message: []const u8, signature: []const u8) (error{ InvalidInput, AuthenticationFailed })!void {
+    return verifyPkcs1v15(Sha256, &digest_info_prefix_sha256, public_key_der, message, signature);
+}
+
+/// Same as `verifyPkcs1v15Sha256` for `sha384WithRSAEncryption`/
+/// `rsa_pkcs1_sha384`.
+pub fn verifyPkcs1v15Sha384(public_key_der: []const u8, message: []const u8, signature: []const u8) (error{ InvalidInput, AuthenticationFailed })!void {
+    return verifyPkcs1v15(Sha384, &digest_info_prefix_sha384, public_key_der, message, signature);
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +928,81 @@ test "RSA-PSS rejects short, long, and out-of-range signatures" {
     try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", signature_equal_to_modulus[0 .. signature_equal_to_modulus.len - 1]));
     var long_signature: [test_modulus_bytes + 1]u8 = undefined;
     try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", &long_signature));
+}
+
+// ---------------------------------------------------------------------------
+// RSA PKCS#1 v1.5 verification tests. `testdata.pkcs1_signature_*` are real
+// openssl-generated signatures (`openssl dgst -sha256/-sha384 -sign`) over
+// `testdata`'s RSA-2048 key, so a successful verification is a differential
+// check against OpenSSL's own PKCS#1 v1.5 signer.
+// ---------------------------------------------------------------------------
+
+test "RSA PKCS#1 v1.5/SHA-256 verifies a known-good openssl signature and rejects tampering" {
+    try verifyPkcs1v15Sha256(testdata.public_key_der, testdata.pkcs1_message, testdata.pkcs1_signature_sha256);
+
+    // Tampered message: same signature, different signed content.
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        verifyPkcs1v15Sha256(testdata.public_key_der, "the quick brown fox jumps over the lazy cat", testdata.pkcs1_signature_sha256),
+    );
+
+    // Tampered signature: flip one byte.
+    var tampered_sig: [test_modulus_bytes]u8 = undefined;
+    @memcpy(&tampered_sig, testdata.pkcs1_signature_sha256);
+    tampered_sig[tampered_sig.len - 1] ^= 0x01;
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        verifyPkcs1v15Sha256(testdata.public_key_der, testdata.pkcs1_message, &tampered_sig),
+    );
+
+    // Wrong signature length: neither is authenticated, both InvalidInput.
+    try std.testing.expectError(
+        error.InvalidInput,
+        verifyPkcs1v15Sha256(testdata.public_key_der, testdata.pkcs1_message, testdata.pkcs1_signature_sha256[0 .. testdata.pkcs1_signature_sha256.len - 1]),
+    );
+    var long_signature: [test_modulus_bytes + 1]u8 = undefined;
+    try std.testing.expectError(
+        error.InvalidInput,
+        verifyPkcs1v15Sha256(testdata.public_key_der, testdata.pkcs1_message, &long_signature),
+    );
+
+    // Malformed RSA public key.
+    try std.testing.expectError(
+        error.InvalidInput,
+        verifyPkcs1v15Sha256(&[_]u8{0x30}, testdata.pkcs1_message, testdata.pkcs1_signature_sha256),
+    );
+}
+
+test "RSA PKCS#1 v1.5/SHA-384 verifies a known-good openssl signature and rejects tampering" {
+    try verifyPkcs1v15Sha384(testdata.public_key_der, testdata.pkcs1_message, testdata.pkcs1_signature_sha384);
+
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        verifyPkcs1v15Sha384(testdata.public_key_der, "the quick brown fox jumps over the lazy cat", testdata.pkcs1_signature_sha384),
+    );
+
+    var tampered_sig: [test_modulus_bytes]u8 = undefined;
+    @memcpy(&tampered_sig, testdata.pkcs1_signature_sha384);
+    tampered_sig[tampered_sig.len - 1] ^= 0x01;
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        verifyPkcs1v15Sha384(testdata.public_key_der, testdata.pkcs1_message, &tampered_sig),
+    );
+
+    try std.testing.expectError(
+        error.InvalidInput,
+        verifyPkcs1v15Sha384(testdata.public_key_der, testdata.pkcs1_message, testdata.pkcs1_signature_sha384[0 .. testdata.pkcs1_signature_sha384.len - 1]),
+    );
+}
+
+test "RSA PKCS#1 v1.5 rejects a signature integer equal to or greater than the modulus" {
+    const exponent = [_]u8{ 1, 0, 1 };
+    var der: [300]u8 = undefined;
+    const key = makeTestPublicKey(&der, &exponent, test_modulus_bytes, 0x80);
+    const signature_equal_to_modulus = minimumTestModulus();
+    const signature_greater_than_modulus = [_]u8{0xff} ** test_modulus_bytes;
+    try std.testing.expectError(error.AuthenticationFailed, verifyPkcs1v15Sha256(key, testdata.pkcs1_message, &signature_equal_to_modulus));
+    try std.testing.expectError(error.AuthenticationFailed, verifyPkcs1v15Sha256(key, testdata.pkcs1_message, &signature_greater_than_modulus));
 }
 
 // ---------------------------------------------------------------------------

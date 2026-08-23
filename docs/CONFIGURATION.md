@@ -325,14 +325,19 @@ file (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
 verification fails deterministically rather than silently trusting nothing.
 
 `appliance`/`native` verification currently authenticates certificate chain
-signatures made with Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 only
-(the pre-existing #343 native signature matrix); an origin signed with
-classic RSA PKCS#1 v1.5 or another unsupported algorithm fails verification
+signatures made with Ed25519, ECDSA P-256/SHA-256, RSA-PSS/SHA-256, or (as of
+#645) RSA PKCS#1 v1.5/SHA-256 or SHA-384 (`sha256WithRSAEncryption`/
+`sha384WithRSAEncryption`, still common among public CAs); an origin signed
+with another unsupported algorithm (e.g. ECDSA/SHA-384) fails verification
 even with a correct CA bundle and hostname (see `docs/TROUBLESHOOTING.md`).
-Independently, `appliance`/`native` also caps each peer certificate entry at
-2048 DER bytes and the whole handshake message at 8 KiB; a certificate or
-chain exceeding either bound fails even when its signature algorithm is
-otherwise supported. `general` has neither restriction.
+RSA PKCS#1 v1.5 support is certificate-chain-signature verification only —
+the TLS 1.3 handshake's own `CertificateVerify` proof-of-possession still
+only uses Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256, since RFC 8446
+§4.2.3 forbids `rsa_pkcs1` schemes there. Independently, `appliance`/`native`
+also caps each peer certificate entry at 2048 DER bytes and the whole
+handshake message at 8 KiB; a certificate or chain exceeding either bound
+fails even when its signature algorithm is otherwise supported (tracked by
+#646). `general` has neither restriction.
 
 ### Health Checks And Circuit Breaking
 

@@ -772,6 +772,10 @@ fn providerToTlsScheme(scheme: crypto_provider.SignatureScheme) ?credentials.Sig
         .ed25519 => .ed25519,
         .ecdsa_secp256r1_sha256 => .ecdsa_secp256r1_sha256,
         .rsa_pss_rsae_sha256 => .rsa_pss_rsae_sha256,
+        // Certificate-chain signature verification only (#645): RFC 8446
+        // §4.2.3 forbids rsa_pkcs1 schemes in TLS 1.3 CertificateVerify, so
+        // these deliberately have no TLS credential-signing counterpart.
+        .rsa_pkcs1_sha256, .rsa_pkcs1_sha384 => null,
     };
 }
 

@@ -1,4 +1,4 @@
-//! Certificate signature verification matrix tests (#343).
+//! Certificate signature verification matrix tests (#343, extended by #645).
 //!
 //! Fixtures under `testdata/` are OpenSSL-generated, so a successful
 //! verification here is a differential check against OpenSSL's signer: the
@@ -10,8 +10,10 @@
 //! - `ecdsa_p256_ca.crt` — self-signed P-256 (signature ecdsa-with-SHA256).
 //! - `rsa_pss.crt` — self-signed RSA-2048 (signature RSASSA-PSS SHA-256).
 //! - `rsa_ca.crt` — self-signed RSA-2048 with sha256WithRSAEncryption
-//!   (PKCS#1 v1.5), i.e. outside the supported matrix.
-//! - `ecdsa_leaf.crt` — P-256 key but signed by the RSA CA (PKCS#1 v1.5).
+//!   (PKCS#1 v1.5, #645).
+//! - `ecdsa_leaf.crt` — P-256 key but signed by the RSA CA with
+//!   sha256WithRSAEncryption (PKCS#1 v1.5, #645), proving PKCS#1 verification
+//!   works for a leaf whose own key type differs from its issuer's.
 
 const std = @import("std");
 const crypto = @import("crypto");
@@ -190,26 +192,112 @@ test "verifying against a mismatched or wrong issuer key fails" {
     try testing.expect(outcome == error.InvalidSignature or outcome == error.MalformedPublicKey);
 }
 
-test "PKCS#1 v1.5 RSA and mismatched-signature certs are unsupported, not verified" {
+test "RSA PKCS#1 v1.5 certificates verify with the pure-Zig provider (#645)" {
     const allocator = testing.allocator;
     var det: crypto.pure_zig.DeterministicEntropy = undefined;
     var prov: crypto.pure_zig.Provider = undefined;
     const cp = testProvider(&det, &prov);
 
-    // sha256WithRSAEncryption is outside the supported RSA-PSS-only matrix.
-    var pkcs1 = try Loaded.init(allocator, rsa_pkcs1_crt);
-    defer pkcs1.deinit(allocator);
-    try testing.expectEqual(x509.SignatureAlgorithm.rsa_pkcs1_sha256, pkcs1.cert.signatureAlgorithm());
-    try testing.expectError(error.UnsupportedSignatureAlgorithm, verify.verifySelfSignature(cp, &pkcs1.cert));
+    // A. rsa_ca.crt classifies as rsa_pkcs1_sha256 and verifies its own
+    // self-signature.
+    var ca = try Loaded.init(allocator, rsa_pkcs1_crt);
+    defer ca.deinit(allocator);
+    try testing.expectEqual(x509.SignatureAlgorithm.rsa_pkcs1_sha256, ca.cert.signatureAlgorithm());
+    try testing.expectEqual(x509.PublicKeyType.rsa, ca.cert.subject_public_key_info.key_type);
+    try verify.verifySelfSignature(cp, &ca.cert);
 
-    // The ECDSA leaf carries a P-256 key but a PKCS#1 v1.5 RSA signature from
-    // its issuer; verifying its signature is likewise unsupported.
+    // B. ecdsa_leaf.crt keeps its own P-256 leaf key, carries an RSA PKCS#1
+    // v1.5/SHA-256 certificate signature from the RSA CA, and verifies
+    // successfully against the CA's RSA issuer SPKI.
     var leaf = try Loaded.init(allocator, ecdsa_leaf_crt);
     defer leaf.deinit(allocator);
+    try testing.expectEqual(x509.PublicKeyType.ecdsa_p256, leaf.cert.subject_public_key_info.key_type);
+    try testing.expectEqual(x509.SignatureAlgorithm.rsa_pkcs1_sha256, leaf.cert.signatureAlgorithm());
+    try verify.verifyCertificateSignature(cp, &leaf.cert, &ca.cert.subject_public_key_info);
+
+    // D. Tampered signature bytes fail with InvalidSignature.
+    const forged_sig = try allocator.dupe(u8, leaf.cert.signature_value.data);
+    defer allocator.free(forged_sig);
+    forged_sig[forged_sig.len - 1] ^= 0x01;
+    var tampered_sig_cert = leaf.cert;
+    tampered_sig_cert.signature_value = .{ .unused_bits = 0, .data = forged_sig };
     try testing.expectError(
-        error.UnsupportedSignatureAlgorithm,
-        verify.verifyCertificateSignature(cp, &leaf.cert, &pkcs1.cert.subject_public_key_info),
+        error.InvalidSignature,
+        verify.verifyCertificateSignature(cp, &tampered_sig_cert, &ca.cert.subject_public_key_info),
     );
+
+    // E. A wrong (but individually well-formed and same-key-type) issuer RSA
+    // key does not authenticate the leaf's signature.
+    var wrong_issuer = try Loaded.init(allocator, rsa_pss_crt);
+    defer wrong_issuer.deinit(allocator);
+    try testing.expectEqual(x509.PublicKeyType.rsa, wrong_issuer.cert.subject_public_key_info.key_type);
+    const wrong_issuer_outcome = verify.verifyCertificateSignature(cp, &leaf.cert, &wrong_issuer.cert.subject_public_key_info);
+    try testing.expect(wrong_issuer_outcome == error.InvalidSignature or wrong_issuer_outcome == error.MalformedPublicKey);
+
+    // F. Wrong signature length is a malformed signature, not an attempted
+    // (and incidentally succeeding or crashing) verification.
+    var short_sig_cert = leaf.cert;
+    short_sig_cert.signature_value = .{ .unused_bits = 0, .data = leaf.cert.signature_value.data[0 .. leaf.cert.signature_value.data.len - 1] };
+    try testing.expectError(
+        error.MalformedSignature,
+        verify.verifyCertificateSignature(cp, &short_sig_cert, &ca.cert.subject_public_key_info),
+    );
+
+    // F (BIT STRING padding). A nonzero unused-bits count on the signature
+    // BIT STRING is rejected before the signature bytes are even considered.
+    var padded_sig_cert = leaf.cert;
+    padded_sig_cert.signature_value = .{ .unused_bits = 3, .data = leaf.cert.signature_value.data };
+    try testing.expectError(
+        error.MalformedSignature,
+        verify.verifyCertificateSignature(cp, &padded_sig_cert, &ca.cert.subject_public_key_info),
+    );
+}
+
+// C. Tampered TBS bytes fail with InvalidSignature for the RSA PKCS#1 v1.5
+// self-signed CA too — the same property already proven for Ed25519/ECDSA in
+// "tampered TBS bytes fail with InvalidSignature for every supported
+// algorithm" above, extended to #645's new scheme.
+test "tampered TBS bytes fail with InvalidSignature for RSA PKCS#1 v1.5 (#645)" {
+    const allocator = testing.allocator;
+    var det: crypto.pure_zig.DeterministicEntropy = undefined;
+    var prov: crypto.pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &prov);
+
+    var loaded = try Loaded.init(allocator, rsa_pkcs1_crt);
+    defer loaded.deinit(allocator);
+
+    const mutated = try tamperedSerialCopy(allocator, &loaded);
+    defer allocator.free(mutated);
+    var cert = try x509.Certificate.parse(allocator, mutated, .{});
+    defer cert.deinit(allocator);
+    try testing.expectError(error.InvalidSignature, verify.verifySelfSignature(cp, &cert));
+}
+
+// G. sha256WithRSAEncryption AlgorithmIdentifier parameter cases: explicit
+// NULL (the fixture's own encoding) and absent parameters are both accepted
+// for interoperability; any other parameter encoding is unsupported.
+test "RSA PKCS#1 v1.5 AlgorithmIdentifier parameters: explicit NULL and absent accepted, other rejected (#645)" {
+    const allocator = testing.allocator;
+    var det: crypto.pure_zig.DeterministicEntropy = undefined;
+    var prov: crypto.pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &prov);
+
+    var ca = try Loaded.init(allocator, rsa_pkcs1_crt);
+    defer ca.deinit(allocator);
+
+    // The fixture as generated by OpenSSL already carries explicit NULL.
+    try testing.expect(ca.cert.signature_algorithm.parameters_raw != null);
+    try testing.expect(ca.cert.signature_algorithm.parameters_null);
+    try verify.verifySelfSignature(cp, &ca.cert);
+
+    // Absent parameters are accepted for interoperability.
+    ca.cert.signature_algorithm.parameters_raw = null;
+    try verify.verifySelfSignature(cp, &ca.cert);
+
+    // Any other parameter encoding (e.g. a non-NULL element) is unsupported.
+    ca.cert.signature_algorithm.parameters_raw = &[_]u8{ 0x02, 0x01, 0x00 };
+    ca.cert.signature_algorithm.parameters_null = false;
+    try testing.expectError(error.UnsupportedSignatureAlgorithm, verify.verifySelfSignature(cp, &ca.cert));
 }
 
 test "malformed signature BIT STRING padding is rejected" {

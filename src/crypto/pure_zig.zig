@@ -85,6 +85,8 @@ pub const Provider = struct {
         caps.signatures.insert(.ed25519);
         caps.signatures.insert(.ecdsa_secp256r1_sha256);
         caps.signatures.insert(.rsa_pss_rsae_sha256);
+        caps.signatures.insert(.rsa_pkcs1_sha256);
+        caps.signatures.insert(.rsa_pkcs1_sha384);
         return caps;
     }
 
@@ -544,6 +546,17 @@ fn verifyImpl(
         .rsa_pss_rsae_sha256 => {
             try rsa.verifyPssSha256(public_key, message, signature);
         },
+        // Certificate-chain signature verification only (#645): reachable
+        // from src/pki/verify.zig, never from TLS 1.3 CertificateVerify
+        // (src/tls/crypto_profile.zig's supportsSignatureScheme refuses to
+        // advertise or select rsa_pkcs1 schemes there regardless of this
+        // provider capability).
+        .rsa_pkcs1_sha256 => {
+            try rsa.verifyPkcs1v15Sha256(public_key, message, signature);
+        },
+        .rsa_pkcs1_sha384 => {
+            try rsa.verifyPkcs1v15Sha384(public_key, message, signature);
+        },
     }
 }
 
@@ -932,6 +945,8 @@ test "capabilities advertise exactly the implemented profile" {
     try testing.expect(caps.supportsSignature(.ed25519));
     try testing.expect(caps.supportsSignature(.ecdsa_secp256r1_sha256));
     try testing.expect(caps.supportsSignature(.rsa_pss_rsae_sha256));
+    try testing.expect(caps.supportsSignature(.rsa_pkcs1_sha256));
+    try testing.expect(caps.supportsSignature(.rsa_pkcs1_sha384));
 }
 
 test "QUIC AES header protection mask matches std.crypto directly" {
@@ -991,6 +1006,30 @@ test "unsupported algorithms return UnsupportedCapability, not undefined behavio
     try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, &sig, "m", &sig));
     try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, "", "m", ""));
     try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, "\x30", "m", "\x00"));
+}
+
+test "provider verify wires RSA PKCS#1 v1.5 to the rsa.zig primitive for certificate-chain use" {
+    var det = DeterministicEntropy.init(1);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    try cp.verify(.rsa_pkcs1_sha256, rsa.testdata.public_key_der, rsa.testdata.pkcs1_message, rsa.testdata.pkcs1_signature_sha256);
+    try testing.expectError(
+        error.AuthenticationFailed,
+        cp.verify(.rsa_pkcs1_sha256, rsa.testdata.public_key_der, "tampered message", rsa.testdata.pkcs1_signature_sha256),
+    );
+
+    try cp.verify(.rsa_pkcs1_sha384, rsa.testdata.public_key_der, rsa.testdata.pkcs1_message, rsa.testdata.pkcs1_signature_sha384);
+    try testing.expectError(
+        error.AuthenticationFailed,
+        cp.verify(.rsa_pkcs1_sha384, rsa.testdata.public_key_der, "tampered message", rsa.testdata.pkcs1_signature_sha384),
+    );
+
+    // Malformed inputs are ordinary input errors, same taxonomy as RSA-PSS.
+    var sig: [8]u8 = @splat(0);
+    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pkcs1_sha256, &sig, "m", &sig));
+    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pkcs1_sha256, "", "m", ""));
+    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pkcs1_sha256, "\x30", "m", "\x00"));
 }
 
 test "ECDSA-P256 verification round-trips and rejects tamper and wrong key" {

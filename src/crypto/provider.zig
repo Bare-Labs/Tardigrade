@@ -234,12 +234,26 @@ pub const Group = enum {
     }
 };
 
-/// Signature schemes for CertificateVerify and (future) ticket authentication.
-/// Names match the TLS `SignatureScheme` registry.
+/// Signature schemes this provider can perform. Names match the TLS
+/// `SignatureScheme` registry (RFC 8446 §4.2.3), but this is not exclusively
+/// a TLS CertificateVerify vocabulary: `src/pki/verify.zig` also verifies
+/// X.509 certificate-chain signatures through this same enum and the
+/// `CryptoProvider.verify` operation. `rsa_pkcs1_sha256`/`rsa_pkcs1_sha384`
+/// are certificate-chain-signature-only additions (#645) — RFC 8446 §4.2.3
+/// forbids `rsa_pkcs1` schemes in TLS 1.3 `CertificateVerify`, so
+/// `src/tls/crypto_profile.zig`'s TLS policy derivation deliberately never
+/// advertises or selects them regardless of provider support; see that
+/// file's `supportsSignatureScheme`.
 pub const SignatureScheme = enum {
     ed25519,
     ecdsa_secp256r1_sha256,
     rsa_pss_rsae_sha256,
+    /// Certificate-chain signature verification only (#645) — never a TLS
+    /// 1.3 CertificateVerify option.
+    rsa_pkcs1_sha256,
+    /// Certificate-chain signature verification only (#645) — never a TLS
+    /// 1.3 CertificateVerify option.
+    rsa_pkcs1_sha384,
 };
 
 // ---------------------------------------------------------------------------

@@ -18030,6 +18030,95 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_reused_total", &.{}) orelse 0) >= 1);
 }
 
+// #645: proves the native upstream HTTPS client accepts an ordinary
+// sha256WithRSAEncryption (RSA PKCS#1 v1.5)-signed origin certificate chain
+// end to end -- downstream request -> gateway proxy -> UpstreamTlsConn ->
+// native TLS client -> WebPkiVerifier -> path validation ->
+// verifyCertificateSignature -> pure-Zig provider -> RSA PKCS#1 verifier --
+// not just a pki.verify unit test. `tests/fixtures/tls/ca.crt` (root,
+// self-signed) and `server.crt`/`.key` (leaf, issued by `ca.crt`, SAN
+// IP:127.0.0.1 + DNS:localhost) were added for #643's mTLS/raw-peer harness
+// and confirmed here to both be sha256WithRSAEncryption and, at 804/747 DER
+// bytes, well under #646's 2 KiB-per-cert/8 KiB-message bounds -- isolating
+// #645 from that separate, still-open blocker. `ca.crt` was reissued (same
+// key/subject/validity, `git log` shows only this commit touching it) to add
+// the `basicConstraints=critical,CA:TRUE` RFC 5280 requires of a CA
+// certificate: the native trust store (`src/pki/trust_store.zig`'s
+// `isCaAnchor`) refuses an anchor without it, which the original V1 encoding
+// (no extensions at all) never satisfied -- `server.crt` still verifies
+// against the reissued `ca.crt` unchanged (same RSA key), and the two
+// existing tests that pass this fixture pair to real `openssl s_server
+// -CAfile` are unaffected by the added extension. Reuses
+// `OpensslRawPeer`/`MtlsRawPeerResponder` (#643) for byte-exact
+// `Content-Length` framing synchronized to the actually observed request,
+// same pattern as the mTLS test above, minus the client-certificate
+// requirement this test does not need.
+test "native upstream https: PKCS#1 v1.5-signed origin certificate (sha256WithRSAEncryption) verifies (#645)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    const leaf_cert = try upstreamTlsFixture("server.crt", allocator);
+    defer allocator.free(leaf_cert);
+    const leaf_key = try upstreamTlsFixture("server.key", allocator);
+    defer allocator.free(leaf_key);
+    const ca_cert = try upstreamTlsFixture("ca.crt", allocator);
+    defer allocator.free(ca_cert);
+
+    var origin = try OpensslRawPeer.start(allocator, &.{ "-cert", leaf_cert, "-key", leaf_key });
+    defer origin.stop();
+
+    const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
+    defer allocator.free(upstream_url);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location /secure/ {
+        \\    proxy_pass /;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URL", .value = upstream_url },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = test_host },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+        },
+    });
+    defer tardigrade.stop();
+
+    const body = "native-upstream-pkcs1-body";
+    const response_bytes = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer allocator.free(response_bytes);
+
+    // The downstream request below has to be in flight while this waits for
+    // the relayed request to arrive on the origin's stdout, so the responder
+    // runs on its own thread -- same synchronization as the mTLS test above.
+    var responder = MtlsRawPeerResponder{
+        .origin = &origin,
+        .allocator = allocator,
+        .response_bytes = response_bytes,
+    };
+    const responder_thread = try std.Thread.spawn(.{}, MtlsRawPeerResponder.run, .{&responder});
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/secure/hello.txt",
+        .body = null,
+        .headers = &.{},
+    }, 20_000);
+    defer response.deinit();
+
+    responder_thread.join();
+    try std.testing.expect(responder.observed_request);
+    if (responder.err) |err| return err;
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "native-upstream-pkcs1-body");
+}
+
 /// A TCP listener that accepts and immediately closes every connection --
 /// not `UpstreamServer` (below), whose response loop first tries to parse a
 /// complete HTTP request and only gives up after its own internal ~5s read

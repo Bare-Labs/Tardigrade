@@ -157,6 +157,8 @@ pub const rows = [_]Row{
     row(.{ .signature = .ed25519 }, "Ed25519", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "sign/verify, tamper rejection, wrong-key rejection", .{ .{ .tls_handshake, .live }, .{ .pki, .live } }, .{ .native_appliance, .general_purpose_openssl }, "Certificate-chain verification (src/pki/verify.zig) and the handshake's own CertificateVerify proof-of-possession (src/tls/tls13_backend.zig) both call CryptoProvider.verify (#490); local CertificateVerify signing (src/tls/credentials.zig) signs through the opaque provider.SigningKey handle."),
     row(.{ .signature = .ecdsa_secp256r1_sha256 }, "ECDSA-P256-SHA256", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "SEC1 key/DER signature verify, provider.SigningKey sign/verify, deterministic and failing signing entropy, alternate high/low-S verification, tamper, wrong-key, non-canonical-signature rejection (#343/#432)", .{ .{ .tls_handshake, .live }, .{ .pki, .live } }, .{ .native_appliance, .general_purpose_openssl }, "Same split as Ed25519, now both live (#490/#432): PKI chain verification and CertificateVerify both call CryptoProvider.verify, and local signing goes through provider.SigningKey with per-signature noise from injected provider entropy. Signatures are canonical DER but not low-S normalized; verification accepts valid non-zero in-range high-S and low-S forms without rewriting. This row is signature-only; P-256 ECDH capability is tracked separately by the secp256r1 group row."),
     row(.{ .signature = .rsa_pss_rsae_sha256 }, "RSA-PSS-RSAE-SHA256", .project_code, .supported, .openssl_provider, .provider_deferred, "strict DER/RSA-PSS positive and negative fixtures, provider.SigningKey sign/verify roundtrip, entropy-failure and undersized-output non-partial-signature checks, credential-selection key-type/offer compatibility, native TLS server/client loopback", .{ .{ .tls_handshake, .live }, .{ .pki, .live } }, .{.general_purpose_openssl}, "#565: native RSA-PSS server signing now exists (pure-Zig private-key owner behind provider.SigningKey, `std.crypto.ff.Modulus.powWithEncodedExponent` for the constant-time private-exponent modpow — no CRT, see docs/CRYPTO_SECURITY_AUDIT.md), and credentials.zig/policy.zig/sni_provider.zig/tls13_backend.zig all recognize the scheme end to end, so tls_handshake is genuinely `.live`: the engine's CertificateVerify can both select an RSA credential and sign/verify with it, not merely name the scheme. `enabled_product_profiles` deliberately stays general_purpose_openssl-only, not a mechanical copy of this: broadening what the controlled native-appliance product actually offers is a separate #391 policy decision this row does not make on its own — engine capability (tls13_backend.native_capabilities) and product enablement (this field) are tracked independently on purpose."),
+    row(.{ .signature = .rsa_pkcs1_sha256 }, "RSA-PKCS1v15-SHA256", .project_code, .supported, .openssl_provider, .provider_deferred, "strict EMSA-PKCS1-v1_5 positive/negative primitive fixtures (known-good openssl signature, tampered message/signature, signature integer >= modulus, wrong length, malformed key), provider.verify wiring, src/pki/verify.zig positive chain-verification fixtures (rsa_ca.crt self-signature, ecdsa_leaf.crt cross-signed by the RSA CA), tampered-TBS/signature and wrong-issuer-key rejection, AlgorithmIdentifier parameter cases (explicit NULL/absent accepted, other rejected), a real native-upstream-HTTPS integration fixture through src/tls/webpki_verifier.zig", .{.{ .pki, .live }}, .{.general_purpose_openssl}, "#645: X.509 certificate-chain signature verification only (`sha256WithRSAEncryption`) — reuses the RSA-PSS row's key parser, accepted-modulus-size, and `std.crypto.ff.Modulus` exponentiation machinery, differing only in EMSA-PKCS1-v1_5 vs EMSA-PSS validation of the recovered block. Deliberately has no `tls_handshake` integration entry: RFC 8446 §4.2.3 forbids `rsa_pkcs1` schemes in TLS 1.3 CertificateVerify, and `src/tls/crypto_profile.zig`'s `supportsSignatureScheme` continues to hard-refuse it regardless of this provider capability (see that file's own regression). `enabled_product_profiles` mirrors the RSA-PSS row for the same reason stated there: primitive support is not itself a native-appliance product-policy decision (#391)."),
+    row(.{ .signature = .rsa_pkcs1_sha384 }, "RSA-PKCS1v15-SHA384", .project_code, .supported, .openssl_provider, .provider_deferred, "strict EMSA-PKCS1-v1_5/SHA-384 positive/negative primitive fixtures (known-good openssl signature, tampered message/signature, wrong length), provider.verify wiring", .{.{ .pki, .live }}, .{.general_purpose_openssl}, "#645: same strict primitive as rsa_pkcs1_sha256, parameterized by hash (`src/crypto/rsa.zig`'s shared `verifyPkcs1v15`) — added because the additional surface area over the required SHA-256 variant is small (a different DigestInfo prefix and digest length), not a second implementation. Same TLS-CertificateVerify exclusion and product-profile reasoning as the SHA-256 row above; x509.SignatureAlgorithm already classified `sha384WithRSAEncryption` before #645 (see src/pki/x509.zig), this row is the provider/PKI wiring for it."),
     row(.{ .certificate_helper = .der_parser }, "DER/X.509 parser helpers", .project_code, .provider_deferred, .openssl_provider, .provider_deferred, "module-local parser fixtures", .{.{ .pki, .not_provider_routed }}, .{ .native_appliance, .general_purpose_openssl }, "Public DER/X.509 parsing has no CryptoProvider vtable entry and is called directly by protocol-local PKI code shared by both product profiles; certificate helpers require malformed-input and corpus tests."),
     row(.{ .certificate_helper = .chain_builder }, "certificate chain builder", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "tracked by PKI stories", .{.{ .pki, .not_integrated }}, .{}, "Not implemented yet for either product profile; chain validation requires path-building fixtures."),
     row(.{ .certificate_helper = .webpki_validation }, "WebPKI validation", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "tracked by PKI stories", .{.{ .pki, .not_integrated }}, .{}, "Not implemented yet for either product profile; WebPKI support requires policy and time-validation review."),
@@ -294,6 +296,8 @@ test "pure-Zig profile capabilities are queryable" {
     try std.testing.expect(caps.supportsSignature(.ed25519));
     try std.testing.expect(caps.supportsSignature(.ecdsa_secp256r1_sha256));
     try std.testing.expect(caps.supportsSignature(.rsa_pss_rsae_sha256));
+    try std.testing.expect(caps.supportsSignature(.rsa_pkcs1_sha256));
+    try std.testing.expect(caps.supportsSignature(.rsa_pkcs1_sha384));
 }
 
 fn expectIntegration(algorithm: Algorithm, consumer: Consumer, expected: IntegrationStatus) !void {
@@ -349,6 +353,28 @@ test "native TLS 1.3 handshake engine is live-integrated through CryptoProvider"
     try expectIntegration(.{ .signature = .ecdsa_secp256r1_sha256 }, .tls_handshake, .live);
     try expectIntegration(.{ .entropy = .injected_random_bytes }, .tls_handshake, .live);
     try expectIntegration(.{ .signature = .rsa_pss_rsae_sha256 }, .tls_handshake, .live);
+}
+
+// Anchors #645's certificate-chain-only scope: RSA PKCS#1 v1.5 must be
+// `pki`-`.live` (src/pki/verify.zig genuinely calls CryptoProvider.verify
+// with it) while carrying no `tls_handshake` integration entry at all — RFC
+// 8446 §4.2.3 forbids `rsa_pkcs1` schemes in TLS 1.3 CertificateVerify. A
+// future regression that wired it into the handshake engine would either
+// make `integrationStatus(.tls_handshake)` non-null here (caught below) or
+// require adding a `.{ .tls_handshake, .live }` entry to the row itself,
+// which is exactly the "blindly make every ... TLS-policy path support the
+// new variant" mistake #645 warns against.
+test "RSA PKCS#1 v1.5 is PKI-only, never a TLS 1.3 CertificateVerify integration" {
+    try expectIntegration(.{ .signature = .rsa_pkcs1_sha256 }, .pki, .live);
+    try expectIntegration(.{ .signature = .rsa_pkcs1_sha384 }, .pki, .live);
+    for (rows) |entry| {
+        if (!algorithmEql(entry.algorithm, .{ .signature = .rsa_pkcs1_sha256 })) continue;
+        try std.testing.expect(entry.integrationStatus(.tls_handshake) == null);
+    }
+    for (rows) |entry| {
+        if (!algorithmEql(entry.algorithm, .{ .signature = .rsa_pkcs1_sha384 })) continue;
+        try std.testing.expect(entry.integrationStatus(.tls_handshake) == null);
+    }
 }
 
 test "row helpers expose consumers and enabled product profiles" {
@@ -411,6 +437,18 @@ test "enabled product profiles are not a mechanical copy of primitive support" {
     const rsa_pss_profiles = enabledProfilesFor(.{ .signature = .rsa_pss_rsae_sha256 });
     try std.testing.expect(!rsa_pss_profiles.contains(.native_appliance));
     try std.testing.expect(rsa_pss_profiles.contains(.general_purpose_openssl));
+
+    // #645: RSA PKCS#1 v1.5 is a genuinely live pki-consumer capability (the
+    // row above proves it), but that is not itself a native-appliance
+    // product-policy decision — same asymmetry as RSA-PSS, for the same
+    // reason (#391 governs appliance product enablement separately).
+    const rsa_pkcs1_sha256_profiles = enabledProfilesFor(.{ .signature = .rsa_pkcs1_sha256 });
+    try std.testing.expect(!rsa_pkcs1_sha256_profiles.contains(.native_appliance));
+    try std.testing.expect(rsa_pkcs1_sha256_profiles.contains(.general_purpose_openssl));
+
+    const rsa_pkcs1_sha384_profiles = enabledProfilesFor(.{ .signature = .rsa_pkcs1_sha384 });
+    try std.testing.expect(!rsa_pkcs1_sha384_profiles.contains(.native_appliance));
+    try std.testing.expect(rsa_pkcs1_sha384_profiles.contains(.general_purpose_openssl));
 
     const header_protection_profiles = enabledProfilesFor(.{ .quic_header_protection = .aes_128 });
     try std.testing.expect(header_protection_profiles.contains(.native_appliance));

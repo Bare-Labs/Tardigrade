@@ -647,15 +647,20 @@ the same knobs, the same 502-on-failure mapping, and the same "fix the
 certificate, don't disable verification" guidance apply.
 
 **Native-profile-specific cause:** under `-Dtls-profile=native`/`appliance`,
-certificate chain verification only authenticates signatures made with
-Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 (`src/pki/verify.zig`, #343).
-An origin whose chain is signed with classic RSA PKCS#1 v1.5
-(`sha256WithRSAEncryption`, still common among public CAs) or another
-unsupported combination (e.g. ECDSA/SHA-384) fails closed here even with a
-correct CA bundle and hostname — this is a native signature-algorithm
-coverage gap, not a misconfiguration, and disabling verification is still not
-the fix. Until the native matrix is extended, such an origin needs
-`-Dtls-profile=general` (OpenSSL) to be proxied with verification enabled.
+certificate chain verification authenticates signatures made with Ed25519,
+ECDSA P-256/SHA-256, RSA-PSS/SHA-256, or (as of #645) classic RSA PKCS#1 v1.5
+(`sha256WithRSAEncryption`/`sha384WithRSAEncryption`, still common among
+public CAs) — `src/pki/verify.zig`, #343 and #645. RSA PKCS#1 v1.5 support is
+certificate-chain-signature verification only; it does not change what the
+TLS 1.3 handshake itself can use for `CertificateVerify` (RFC 8446 §4.2.3
+forbids `rsa_pkcs1` there, so that step still only offers Ed25519, ECDSA
+P-256/SHA-256, or RSA-PSS/SHA-256). An origin whose chain is signed with
+another unsupported combination (e.g. ECDSA/SHA-384, or RSA PKCS#1 v1.5/
+SHA-512) still fails closed here even with a correct CA bundle and hostname —
+this is a native signature-algorithm coverage gap, not a misconfiguration,
+and disabling verification is still not the fix. Until the native matrix is
+extended further, such an origin needs `-Dtls-profile=general` (OpenSSL) to
+be proxied with verification enabled.
 
 Independently of signature support, the native handshake engine also caps
 each peer certificate entry at 2048 DER bytes and the whole handshake

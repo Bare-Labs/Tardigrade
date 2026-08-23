@@ -183,3 +183,29 @@ test "hand-written TLS policy capabilities are rejected when provider cannot sup
     const bad_pkcs1 = [_]policy_mod.SignatureScheme{.rsa_pkcs1_sha256};
     try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .signature_schemes = &bad_pkcs1 }));
 }
+
+// #645 merge-blocking regression: the pure-Zig provider now genuinely
+// verifies RSA PKCS#1 v1.5 certificate signatures (`caps.supportsSignature`
+// below is provider.SignatureScheme, distinct from this file's TLS-wire
+// `policy_mod.SignatureScheme`) — this proves that primitive existing does
+// not, by itself, cause the TLS `signature_algorithms` derivation to
+// advertise or select it for CertificateVerify. RFC 8446 §4.2.3 forbids
+// `rsa_pkcs1` schemes there; `supportsSignatureScheme`'s `.rsa_pkcs1_sha256
+// => false` arm (see above) is unconditional, so this must hold regardless
+// of provider capability.
+test "adding the RSA PKCS#1 v1.5 provider primitive does not advertise it for TLS CertificateVerify" {
+    const caps = profile.capabilities(.pure_zig);
+    try std.testing.expect(caps.supportsSignature(.rsa_pkcs1_sha256));
+    try std.testing.expect(caps.supportsSignature(.rsa_pkcs1_sha384));
+
+    try std.testing.expect(!supportsSignatureScheme(caps, .rsa_pkcs1_sha256));
+
+    const general = fromProfile(.general_purpose_openssl, caps);
+    for (general.signature_schemes[0..general.signature_schemes_len]) |scheme| {
+        try std.testing.expect(scheme != .rsa_pkcs1_sha256);
+    }
+    const native = fromProfile(.native_appliance, caps);
+    for (native.signature_schemes[0..native.signature_schemes_len]) |scheme| {
+        try std.testing.expect(scheme != .rsa_pkcs1_sha256);
+    }
+}

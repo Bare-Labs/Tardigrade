@@ -1,11 +1,16 @@
-//! X.509 certificate signature verification matrix (#343).
+//! X.509 certificate signature verification matrix (#343, extended by #645).
 //!
 //! Verifies a certificate's signature under an issuer's public key for the
-//! initial practical TLS algorithm matrix — Ed25519, ECDSA P-256/SHA-256, and
-//! RSA-PSS-RSAE/SHA-256 — entirely through the #327 crypto-provider seam and
-//! the #341 parsed certificate views. No cryptographic primitive is named
-//! here and there is no OpenSSL fallback: unsupported algorithms fail closed
-//! with a typed outcome.
+//! supported algorithm matrix — Ed25519, ECDSA P-256/SHA-256, RSA-PSS-RSAE/
+//! SHA-256, and RSA PKCS#1 v1.5/SHA-256 and SHA-384 (#645, common among
+//! public WebPKI CAs as `sha256WithRSAEncryption`/`sha384WithRSAEncryption`)
+//! — entirely through the #327 crypto-provider seam and the #341 parsed
+//! certificate views. No cryptographic primitive is named here and there is
+//! no OpenSSL fallback: unsupported algorithms fail closed with a typed
+//! outcome. RSA PKCS#1 v1.5 support here is certificate-chain-signature
+//! verification only — it must never become a TLS 1.3 `CertificateVerify`
+//! option (RFC 8446 §4.2.3 forbids `rsa_pkcs1` there); see
+//! `src/tls/crypto_profile.zig`'s `supportsSignatureScheme`.
 //!
 //! ## Separation of concerns
 //!
@@ -119,10 +124,33 @@ fn resolveScheme(algorithm: *const x509.AlgorithmIdentifier) Error!Resolved {
             try validatePssSha256(algorithm);
             break :blk .{ .scheme = .rsa_pss_rsae_sha256, .required_key_type = .rsa };
         },
-        // RSA PKCS#1 v1.5, ECDSA over other curves/hashes, and anything the
-        // parser did not recognize are outside the matrix.
+        .rsa_pkcs1_sha256 => blk: {
+            // sha256WithRSAEncryption (#645): unlike Ed25519/ecdsa-with-SHA256
+            // above, RFC interop practice tolerates omitted parameters, so
+            // both explicit NULL and absent are accepted; anything else is
+            // outside the matrix.
+            try validatePkcs1AlgorithmParameters(algorithm);
+            break :blk .{ .scheme = .rsa_pkcs1_sha256, .required_key_type = .rsa };
+        },
+        .rsa_pkcs1_sha384 => blk: {
+            // sha384WithRSAEncryption (#645), same parameter rule as SHA-256.
+            try validatePkcs1AlgorithmParameters(algorithm);
+            break :blk .{ .scheme = .rsa_pkcs1_sha384, .required_key_type = .rsa };
+        },
+        // ECDSA over other curves/hashes and anything the parser did not
+        // recognize (including rsa_pkcs1_sha512) are outside the matrix.
         else => error.UnsupportedSignatureAlgorithm,
     };
+}
+
+/// Enforce the `sha256WithRSAEncryption`/`sha384WithRSAEncryption`
+/// `AlgorithmIdentifier` parameter rule (#645): explicit ASN.1 NULL is
+/// accepted (the strict PKCS#1 encoding), and absent parameters are also
+/// accepted for interoperability with encoders that omit the DEFAULT NULL;
+/// any other parameter encoding is outside the matrix.
+fn validatePkcs1AlgorithmParameters(algorithm: *const x509.AlgorithmIdentifier) Error!void {
+    if (algorithm.parameters_raw == null) return;
+    if (!algorithm.parameters_null) return error.UnsupportedSignatureAlgorithm;
 }
 
 /// Enforce the issuer SubjectPublicKeyInfo `AlgorithmIdentifier` parameters
@@ -135,7 +163,13 @@ fn validateIssuerKeyParameters(scheme: provider.SignatureScheme, issuer: *const 
         .ed25519 => {
             if (issuer.algorithm.parameters_raw != null) return error.MalformedPublicKey;
         },
-        .rsa_pss_rsae_sha256 => {
+        // RFC 4055 §1.2: an rsaEncryption SPKI's own AlgorithmIdentifier
+        // parameters must be explicit NULL, regardless of which RSA
+        // signature scheme (PSS or PKCS#1 v1.5, #645) is used to verify
+        // with it — this is an issuer-key encoding rule, not a
+        // signature-algorithm rule, so PKCS#1 gets the identical strict
+        // check RSA-PSS already enforces.
+        .rsa_pss_rsae_sha256, .rsa_pkcs1_sha256, .rsa_pkcs1_sha384 => {
             if (issuer.algorithm.parameters_raw == null or !issuer.algorithm.parameters_null) {
                 return error.MalformedPublicKey;
             }
@@ -158,10 +192,11 @@ fn issuerPublicKey(scheme: provider.SignatureScheme, issuer: *const x509.Subject
             const compressed = key.len == 33 and (key[0] == 0x02 or key[0] == 0x03);
             if (!uncompressed and !compressed) return error.MalformedPublicKey;
         },
-        .rsa_pss_rsae_sha256 => {
+        .rsa_pss_rsae_sha256, .rsa_pkcs1_sha256, .rsa_pkcs1_sha384 => {
             // Confirm the SPKI carries a well-formed DER RSAPublicKey before
             // handing it to the provider, so a later input rejection is the
-            // signature, not the key.
+            // signature, not the key. Same check for PKCS#1 (#645) as
+            // RSA-PSS: both consume the same RSAPublicKey encoding.
             _ = rsaModulusLen(key) catch return error.MalformedPublicKey;
         },
     }
@@ -184,9 +219,10 @@ fn signatureBytes(
             // junk, wrong shape) up front for a precise typed outcome.
             try validateEcdsaDerSignature(sig);
         },
-        .rsa_pss_rsae_sha256 => {
-            // A PSS signature is exactly one modulus in length; a mismatch is
-            // a signature defect, distinct from a malformed key.
+        .rsa_pss_rsae_sha256, .rsa_pkcs1_sha256, .rsa_pkcs1_sha384 => {
+            // A PSS or PKCS#1 v1.5 (#645) signature is exactly one modulus in
+            // length; a mismatch is a signature defect, distinct from a
+            // malformed key.
             const modulus_len = rsaModulusLen(issuer.subject_public_key.data) catch return error.MalformedPublicKey;
             if (sig.len != modulus_len) return error.MalformedSignature;
         },
