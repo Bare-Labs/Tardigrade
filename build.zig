@@ -1,14 +1,19 @@
 const std = @import("std");
 
-/// TLS/crypto build profile (#379, epic #327). `general` links the single
-/// approved OpenSSL adapter as a compatibility backend; `appliance` is the
-/// Bare Systems profile: no OpenSSL configuration, import, or linkage — the
-/// OpenSSL adapter module is replaced with a native stub at the build graph
-/// level, so `@cImport("openssl/...")` is never analyzed and `libssl`/
-/// `libcrypto` are never linked. There is no runtime fallback between
+/// TLS/crypto build profile (#379, epic #327, cutover #634). `general`
+/// links the single approved OpenSSL adapter as a transitional
+/// compatibility backend. `appliance` and `native` are native-only builds:
+/// no OpenSSL configuration, import, or linkage — the OpenSSL adapter
+/// module is replaced with a native stub at the build graph level, so
+/// `@cImport("openssl/...")` is never analyzed and `libssl`/`libcrypto`
+/// are never linked. `appliance` additionally applies the Bare Systems
+/// product policy (single Ed25519 identity, required server name, fixed
+/// TLS 1.3 policy); `native` is the general-purpose native profile
+/// (multi-identity SNI, generic credential loader) that #634 promotes to
+/// the sole shipping implementation. There is no runtime fallback between
 /// profiles; the selection is embedded in the binary and reported by
 /// `tardi version`. See docs/TLS_DEPENDENCY_POLICY.md.
-const TlsProfile = enum { general, appliance };
+const TlsProfile = enum { general, appliance, native };
 
 /// Resolves the source revision embedded in benchmark/diagnostic metadata
 /// (e.g. `crypto_bench`'s `_meta.tardigrade_commit`, #378's benchmark
@@ -79,7 +84,7 @@ pub fn build(b: *std.Build) void {
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
-        "TLS/crypto profile: 'general' (default) links the approved OpenSSL adapter; 'appliance' forbids all foreign TLS/crypto linkage (#379)",
+        "TLS/crypto profile: 'general' (default) links the transitional OpenSSL adapter; 'native' is the general-purpose pure-Zig profile and 'appliance' the Bare Systems policy profile — both forbid all foreign TLS/crypto linkage (#379, #634)",
     ) orelse .general;
     const link_openssl_adapter = tls_profile == .general;
 

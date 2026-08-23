@@ -114,8 +114,10 @@ and which protocols a deployment serves:
   that is not part of `SIGHUP` reload and does not respond to a changed
   `TLS_CERT_PATH`/`TLS_KEY_PATH` value.
 - The **native credential store** (`http.native_tls_connection.NativeCredentialStore`),
-  used for native HTTP/3 on the `general` build (the appliance profile uses
-  `ApplianceCredentials` for HTTP/3 too — see below). It supports a real
+  used for native HTTP/3 on the `general` build, and for *both* native TCP
+  and native HTTP/3 on the general-purpose native build
+  (`tls-profile=native`, #634); the appliance profile uses
+  `ApplianceCredentials` for both — see below. It supports a real
   prepare/commit hot-swap of certificate, key, and SNI identity from the
   proposed reload paths, and `hotReloadConfig` uses that capability on
   every accepted `SIGHUP` where it applies (see below).
@@ -126,10 +128,16 @@ and which protocols a deployment serves:
   reload outright via `applianceCredentialConfigChanged` for any change to
   `TLS_CERT_PATH`/`TLS_KEY_PATH`/`TLS_SERVER_NAME`/`TLS_SNI_CERTS`, so in
   practice appliance credentials are fully startup-owned — a `SIGHUP` never
-  changes what either protocol serves. (There is currently no shipping
-  profile where a live-reloadable `NativeCredentialStore` is shared between
-  native TCP and native HTTP/3; today's two profiles are `general`, above,
-  and `appliance`, here.)
+  changes what either protocol serves. (On the `native` profile, by
+  contrast, one live-reloadable `NativeCredentialStore` is shared between
+  native TCP and native HTTP/3, so a single accepted `SIGHUP` rotates both
+  surfaces to the same identity atomically — the #629 split-identity
+  hazard is structural to the mixed `general`+H3 composition only. TLS
+  *topology* is still startup-owned on every native build: the store and
+  provider are created only when cert/key paths exist at startup, so
+  `hotReloadConfig` rejects any reload that would turn TLS on for a
+  process that started plaintext, or off for one that started with TLS —
+  "enabling or disabling native TLS requires restart".)
 
 **On the default `general` build with the OpenSSL adapter linked**, stable
 TCP owns its identity via `TlsTerminator` (startup-owned, as above) while

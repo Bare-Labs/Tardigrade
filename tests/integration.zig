@@ -2944,6 +2944,27 @@ fn requireNativeTlsProfile() !void {
     if (build_options.tls_openssl_adapter) return error.SkipZigTest;
 }
 
+/// #634: cases asserting the Bare appliance *product policy* — the strict
+/// Ed25519 single-identity loader, `check`/startup credential preflight,
+/// unknown-SNI handshake rejection, restart-owned credential rotation —
+/// hold only on `-Dtls-profile=appliance`. The general-purpose `native`
+/// profile shares the adapter-free native TLS engine
+/// (`requireNativeTlsProfile` passes there too) but uses the permissive
+/// generic credential store, so these behaviors are intentionally absent.
+fn requireApplianceTlsProfile() !void {
+    if (!std.mem.eql(u8, build_options.tls_profile, "appliance")) return error.SkipZigTest;
+}
+
+/// #634: the general-purpose adapter-free profile (`-Dtls-profile=native`)
+/// only — for cases proving generic-native behavior whose appliance
+/// counterpart takes a different code path with its own assertions (e.g.
+/// the appliance credential-config reload rejection vs. the generic
+/// native TLS-topology reload rejection).
+fn requireGenericNativeTlsProfile() !void {
+    try requireNativeTlsProfile();
+    if (std.mem.eql(u8, build_options.tls_profile, "appliance")) return error.SkipZigTest;
+}
+
 /// #522: the appliance TLS profile explicitly forbids
 /// `TARDIGRADE_HTTP3_ENABLE_0RTT` (`edge_config.zig`'s
 /// `validateApplianceTlsProfile` rejects it outright as an unsupported
@@ -6408,8 +6429,8 @@ test "interop.openssl.sni_mismatch" {
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
-    // The appliance TLS profile (the only profile the native listener builds
-    // under, see `requireNativeTlsProfile`) supports exactly one identity --
+    // The appliance TLS profile (the profile this suite runs under in CI,
+    // see `requireNativeTlsProfile`) supports exactly one identity --
     // `TARDIGRADE_TLS_SNI_CERTS` is rejected outright at startup. So "SNI
     // mismatch" here means the only meaningful, honest external case: a
     // client presenting any SNI other than the configured one, ticket or
@@ -8649,7 +8670,7 @@ test "rotation.persistent.n_to_n_plus_1" {
 //
 // This test does not additionally attempt to bundle a TLS credential change
 // into a failing SIGHUP: `requireNativeTlsProfile` gates every test in this
-// file to the appliance TLS profile build (the only profile where
+// file to the native-TLS builds (`-Dtls-profile=appliance`/`native`, where
 // `build_options.tls_openssl_adapter` is false), and inspecting
 // `edge_gateway.run`/`gateway_shutdown.hotReloadConfig` shows the appliance
 // profile's real served identity (`appliance_credentials.ApplianceCredentials`,
@@ -16788,6 +16809,7 @@ fn expectApplianceStartupFailure(
 }
 
 test "native TLS listener appliance identity serves the exact configured SNI" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -16827,6 +16849,28 @@ test "#488: native TLS listener resumes and serves HTTP traffic with production 
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
+    // #634: this test's client handshakes with SNI "tardigrade.test". On
+    // the appliance profile the strict owner serves that name because it is
+    // the configured `TARDIGRADE_TLS_SERVER_NAME`; on the general-purpose
+    // `native` profile the generic credential store's default bundle only
+    // covers absent SNI (unknown names fail closed), so the same identity
+    // must be registered for the name explicitly via
+    // `TARDIGRADE_TLS_SNI_CERTS` — which the appliance profile in turn
+    // rejects outright, hence the per-profile env below.
+    const is_appliance = comptime std.mem.eql(u8, build_options.tls_profile, "appliance");
+    const sni_certs_value = try std.fmt.allocPrint(allocator, "tardigrade.test:{s}:{s}", .{ tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(sni_certs_value);
+    const shared_env = [_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+    };
+    var native_env: [shared_env.len + 1]EnvPair = undefined;
+    @memcpy(native_env[0..shared_env.len], &shared_env);
+    native_env[shared_env.len] = .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs_value };
+
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .config_text =
         \\location = /healthz {
@@ -16835,13 +16879,7 @@ test "#488: native TLS listener resumes and serves HTTP traffic with production 
         ,
         .ready_https_insecure = true,
         .ready_path = "/healthz",
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
-            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
-            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
-            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
-        },
+        .extra_env = if (is_appliance) &shared_env else &native_env,
     });
     defer tardigrade.stop();
 
@@ -16952,6 +16990,7 @@ test "#488: native TLS listener resumes and serves HTTP traffic with production 
 }
 
 test "native TLS listener appliance rejects unknown SNI before HTTP dispatch" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17004,18 +17043,21 @@ test "native TLS listener appliance rejects unknown SNI before HTTP dispatch" {
 }
 
 test "native TLS listener appliance refuses startup with a mismatched key" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     try expectApplianceStartupFailure(allocator, "native_ed25519_mismatch.key", "error.KeyCertificateMismatch");
 }
 
 test "native TLS listener appliance refuses startup with an unsupported key algorithm" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     try expectApplianceStartupFailure(allocator, "native_p256.key", "error.UnsupportedPrivateKeyAlgorithm");
 }
 
 test "appliance run --daemon rejects a mismatched key synchronously, without ever backgrounding" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17073,6 +17115,7 @@ test "appliance run --daemon rejects a mismatched key synchronously, without eve
 }
 
 test "appliance master mode rejects a mismatched key before writing a PID file or spawning workers" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17131,6 +17174,7 @@ test "appliance master mode rejects a mismatched key before writing a PID file o
 }
 
 test "native TLS listener appliance check command validates credentials without binding" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17203,7 +17247,41 @@ test "native TLS listener appliance check command validates credentials without 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, unnamed.term);
 }
 
+test "native TLS listener check rejects ACME on native builds even without credentials" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    // #634 (#641 review): enabling ACME is a request to *obtain*
+    // credentials, so the native capability gate must reject it through the
+    // real `tardi check` path even when no cert/key pair is configured —
+    // it must not become silently inert behind the TLS-files gate.
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-native-acme-check-{d}.conf", .{compat.nanoTimestamp()});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_TLS_ACME_ENABLED", "true");
+    _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
+    _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
+
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, result.term);
+    try assertContains(result.stderr, "TARDIGRADE_TLS_ACME_ENABLED");
+}
+
 test "appliance hot reload rejects turning TLS on for a server that started plaintext" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17271,6 +17349,7 @@ test "appliance hot reload rejects turning TLS on for a server that started plai
 }
 
 test "appliance hot reload rejects turning TLS off for a server that started with TLS" {
+    try requireApplianceTlsProfile();
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -17329,6 +17408,143 @@ test "appliance hot reload rejects turning TLS off for a server that started wit
     // The TLS listener is still there and still authenticates with the
     // original identity.
     const second_client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer second_client.destroy();
+    try second_client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const after = try second_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(after);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(after, "HTTP/1.1 200 OK"));
+    try assertContains(after, "alive");
+}
+
+// #634 (#641 review): the generic-native counterparts of the two appliance
+// reload-rejection tests above. On `-Dtls-profile=native` the credential
+// store/provider are created only when TLS files exist at startup and
+// `startNewConnection` dispatches on that startup-fixed optional, so a
+// reload that changes TLS topology must be rejected outright — never
+// "reload applied" while new connections keep the old transport. The
+// appliance profile rejects the same transitions through its own
+// credential-config check with a different message, asserted by the tests
+// above; these two are skipped there.
+
+test "native TLS listener generic-native hot reload rejects turning TLS on for a server that started plaintext" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        // No TLS env at all: the process starts in plaintext, so neither
+        // the NativeCredentialStore nor native_tls_provider is constructed.
+    });
+    defer tardigrade.stop();
+
+    var before = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/healthz",
+        .body = null,
+        .headers = &.{},
+    });
+    defer before.deinit();
+    try std.testing.expectEqual(@as(u16, 200), before.status_code);
+    try assertContains(before.body, "alive");
+
+    // Rewrite the config file to turn TLS on with a valid identity, then
+    // reload. The reload must be rejected (there is no credential store to
+    // populate on a running WorkerContext) rather than publishing a
+    // TLS-marked config while new connections silently continue over
+    // plaintext.
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const updated_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\tls_cert_path {s};
+        \\tls_key_path {s};
+    , .{ tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(updated_config);
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+
+    try waitForLogSubstring(
+        allocator,
+        tardigrade.log_path,
+        "would enable or disable TLS on a running native-TLS process",
+        3_000,
+    );
+
+    // New connections still succeed over plain HTTP: the reload never took
+    // effect, so the listener's behavior is unchanged.
+    var after = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/healthz",
+        .body = null,
+        .headers = &.{},
+    });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after.status_code);
+    try assertContains(after.body, "alive");
+}
+
+test "native TLS listener generic-native hot reload rejects turning TLS off for a server that started with TLS" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    // The identity is configured entirely through config-file directives
+    // (no TARDIGRADE_TLS_* env vars) so that editing the file and sending
+    // SIGHUP is a genuine topology change, not shadowed by env — same
+    // reasoning as the appliance variant above.
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\tls_cert_path {s};
+        \\tls_key_path {s};
+    , .{ tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(initial_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    // Absent SNI selects the generic store's default identity.
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", null);
+    defer client.destroy();
+    try client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const before = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(before, "HTTP/1.1 200 OK"));
+    try assertContains(before, "alive");
+
+    // Rewrite the config file dropping every TLS directive, then reload.
+    // This must be rejected — the running provider and identity stay active.
+    const updated_config =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+
+    try waitForLogSubstring(
+        allocator,
+        tardigrade.log_path,
+        "would enable or disable TLS on a running native-TLS process",
+        3_000,
+    );
+
+    // The TLS listener is still there and still serves with the original
+    // identity.
+    const second_client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", null);
     defer second_client.destroy();
     try second_client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
     const after = try second_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
