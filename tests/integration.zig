@@ -17529,7 +17529,7 @@ const OpensslRawPeer = struct {
         var child = try std.process.spawn(compat.io(), .{
             .argv = argv.items,
             .stdin = .pipe,
-            .stdout = .ignore,
+            .stdout = .pipe,
             .stderr = .ignore,
         });
         errdefer child.kill(compat.io());
@@ -17537,10 +17537,31 @@ const OpensslRawPeer = struct {
         return .{ .child = child, .port = port };
     }
 
-    /// Write `bytes` to the connected client. Only meaningful once a client
-    /// has actually connected and completed the TLS handshake; the caller is
-    /// responsible for sequencing (e.g. sleeping briefly after the request
-    /// is sent) since this has no way to observe that the request arrived.
+    /// Block (bounded) until the relayed client request's head has arrived
+    /// on the child's stdout (i.e. a client has connected, completed the TLS
+    /// handshake -- including presenting a client certificate if `-Verify 1`
+    /// requires one -- and sent a request). Request-synchronizes
+    /// `sendToClient`: writing a response to `openssl s_server`'s stdin
+    /// before any client has connected relies on it buffering that write
+    /// and flushing it into the first established session, which held on
+    /// this contributor's OpenSSL build but proved not to be a portable
+    /// contract to build required CI on (observed failing on CI's macOS
+    /// runner as `error.ReadTimeout` with zero bytes ever read downstream).
+    fn waitForRequestHead(self: *OpensslRawPeer, allocator: std.mem.Allocator, timeout_ms: u32) !void {
+        var buf = std.array_list.Managed(u8).init(allocator);
+        defer buf.deinit();
+        var tmp: [4096]u8 = undefined;
+        while (std.mem.find(u8, buf.items, "\r\n\r\n") == null) {
+            const n = try readSocketWithPoll(self.child.stdout.?.handle, &tmp, @intCast(timeout_ms));
+            if (n == 0) return error.UpstreamConnectionClosed;
+            try buf.appendSlice(tmp[0..n]);
+            if (buf.items.len > 64 * 1024) return error.StreamTooLong;
+        }
+    }
+
+    /// Write `bytes` to the connected client. Callers should call
+    /// `waitForRequestHead` first so this doesn't race the client actually
+    /// connecting (see its doc comment).
     fn sendToClient(self: *OpensslRawPeer, bytes: []const u8) !void {
         try self.child.stdin.?.writeStreamingAll(compat.io(), bytes);
     }
@@ -17656,6 +17677,25 @@ test "native upstream https: verified request to a trusted upstream succeeds" {
 // this switches to deterministic `Content-Length` framing (the buffered,
 // non-streaming upstream reader) entirely, which sidesteps the
 // close-delimited framing question altogether.
+const MtlsRawPeerResponder = struct {
+    origin: *OpensslRawPeer,
+    allocator: std.mem.Allocator,
+    response_bytes: []const u8,
+    observed_request: bool = false,
+    err: ?anyerror = null,
+
+    fn run(self: *MtlsRawPeerResponder) void {
+        self.origin.waitForRequestHead(self.allocator, 10_000) catch |err| {
+            self.err = err;
+            return;
+        };
+        self.observed_request = true;
+        self.origin.sendToClient(self.response_bytes) catch |err| {
+            self.err = err;
+        };
+    }
+};
+
 test "native upstream https: client certificate (mTLS) required by the origin" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -17702,12 +17742,6 @@ test "native upstream https: client certificate (mTLS) required by the origin" {
             "-CAfile", client_ca_cert,
         });
         defer origin.stop();
-        // Written before the client connects: `openssl s_server` buffers
-        // stdin input and flushes it to the peer as soon as the TLS session
-        // is established (verified independently -- an s_client/Python TLS
-        // client handshaking afterward receives it immediately), so this
-        // does not race the downstream request below.
-        try origin.sendToClient(response_bytes);
 
         const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
         defer allocator.free(upstream_url);
@@ -17728,6 +17762,20 @@ test "native upstream https: client certificate (mTLS) required by the origin" {
         });
         defer tardigrade.stop();
 
+        // The downstream request (below) has to be in flight *while* this
+        // waits for the relayed request to arrive on the origin's stdout,
+        // so the responder runs on its own thread: request-synchronizing
+        // `sendToClient` (see `waitForRequestHead`'s doc comment) means
+        // nothing can write the response until Tardigrade has actually sent
+        // its request, which can only happen concurrently with this test's
+        // own blocking `sendRequestWithTimeout` call below.
+        var responder = MtlsRawPeerResponder{
+            .origin = &origin,
+            .allocator = allocator,
+            .response_bytes = response_bytes,
+        };
+        const responder_thread = try std.Thread.spawn(.{}, MtlsRawPeerResponder.run, .{&responder});
+
         // 20s, not a tight bound: this test spawns two extra processes
         // (openssl s_server and this Tardigrade instance) on top of two TLS
         // handshakes, and CI's macos-14 runner has shown itself to need more
@@ -17743,6 +17791,11 @@ test "native upstream https: client certificate (mTLS) required by the origin" {
             .headers = &.{},
         }, 20_000);
         defer response.deinit();
+
+        responder_thread.join();
+        try std.testing.expect(responder.observed_request);
+        if (responder.err) |err| return err;
+
         try std.testing.expectEqual(@as(u16, 200), response.status_code);
         try assertContains(response.body, "native-upstream-mtls-body");
     }

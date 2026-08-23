@@ -917,6 +917,47 @@ fn relayStreamingUploadToHttp2(
 /// origin negotiates HTTP/1.1 via ALPN, the request runs on the h1 streaming
 /// relay over that fresh (unpooled) connection instead.
 ///
+/// The h2-pool `.h1` arm's exchange, factored out so it can be driven over an
+/// arbitrary `transport`/`fd` pair in a unit test — production call sites
+/// always pass the pool's `*UpstreamTlsConn`, but a test can pass any fake
+/// transport implementing the same small `read`/`writeAll` surface (plus a
+/// real fd for the poll-based readiness check `streamProxyOverTransport`'s
+/// buffered reader falls back to). Sets `downstream_committed.*` on every
+/// error return, from `streamProxyOverTransport`'s own `wrote_downstream`
+/// (#643): once the response head is on the wire, the caller must not
+/// serialize a second one after a later failure.
+fn runNegotiatedH1Exchange(
+    allocator: std.mem.Allocator,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    relay_bytes: usize,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    buffered_body: []const u8,
+    streaming_body: ?StreamingRequestBody,
+    downstream_conn: anytype,
+    downstream_writer: anytype,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+    correlation_id: []const u8,
+    connect_timeout_ms: u32,
+    read_deadline_ms: u32,
+    cancel_token: ?*const CancellationToken,
+    proxy_buffer_limits: proxy_buffer_account.Limits,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
+    downstream_committed: *bool,
+) !StreamingProxyResult {
+    var wrote_downstream = false;
+    const res = streamProxyOverTransport(allocator, transport, fd, relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity) catch |err| {
+        downstream_committed.* = wrote_downstream;
+        return err;
+    };
+    return res.result;
+}
+
 /// `opts == null` selects prior-knowledge cleartext h2c (#237): plain socket,
 /// `http` scheme, `h2c:`-prefixed pool key, no `.h1` fallback.
 fn streamViaH2Pool(
@@ -980,7 +1021,6 @@ fn streamViaH2Pool(
                 }
                 if (h1_pool) |p| p.recordProtocol(false);
                 const start_ms = http.event_loop.monotonicMs();
-                var wrote_downstream = false;
                 // An ALPN-h1 origin never creates an h2 origin entry, so its
                 // per-origin account comes from the h1 pool — under the h1 key
                 // (`https:host:port`), which is the same origin identity the
@@ -995,12 +1035,9 @@ fn streamViaH2Pool(
                 // own, so this is an ordinary HTTP/1 exchange: allocate and
                 // charge at the current config's size, exactly as the h1 path
                 // below does.
-                const res = streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global }) catch |err| {
-                    downstream_committed.* = wrote_downstream;
-                    return err;
-                };
+                const result = try runNegotiatedH1Exchange(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global }, downstream_committed);
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
-                return res.result;
+                return result;
             },
             .h2 => |conn| {
                 if (h1_pool) |p| p.recordProtocol(true);
@@ -4048,6 +4085,8 @@ const H2ExchangeCtx = struct {
     finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     failed: bool = false,
     status: u16 = 0,
+    err: ?anyerror = null,
+    downstream_committed: bool = false,
 };
 
 fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
@@ -4084,6 +4123,81 @@ fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
         return;
     };
     ctx.status = result.status_code;
+}
+
+/// A downstream writer that cancels `token` the moment it has captured a
+/// complete response head (`\r\n\r\n`), as a side effect of the very write
+/// call that commits the response -- guaranteeing the cancellation is
+/// already visible by the h2-pool body loop's *first* `cancelStopped()`
+/// check, rather than racing to land it inside a narrow window between
+/// loop iterations.
+const CancelingHeadCaptureWriter = struct {
+    captured: *std.array_list.Managed(u8),
+    token: *CancellationToken,
+
+    fn maybeCancel(self: CancelingHeadCaptureWriter) void {
+        if (!self.token.isCancelled() and std.mem.find(u8, self.captured.items, "\r\n\r\n") != null) {
+            self.token.cancel(.client_disconnect);
+        }
+    }
+
+    pub fn writeAll(self: CancelingHeadCaptureWriter, bytes: []const u8) !void {
+        try self.captured.appendSlice(bytes);
+        self.maybeCancel();
+    }
+    pub fn print(self: CancelingHeadCaptureWriter, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [64]u8 = undefined;
+        try self.captured.appendSlice(try std.fmt.bufPrint(&buf, fmt, args));
+        self.maybeCancel();
+    }
+};
+
+/// Same exchange as `runH2ExchangeThread`, but a GET with no upload body,
+/// over `CancelingHeadCaptureWriter`, and reporting the error plus
+/// `downstream_committed` state back on `ctx` (#643).
+fn runH2CancelExchangeThread(ctx: *H2ExchangeCtx, token: *CancellationToken) void {
+    defer ctx.finished.store(true, .release);
+    var downstream_committed = false;
+    const result = streamViaH2Pool(
+        std.testing.allocator,
+        ctx.pool,
+        null,
+        "127.0.0.1",
+        ctx.port,
+        null, // prior-knowledge h2c
+        ctx.uri,
+        "POST",
+        &.{},
+        // A buffered (non-streamed) body, not empty: `H2SlowResponseOrigin`
+        // only proceeds past the request phase once it has read a DATA
+        // frame carrying END_STREAM, which a genuinely bodiless request
+        // never sends (END_STREAM lands directly on HEADERS instead) --
+        // confirmed empirically as the exchange timing out server-side
+        // never receiving a response at all.
+        "x",
+        null, // buffered, not streamed
+        ctx.read_buf.len,
+        ctx.source,
+        CancelingHeadCaptureWriter{ .captured = ctx.captured, .token = token },
+        ctx.security,
+        null,
+        null,
+        "h2-cancel-test",
+        2000,
+        5000,
+        token,
+        ctx.limits,
+        ctx.observer,
+        ctx.global,
+        &downstream_committed,
+    ) catch |err| {
+        ctx.failed = true;
+        ctx.err = err;
+        ctx.downstream_committed = downstream_committed;
+        return;
+    };
+    ctx.status = result.status_code;
+    ctx.downstream_committed = downstream_committed;
 }
 
 test "an http2 upload releases request-direction capacity before its response completes" {
@@ -4166,6 +4280,65 @@ test "an http2 upload releases request-direction capacity before its response co
     try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
     try std.testing.expectEqual(@as(usize, 0), counters.reserved);
     try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+// Reviewer-requested regression (#643): `streamViaH2Pool`'s real `.h2` arm
+// must set `downstream_committed` when its own mid-relay `cancelStopped()`
+// check throws `error.RequestCancelled` *after* the response head already
+// went downstream -- the second of the two commitment gaps the first
+// implementation of this fix left uncovered (the first is the sibling
+// `.h1`-arm test above). Reuses `H2SlowResponseOrigin`: it sends HEADERS
+// then withholds the body, which would otherwise make "wait for
+// cancellation to matter" a race against the body loop's next iteration --
+// sidestepped entirely by canceling the token as a side effect of
+// `CancelingHeadCaptureWriter` observing the head write complete, which
+// happens synchronously before the body loop's first (not second)
+// `cancelStopped()` check.
+test "an http2 mid-relay cancellation reports downstream_committed" {
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin = H2SlowResponseOrigin{ .listen_fd = listener.fd };
+    const origin_thread = try std.Thread.spawn(.{}, h2SlowResponseServe, .{&origin});
+
+    var read_buf: [16 * 1024]u8 = undefined;
+    const limits = uploadTestLimits(1024 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, read_buf.len);
+    var counters = UploadBufferObserver{};
+    var source = FakeUploadSource{ .data = "" };
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/slow", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{});
+    var ctx = H2ExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf = &read_buf,
+        .source = &source,
+        .captured = &captured,
+        .security = &security,
+        .limits = limits,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    var token = CancellationToken.init(0); // no deadline; canceled explicitly
+    const exchange = try std.Thread.spawn(.{}, runH2CancelExchangeThread, .{ &ctx, &token });
+    exchange.join();
+
+    // Unstick the origin thread (still waiting on `release_body`, which
+    // this exchange -- canceled before ever reading the body -- never
+    // reaches) so it can exit cleanly.
+    origin.release_body.store(true, .release);
+    pool.deinit();
+    origin_thread.join();
+
+    try std.testing.expect(ctx.failed);
+    try std.testing.expectEqual(@as(?anyerror, error.RequestCancelled), ctx.err);
+    try std.testing.expect(ctx.downstream_committed);
 }
 
 /// Walk an HTTP/2 frame stream looking for one frame type. Frames are
@@ -4614,6 +4787,11 @@ const Http1ResponseRelay = struct {
     status: u16 = 0,
     upstream_aborted: bool = false,
     downstream_aborted_after_status: bool = false,
+    /// Set from `runNegotiatedH1Exchange`'s own out-parameter on an error
+    /// return (#643): whether the downstream response head had already been
+    /// written before the failure, i.e. whether a caller may safely
+    /// serialize a replacement response.
+    downstream_committed: bool = false,
 
     fn init(
         relay_bytes: usize,
@@ -4649,9 +4827,8 @@ const Http1ResponseRelay = struct {
         defer self.finished.store(true, .release);
         var security = http.security_headers.SecurityHeaders{};
         var source = FakeUploadSource{ .data = "" };
-        var wrote_downstream = false;
         const uri = std.Uri.parse("http://origin.test/resource") catch unreachable;
-        const res = streamProxyOverTransport(
+        const result = runNegotiatedH1Exchange(
             self.allocator,
             compat.netStreamFromFd(self.client_fd),
             self.client_fd,
@@ -4670,17 +4847,17 @@ const Http1ResponseRelay = struct {
             0,
             self.read_deadline_ms,
             self.cancel_token,
-            &wrote_downstream,
             self.limits,
             self.counters.observer(),
             self.capacity,
+            &self.downstream_committed,
         ) catch |err| {
             self.err = err;
             return;
         };
-        self.status = res.result.status_code;
-        self.upstream_aborted = res.result.upstream_aborted;
-        self.downstream_aborted_after_status = res.result.downstream_aborted_after_status;
+        self.status = result.status_code;
+        self.upstream_aborted = result.upstream_aborted;
+        self.downstream_aborted_after_status = result.downstream_aborted_after_status;
     }
 
     fn runCapturing(self: *Http1ResponseRelay) void {
@@ -4745,6 +4922,46 @@ test "http1 response relay releases its origin reservation when the upstream abo
     try std.testing.expect(relay.err == null);
     try std.testing.expect(relay.upstream_aborted);
     try relay.expectNothingHeld();
+}
+
+// Reviewer-requested regression (#643): the h2-pool's ALPN->h1 fallback arm
+// (`streamViaH2Pool`'s `.h1` case) must set `downstream_committed` on error
+// exactly like the direct-H1 pooled path does, so a caller never serializes
+// a second HTTP response onto an already-committed connection. Exercises
+// `runNegotiatedH1Exchange` directly -- the small helper `streamViaH2Pool`'s
+// `.h1` arm calls -- since forcing a deterministic post-commit failure
+// through a real ALPN-negotiated TLS connection would need far more
+// machinery than the actual commitment contract being tested here.
+//
+// Reuses the sibling read-timeout test's exact mechanism below (head sent,
+// no body follows, a short deadline) rather than attempting a TCP-style RST:
+// this harness's socketpair is AF_UNIX (`makeBlockingSocketpair`), which has
+// no RST/FIN distinction at the protocol level -- an abrupt
+// `SO_LINGER{onoff=1,linger=0}` close on it still surfaces to the peer as a
+// plain, graceful `read() == 0` (confirmed empirically: it produced
+// `relayUpstreamBody`'s existing `.aborted = true` outcome, not a thrown
+// error). A read timeout is a genuinely thrown error reached only after the
+// head already committed, which is exactly the post-commit failure shape
+// this test needs to prove.
+test "negotiated-h1 exchange reports downstream_committed on a post-commit read timeout" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const relay_bytes: usize = 16 * 1024;
+
+    var relay = try Http1ResponseRelay.init(
+        relay_bytes,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+    relay.read_deadline_ms = 100;
+
+    // The head commits the response; the promised body never arrives.
+    relay.originSend(h1_response_head);
+    relay.runCapturing();
+
+    try std.testing.expect(relay.err != null);
+    try std.testing.expect(relay.downstream_committed);
 }
 
 test "http1 response relay releases its origin reservation on a read timeout" {
