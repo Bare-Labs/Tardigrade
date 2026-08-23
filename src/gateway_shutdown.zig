@@ -218,6 +218,35 @@ pub fn hotReloadConfig(
             return;
         }
     }
+    // #634 (#641 review): on the adapter-free profiles the native
+    // credential store and `native_tls_provider` are created only when TLS
+    // files exist at startup, and `startNewConnection` dispatches on that
+    // startup-fixed optional. A reload that turns TLS on for a process that
+    // started plaintext (or off for one that started with TLS) would
+    // therefore publish a config the runtime cannot honor — "reload
+    // applied" while new connections keep the old transport. Reject the
+    // topology change outright before any runtime mutation; enabling or
+    // disabling TLS is restart-owned on native builds. (On the appliance
+    // profile the credential-config check above already rejects these same
+    // transitions with its own message; this guard is the generic-native
+    // owner of the rule.)
+    if (edge_config.is_native_tls_build) {
+        var current_lease = worker_ctx.config_store.acquire();
+        const tls_topology_changed = edge_config.hasTlsFiles(current_lease.cfg) != edge_config.hasTlsFiles(cfg_ptr);
+        current_lease.release();
+        if (tls_topology_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "enabling or disabling native TLS requires restart", .{}) catch "enabling or disabling native TLS requires restart";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_CERT_PATH/TARDIGRADE_TLS_KEY_PATH would enable or disable TLS on a running native-TLS process; the native credential owner is startup-fixed, so restart to change TLS topology (#634)", .{});
+            return;
+        }
+    }
     // #629: a general-profile build serving both stable TCP (OpenSSL
     // `TlsTerminator`) and native HTTP/3 (`NativeCredentialStore`) has two
     // independent TLS credential owners. Left unrestricted, native H3 could

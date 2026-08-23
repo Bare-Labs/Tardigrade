@@ -3002,6 +3002,17 @@ fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
 /// `validateApplianceTlsProfile`/`validateTlsServerNamePolicy` instead.
 fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     if (!is_native_tls_build) return;
+
+    // ACME is checked before the TLS-files gate below: enabling ACME is a
+    // request to *obtain* credentials, so it is meaningful — and must fail
+    // deterministically — precisely when no cert/key pair is configured
+    // yet. Every check after the gate concerns behavior of an active local
+    // identity and is inert without one.
+    if (cfg.tls_acme_enabled) {
+        logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (the ACME client is OpenSSL-adapter-only until its native implementation lands, #634)", .{});
+        return error.UnsupportedNativeTlsConfiguration;
+    }
+
     if (!hasTlsFiles(cfg)) return;
 
     if (!std.mem.eql(u8, cfg.tls_min_version, "1.3") or !std.mem.eql(u8, cfg.tls_max_version, "1.3")) {
@@ -3030,10 +3041,6 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     }
     if (cfg.tls_crl_check) {
         logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_CRL_CHECK", .{});
-        return error.UnsupportedNativeTlsConfiguration;
-    }
-    if (cfg.tls_acme_enabled) {
-        logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (the ACME client is OpenSSL-adapter-only until its native implementation lands, #634)", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
     if (cfg.tls_ocsp_auto_refresh) {
@@ -4316,6 +4323,17 @@ test "native-TLS builds reject OpenSSL-adapter-only TLS settings one at a time" 
     }
     {
         var cfg = base;
+        cfg.tls_acme_enabled = true;
+        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
+    }
+    {
+        // #641 review: ACME is a request to *obtain* credentials, so it
+        // must be rejected even when no cert/key pair is configured yet —
+        // it must not slip past the TLS-files early return and become
+        // silently inert.
+        var cfg = base;
+        cfg.tls_cert_path = "";
+        cfg.tls_key_path = "";
         cfg.tls_acme_enabled = true;
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
     }

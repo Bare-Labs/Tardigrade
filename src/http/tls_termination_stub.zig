@@ -1,19 +1,23 @@
-//! No-OpenSSL TLS termination stub for the Bare Systems appliance profile
-//! (#379, epic #327).
+//! No-OpenSSL TLS termination stub for the adapter-free profiles
+//! (#379, epic #327, #634).
 //!
-//! Selected by `-Dtls-profile=appliance` in `src/http.zig`. Presents the
+//! Selected via `tls_backend.zig` whenever `tls_openssl_adapter` is false
+//! (`-Dtls-profile=appliance` and `-Dtls-profile=native`). Presents the
 //! same public surface as `tls_termination.zig` so every call site compiles
 //! unchanged, but contains no `@cImport`, no OpenSSL types, and no C
-//! linkage. Until the native TLS path lands (#391 defines the appliance
-//! support matrix), any attempt to construct a terminator or upstream TLS
-//! connection fails closed at startup with `error.ContextInitFailed` — a
-//! deliberate, inspectable failure rather than a hidden runtime fallback.
+//! linkage. Downstream TLS on those builds is served by the native
+//! listener (`native_tls_connection.zig`), never by this file; any attempt
+//! to construct the OpenSSL-shaped terminator or an upstream TLS
+//! connection (the OpenSSL-adapter-only paths) fails closed with
+//! `error.ContextInitFailed` — a deliberate, inspectable failure rather
+//! than a hidden runtime fallback.
 //!
 //! Option structs are duplicated field-for-field from the adapter so
-//! configuration parsing behaves identically in both profiles; only the
+//! configuration parsing behaves identically in every profile; only the
 //! I/O-bearing types are inert.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const encrypted_stream = @import("tls_core").encrypted_stream;
 const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
@@ -83,9 +87,14 @@ pub const NegotiatedProtocol = enum {
     http2,
 };
 
+// #641 review: this binary's own `-Dtls-profile` value, not a hardcoded
+// "appliance" — the `native` profile selects this same stub and must not
+// misreport itself as appliance in a handshake-error log line.
 const unavailable_message = "TLS termination is unavailable: this binary was built with " ++
-    "-Dtls-profile=appliance and contains no OpenSSL adapter; the native TLS " ++
-    "path is tracked by #391";
+    "-Dtls-profile=" ++ build_options.tls_profile ++ " and contains no OpenSSL adapter; " ++
+    "downstream TLS on this profile is served by the native listener " ++
+    "(native_tls_connection.zig), which this error path never reaches in " ++
+    "production — see #634";
 
 pub const TlsTerminator = struct {
     allocator: std.mem.Allocator,

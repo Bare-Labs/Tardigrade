@@ -132,7 +132,12 @@ and which protocols a deployment serves:
   contrast, one live-reloadable `NativeCredentialStore` is shared between
   native TCP and native HTTP/3, so a single accepted `SIGHUP` rotates both
   surfaces to the same identity atomically — the #629 split-identity
-  hazard is structural to the mixed `general`+H3 composition only.)
+  hazard is structural to the mixed `general`+H3 composition only. TLS
+  *topology* is still startup-owned on every native build: the store and
+  provider are created only when cert/key paths exist at startup, so
+  `hotReloadConfig` rejects any reload that would turn TLS on for a
+  process that started plaintext, or off for one that started with TLS —
+  "enabling or disabling native TLS requires restart".)
 
 **On the default `general` build with the OpenSSL adapter linked**, stable
 TCP owns its identity via `TlsTerminator` (startup-owned, as above) while

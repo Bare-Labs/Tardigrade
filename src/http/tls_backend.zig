@@ -1,13 +1,16 @@
-//! TLS termination backend selector (#379, epic #327).
+//! TLS termination backend selector (#379, epic #327, #634).
 //!
 //! Every consumer of TLS termination — `http.zig`'s public alias and the
 //! direct importers inside `src/http/` — goes through this file, so exactly
 //! one backend type set exists per build. `-Dtls-profile=general` selects
-//! the approved OpenSSL adapter; `-Dtls-profile=appliance` selects the
-//! no-OpenSSL stub, in which case `tls_termination.zig` is never analyzed,
-//! `@cImport("openssl/...")` never runs, and no `libssl`/`libcrypto`
-//! linkage exists. The selection is a build-graph decision with no runtime
-//! fallback; see docs/TLS_DEPENDENCY_POLICY.md.
+//! the approved OpenSSL adapter; the adapter-free profiles
+//! (`-Dtls-profile=appliance` and `-Dtls-profile=native`, i.e.
+//! `tls_openssl_adapter=false`) select the no-OpenSSL stub, in which case
+//! `tls_termination.zig` is never analyzed, `@cImport("openssl/...")`
+//! never runs, and no `libssl`/`libcrypto` linkage exists — downstream TLS
+//! on those builds is served by `native_tls_connection.zig` instead. The
+//! selection is a build-graph decision with no runtime fallback; see
+//! docs/TLS_DEPENDENCY_POLICY.md.
 
 const selected = if (@import("build_options").tls_openssl_adapter)
     @import("tls_termination.zig")

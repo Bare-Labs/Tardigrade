@@ -1,10 +1,12 @@
-//! ACME client backend selector (#379, epic #327).
+//! ACME client backend selector (#379, epic #327, #634).
 //!
 //! Mirrors `tls_backend.zig`: `-Dtls-profile=general` selects the
-//! OpenSSL-backed ACME client, `-Dtls-profile=appliance` selects the
-//! no-OpenSSL stub, so an appliance binary never analyzes the ACME client's
-//! `@cImport("openssl/...")` and never links OpenSSL through the ACME path.
-//! The pure-Zig `ChallengeStore` is identical in both backends.
+//! OpenSSL-backed ACME client; the adapter-free profiles
+//! (`-Dtls-profile=appliance` and `-Dtls-profile=native`, i.e.
+//! `tls_openssl_adapter=false`) select the no-OpenSSL stub, so those
+//! binaries never analyze the ACME client's `@cImport("openssl/...")` and
+//! never link OpenSSL through the ACME path. The pure-Zig `ChallengeStore`
+//! is identical in both backends.
 
 const selected = if (@import("build_options").tls_openssl_adapter)
     @import("acme_client.zig")
