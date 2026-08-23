@@ -17187,9 +17187,13 @@ test "native TLS listener generic-native explicit SNI mapping overrides a matchi
     }, "", 10_000);
     defer probe.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(probe.outcome));
-    // The served leaf must be the P-256 override (subject CN=127.0.0.1), not
-    // the Ed25519 default (subject CN=tardigrade.test).
-    try assertContains(probe.stdout, "CN=127.0.0.1");
+    // The served leaf must be the P-256 override, not the Ed25519 default:
+    // checked via the negotiated CertificateVerify signature type rather
+    // than the printed certificate subject line, whose exact formatting
+    // (spacing around "=", presence of "subject=" vs "s:") varies across
+    // openssl versions/distributions in ways the signature-type line does
+    // not.
+    try assertContains(probe.stdout, "Peer signature type: ecdsa_secp256r1_sha256");
 }
 
 // #634 deliverable 1: native upstream HTTPS/TLS. `openssl s_server` is used
