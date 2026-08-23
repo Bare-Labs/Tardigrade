@@ -11,6 +11,7 @@ on:
       - "scripts/install-zig.sh"
       - "scripts/install.sh"
       - "scripts/test-install.sh"
+      - "scripts/test-launchd-service.sh"
       - "scripts/audit-release-binary.sh"
       - "scripts/package-release-archive.sh"
       - "packaging/**"
@@ -143,6 +144,10 @@ jobs:
           kill -INT "$pid"
           wait "$pid"
           trap - EXIT
+
+      - name: Smoke test launchd service lifecycle
+        if: matrix.os == 'macos-15'
+        run: ./scripts/test-launchd-service.sh --artifact-dir "$RUNNER_TEMP/extracted"
 
       - name: Smoke test installer path
         run: ./scripts/test-install.sh
