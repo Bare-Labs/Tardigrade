@@ -1520,7 +1520,7 @@ fn exchangeBoundedBufferedHttpRequest(
             }
         }
 
-        if (read_deadline_ms > 0 and !try pollFdReadable(fd, read_deadline_ms)) {
+        if (read_deadline_ms > 0 and !transportHasBufferedInput(transport) and !try pollFdReadable(fd, read_deadline_ms)) {
             return error.Timeout;
         }
         const n = try transport.read(&read_buf);
@@ -1656,6 +1656,24 @@ fn decodeChunkedBody(allocator: std.mem.Allocator, encoded: []const u8, max_byte
         if (out.items.len > max_bytes) return error.StreamTooLong;
         pos = data_end + 2; // skip the CRLF after the chunk data
     }
+}
+
+/// Whether `transport` already has decrypted/decoded bytes buffered above
+/// the raw fd (e.g. a TLS record layer that read more of the socket than one
+/// call needed, or over-read past the handshake into the first response
+/// bytes). Polling the raw fd for *new* readability in that case is wrong —
+/// the peer may have nothing further to send until it gets our next
+/// request, so the poll would starve out its own deadline waiting for bytes
+/// that already arrived. Mirrors `upstream_h2.zig`'s existing `if
+/// (transport.pending() > 0) return;` guard. `transport` types without a
+/// `pending()` method (e.g. `compat.NetStream`, the plaintext transport)
+/// have nothing to buffer above the fd, so they always poll normally.
+fn transportHasBufferedInput(transport: anytype) bool {
+    const T = @TypeOf(transport);
+    const info = @typeInfo(T);
+    const Target = if (info == .pointer) info.pointer.child else T;
+    if (!@hasDecl(Target, "pending")) return false;
+    return transport.pending() > 0;
 }
 
 /// Wait up to `timeout_ms` for `fd` to become readable. Returns false on
@@ -1939,7 +1957,7 @@ const StreamReadBuf = struct {
             self.start = 0;
         }
         if (self.end == self.buf.len) return error.StreamTooLong; // window full without a delimiter
-        if (deadline_ms > 0 and !try pollFdReadable(fd, deadline_ms)) return error.Timeout;
+        if (deadline_ms > 0 and !transportHasBufferedInput(transport) and !try pollFdReadable(fd, deadline_ms)) return error.Timeout;
         const n = try transport.read(self.buf[self.end..]);
         if (n == 0) return false;
         self.end += n;

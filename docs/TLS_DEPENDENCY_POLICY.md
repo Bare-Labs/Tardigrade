@@ -59,21 +59,40 @@ the binary. There is no runtime switch and no fallback between profiles.
   multi-identity credential loading (default cert/key plus
   `TARDIGRADE_TLS_SNI_CERTS`), native TCP TLS termination, native QUIC/H3,
   SIGHUP-driven credential reload, opt-in native resumption
-  (`TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). The credential store is
-  fail-closed on SNI, matching the existing native HTTP/3 behavior: the
-  default identity serves clients that send no SNI, and every host name
-  clients will request must be registered via `TARDIGRADE_TLS_SNI_CERTS`
-  (default-identity SAN matching is part of the remaining #634 parity
-  work).
+  (`TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`), and a **native upstream HTTPS/TLS
+  client** (`src/http/tls_termination_stub.zig`'s `UpstreamTlsConn`, #634) —
+  `proxy_pass https://…` upstreams are served entirely by the native TLS
+  engine, record layer, and PKI stack, never by OpenSSL.
+- Downstream SNI selection: an explicit `TARDIGRADE_TLS_SNI_CERTS` mapping
+  always wins first; failing that, the default identity is served if its own
+  certificate's SAN actually covers the requested hostname (RFC 9525 matching
+  via `src/pki/identity.zig`, not string heuristics — see
+  `sni_provider.UnknownSniPolicy.use_default_when_identity_matches`); failing
+  that, the handshake fails closed. Absent SNI still serves the default
+  identity unconditionally, unchanged from before.
+- Upstream TLS: certificate verification (`TARDIGRADE_UPSTREAM_TLS_VERIFY`,
+  `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE`) uses the same native PKI path-building/
+  validation as downstream mTLS would (`src/tls/webpki_verifier.zig`), falling
+  back to a small set of well-known system CA bundle file locations when no
+  bundle is configured; SNI/hostname derivation
+  (`TARDIGRADE_UPSTREAM_TLS_SERVER_NAME`), upstream ALPN/protocol selection
+  (`TARDIGRADE_UPSTREAM_PROTOCOL`), upstream client certificates (mTLS to the
+  origin), and existing connect/response timeouts all continue to work
+  unchanged; disabling verification still encrypts the connection, it just
+  skips identity checking. See `docs/CONFIGURATION.md` for the full knob
+  list and `docs/TROUBLESHOOTING.md` for native-profile-specific upstream TLS
+  failure modes.
 - Must not link `libssl`, `libcrypto`, or any other foreign TLS, crypto, QUIC,
   HTTP/3, or certificate library — audited identically to the appliance
   profile.
-- OpenSSL-adapter-only settings (TLS 1.2, cipher-string overrides, mTLS client
-  verification, the OpenSSL session cache/tickets, OCSP stapling, CRL checks,
-  ACME, the filesystem credential watcher, PROXY protocol with TLS) fail
-  config validation deterministically (`UnsupportedNativeTlsConfiguration`)
-  instead of being silently ignored; each is either natively implemented later
-  or explicitly dispositioned under #634.
+- OpenSSL-adapter-only settings (TLS 1.2, cipher-string overrides, downstream
+  mTLS client verification, the OpenSSL session cache/tickets, OCSP stapling,
+  CRL checks, ACME, the filesystem credential watcher, PROXY protocol with
+  TLS) fail config validation deterministically
+  (`UnsupportedNativeTlsConfiguration`) instead of being silently ignored;
+  each is either natively implemented later or explicitly dispositioned under
+  #634. Upstream TLS is not on this list: every upstream TLS knob is
+  supported natively (see above), not rejected.
 - This is the profile #634 promotes to the shipping default once feature
   disposition and release/packaging cutover complete.
 
@@ -179,9 +198,19 @@ alongside the release assets and SBOM.
       foreign linkage, generic multi-identity credentials, deterministic
       rejection of OpenSSL-adapter-only settings, built and binary-audited in
       CI.
-- [ ] Every operator-visible OpenSSL-path capability (mTLS, OCSP, CRL, ACME,
-      TLS 1.2, cipher policy, watcher-based reload, upstream TLS) is migrated
-      to native code or explicitly dispositioned per #634.
+- [x] Native upstream HTTPS/TLS client: `proxy_pass https://…` upstreams work
+      under `-Dtls-profile=native` with native PKI verification, hostname/SAN
+      checking, SNI, ALPN/protocol selection, connection pooling/reuse, and
+      bounded failure mapping — no OpenSSL, no runtime fallback.
+- [x] Default downstream identity SAN/SNI eligibility: a default certificate
+      may satisfy a requested SNI its own SAN actually covers, without
+      requiring an explicit `TARDIGRADE_TLS_SNI_CERTS` entry; explicit
+      mappings still take precedence and mismatched/unmatched SNI still fails
+      closed.
+- [ ] Every remaining operator-visible OpenSSL-path capability (downstream
+      mTLS, OCSP, CRL, ACME, TLS 1.2, cipher policy, watcher-based reload) is
+      migrated to native code or explicitly dispositioned per #634. Upstream
+      TLS is no longer on this list — see above.
 - [ ] Native TLS reaches the v1.0 general-purpose support contract
       (`docs/SUPPORT_MATRIX.md`).
 - [ ] Native path passes the TLS/interop conformance suite at parity with the

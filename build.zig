@@ -342,6 +342,7 @@ pub fn build(b: *std.Build) void {
 
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,
+        .filters = if (b.option([]const u8, "integration-test-filter", "Filter tests run by test-integration")) |f| &.{f} else &.{},
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
     run_integration_tests.step.dependOn(b.getInstallStep());
@@ -351,11 +352,18 @@ pub fn build(b: *std.Build) void {
 
     const native_listener_integration_tests = b.addTest(.{
         .root_module = integration_mod,
-        .filters = &.{"native TLS listener"},
+        // #634: "native upstream https" covers the native upstream HTTPS/TLS
+        // client (`UpstreamTlsConn`) regressions alongside the pre-existing
+        // downstream "native TLS listener" cases (which also include the
+        // default-identity SAN/SNI eligibility tests) -- one step for every
+        // native-profile TLS-specific real-process integration case, so CI
+        // exercises both without needing the full (slower) `test-integration`
+        // suite.
+        .filters = &.{ "native TLS listener", "native upstream https" },
     });
     const run_native_listener_integration_tests = b.addRunArtifact(native_listener_integration_tests);
     run_native_listener_integration_tests.step.dependOn(b.getInstallStep());
-    const native_listener_integration_step = b.step("test-integration-native-tls", "Run native TLS listener HTTP integration tests");
+    const native_listener_integration_step = b.step("test-integration-native-tls", "Run native TLS listener and upstream HTTPS integration tests");
     native_listener_integration_step.dependOn(&run_native_listener_integration_tests.step);
 
     // #162: `tardi init <profile>` / `config init --profile` real
@@ -950,6 +958,14 @@ pub fn build(b: *std.Build) void {
     // The appliance credential loader (#392) reuses the PKI PEM/X.509
     // machinery; pki does not import tls_core, so this stays acyclic.
     tls_core_mod.addImport("pki", pki_mod);
+    // #634: `sni_provider.zig`'s default-identity SAN eligibility check
+    // (`defaultIdentitySatisfiesSni`) reuses `pki.x509`/`pki.identity`.
+    // `session_cache*_mod` build `session_cache.zig`/
+    // `session_cache_persistence.zig` as standalone test roots (not through
+    // `tls_core_mod`) but still reach `sni_provider.zig` transitively, so
+    // they need the same "pki" module wired directly.
+    session_cache_mod.addImport("pki", pki_mod);
+    session_cache_persistence_mod.addImport("pki", pki_mod);
     const pki_tests = b.addTest(.{ .root_module = pki_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");

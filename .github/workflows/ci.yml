@@ -285,11 +285,14 @@ jobs:
   # many of its fixtures (restart/rotation/soak/interop cases) authenticate
   # against `TARDIGRADE_TLS_SERVER_NAME` the way the appliance profile's
   # single-identity credential owner treats it -- as the served SNI name --
-  # which the `native` profile's generic multi-identity credential store
-  # does not do (it requires the name to be registered via
-  # `TARDIGRADE_TLS_SNI_CERTS`, matching existing native-H3 behavior).
-  # Wiring the full suite through `native` is tracked as related follow-up
-  # to #634, not a change this slice makes to dozens of unrelated fixtures.
+  # which the `native` profile's generic multi-identity credential store only
+  # partially mirrors: an SNI not covered by the default identity's own
+  # certificate SAN still requires explicit `TARDIGRADE_TLS_SNI_CERTS`
+  # registration (#634's default-identity SAN/SNI eligibility, exercised by
+  # `test-integration-native-tls` below, narrows this gap but does not close
+  # it for every existing fixture's certificate). Wiring the full suite
+  # through `native` is tracked as related follow-up to #634, not a change
+  # this slice makes to dozens of unrelated fixtures.
   test-native:
     name: Test native profile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

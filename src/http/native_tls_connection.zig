@@ -98,7 +98,14 @@ pub const NativeCredentialStore = struct {
 
         const snapshot = try self.provider_state.buildSnapshot(configs, .{
             .absent_sni_policy = .use_default,
-            .unknown_sni_policy = .fail_handshake,
+            // #634: the default identity may satisfy a requested SNI that
+            // has no explicit `TARDIGRADE_TLS_SNI_CERTS` mapping when its own
+            // certificate's SAN actually covers that hostname, checked via
+            // `sni_provider.Snapshot.defaultIdentitySatisfiesSni` (RFC 9525
+            // matching, not blind fallback) -- an explicit mapping still
+            // always wins, and a non-covering or unparsable default
+            // identity still fails closed exactly like before.
+            .unknown_sni_policy = .use_default_when_identity_matches,
         });
         return .{ .snapshot = snapshot };
     }

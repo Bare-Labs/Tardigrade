@@ -640,7 +640,11 @@ certificate validation for every request to that origin. Instead fix the
 origin's certificate, supply the correct CA bundle via
 `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE`, or correct
 `TARDIGRADE_UPSTREAM_TLS_SERVER_NAME` if SNI doesn't match what the origin
-presents.
+presents. This applies identically on every `-Dtls-profile` build (#634):
+`appliance`/`native` upstream HTTPS goes through the native TLS/PKI stack
+(`src/http/tls_termination_stub.zig`'s `UpstreamTlsConn`), not OpenSSL, but
+the same knobs, the same 502-on-failure mapping, and the same "fix the
+certificate, don't disable verification" guidance apply.
 
 #### Verify the fix
 
