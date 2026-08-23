@@ -121,7 +121,7 @@ jobs:
           body=""
           ready=false
           for _ in {1..50}; do
-            if body="$(curl -fsS http://127.0.0.1:8080/ 2>/dev/null)"; then
+            if body="$(curl -fsS http://localhost:8080/ 2>/dev/null)"; then
               ready=true
               break
             fi
@@ -138,7 +138,7 @@ jobs:
           fi
 
           test "$body" = '<h1>Darwin release smoke</h1>'
-          test "$(curl -fsS http://127.0.0.1:8080/health)" = 'ok'
+          test "$(curl -fsS http://localhost:8080/health)" = 'ok'
 
           kill -INT "$pid"
           wait "$pid"
