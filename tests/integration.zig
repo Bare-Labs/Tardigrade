@@ -17177,23 +17177,30 @@ test "native TLS listener generic-native explicit SNI mapping overrides a matchi
     });
     defer tardigrade.stop();
 
-    try requireOpenssl(allocator);
-    const connect_arg = try opensslConnectArg(allocator, tardigrade.port);
-    defer allocator.free(connect_arg);
-    var probe = try runOpenssl(allocator, &.{
-        "s_client",        "-connect", connect_arg,
-        "-alpn",           "http/1.1", "-servername",
-        "tardigrade.test", "-tls1_3",  "-showcerts",
-    }, "", 10_000);
-    defer probe.deinit(allocator);
-    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(probe.outcome));
-    // The served leaf must be the P-256 override, not the Ed25519 default:
-    // checked via the negotiated CertificateVerify signature type rather
-    // than the printed certificate subject line, whose exact formatting
-    // (spacing around "=", presence of "subject=" vs "s:") varies across
-    // openssl versions/distributions in ways the signature-type line does
-    // not.
-    try assertContains(probe.stdout, "Peer signature type: ecdsa_secp256r1_sha256");
+    // Handshake with this repo's own native TLS test client (not
+    // `openssl s_client`): asserting on an external tool's human-readable
+    // output (certificate-print formatting, "Peer signature type:" line
+    // presence/wording) proved fragile across the different openssl
+    // versions/distributions CI's Linux and macOS runners actually ship,
+    // even after switching from the subject line to the signature-type
+    // line once already. Instead, compare the served leaf certificate's
+    // exact DER bytes against the P-256 override fixture's, which is
+    // unambiguous and has no external-tool version dependency at all.
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+
+    const served_entry = client.backend.peer_chain_entries[0];
+    const served_leaf = client.backend.peer_chain[served_entry.start..][0..served_entry.len];
+
+    const override_cert_pem = try compat.cwd().readFileAlloc(allocator, override_cert_path, 256 * 1024);
+    defer allocator.free(override_cert_pem);
+    const override_chain = try tls_core.identity_loader.certChainFromPemOrDer(allocator, override_cert_pem);
+    defer {
+        for (override_chain) |entry| allocator.free(entry);
+        allocator.free(override_chain);
+    }
+
+    try std.testing.expectEqualSlices(u8, override_chain[0], served_leaf);
 }
 
 // #634 deliverable 1: native upstream HTTPS/TLS. `openssl s_server` is used
