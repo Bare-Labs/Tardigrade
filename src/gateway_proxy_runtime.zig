@@ -675,8 +675,17 @@ pub fn handleLocationProxyPass(
                         state.recordProxyUpstreamFailure(cfg, selection.base_url, circuit_permit);
                     }
                     if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
-                    try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
+                    if (downstream_committed) {
+                        // Cancellation can fire mid-relay, after the response
+                        // head already went downstream (e.g. the h2-pool
+                        // path's own `cancelStopped` check inside its body
+                        // loop) -- never serialize a second response onto an
+                        // already-committed connection (#643).
+                        downstream_broken.* = true;
+                        return @intFromEnum(http.Status.gateway_timeout);
+                    }
+                    try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
                     return @intFromEnum(http.Status.gateway_timeout);
                 }
                 if (err == error.OutOfMemory) {

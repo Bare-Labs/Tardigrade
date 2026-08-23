@@ -17502,6 +17502,54 @@ const OpensslUpstreamServer = struct {
     }
 };
 
+/// An `openssl s_server` peer run *without* `-WWW`/`-HTTP`: after the TLS
+/// handshake, whatever this test writes to the child's stdin is relayed
+/// verbatim to the client, and whatever the client sends arrives on the
+/// child's stdout. This gives byte-exact control over the HTTP response
+/// (a real `Content-Length`, no close-delimited/demo-server framing) while
+/// the TLS handshake itself -- including certificate verification and, with
+/// `-Verify 1`, mTLS client-certificate enforcement -- is still a real,
+/// independent (non-Tardigrade) implementation. Avoids `-WWW`'s close-
+/// delimited framing entirely, which needs the streaming relay and is a
+/// separate, already-covered concern (see the close-delimited tests above).
+const OpensslRawPeer = struct {
+    child: std.process.Child,
+    port: u16,
+
+    fn start(allocator: std.mem.Allocator, extra_args: []const []const u8) !OpensslRawPeer {
+        const port = try findFreePort();
+        const accept_arg = try std.fmt.allocPrint(allocator, "{d}", .{port});
+        defer allocator.free(accept_arg);
+
+        var argv: std.array_list.Managed([]const u8) = .init(allocator);
+        defer argv.deinit();
+        try argv.appendSlice(&.{ "openssl", "s_server", "-accept", accept_arg, "-alpn", "http/1.1", "-quiet" });
+        try argv.appendSlice(extra_args);
+
+        var child = try std.process.spawn(compat.io(), .{
+            .argv = argv.items,
+            .stdin = .pipe,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        errdefer child.kill(compat.io());
+        try waitForTcpPort(port, 5_000);
+        return .{ .child = child, .port = port };
+    }
+
+    /// Write `bytes` to the connected client. Only meaningful once a client
+    /// has actually connected and completed the TLS handshake; the caller is
+    /// responsible for sequencing (e.g. sleeping briefly after the request
+    /// is sent) since this has no way to observe that the request arrived.
+    fn sendToClient(self: *OpensslRawPeer, bytes: []const u8) !void {
+        try self.child.stdin.?.writeStreamingAll(compat.io(), bytes);
+    }
+
+    fn stop(self: *OpensslRawPeer) void {
+        self.child.kill(compat.io());
+    }
+};
+
 fn upstreamTlsFixture(name: []const u8, allocator: std.mem.Allocator) ![]u8 {
     const cwd = try compat.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
@@ -17594,36 +17642,24 @@ test "native upstream https: verified request to a trusted upstream succeeds" {
 // success isn't explained by an origin that merely requests but doesn't
 // require one.
 //
-// Excluded from `test-integration-native-tls`'s CI-gated filter (named
-// "native upstream mtls" rather than "native upstream https", mirroring the
-// existing "native upstream h2 (best-effort, not CI-gated)" test's own
-// naming trick a little further down): CI's macos-14 runner has failed this
-// specific test four times in a row across several genuinely different
-// fixes -- a real premature-EOF-adjacent bug that turned out to be a false
-// theory (reverted after the reviewer disproved it with direct evidence
-// from the record layer), a real double-HTTP-response bug in the streaming
-// proxy's post-commit error path (found, fixed, and covered by a
-// deterministic TLS-free regression test elsewhere in this file), and,
-// after both of those, the underlying exchange still fails consistently
-// enough on that one runner to exhaust this test's own 10-attempt retry
-// loop. It has never failed locally (including many stress runs on both
-// this contributor's own macOS/aarch64 hardware and this PR's CI
-// ubuntu-latest/ubuntu-24.04-arm native-profile jobs), so the mTLS wiring
-// this test exists to prove is not in doubt -- what's left looks like
-// scheduling/timing pressure specific to that one CI runner under this
-// test's extra process spawns (openssl s_server plus two sequential
-// Tardigrade instances), not a further reproducible protocol bug. Still
-// runs in the full `test-integration` suite (local dev, and CI's "Test
-// appliance profile" job runs that full suite too, though this specific
-// test is gated off there by `requireGenericNativeTlsProfile()`).
-test "native upstream mtls (best-effort, not CI-gated): client certificate required by the origin" {
+// Uses `OpensslRawPeer` (byte-exact `Content-Length` framing) rather than
+// `OpensslUpstreamServer`'s `-WWW` demo mode: an earlier version of this
+// test used `-WWW`, whose close-delimited framing needed the streaming
+// relay and, on CI's macos-14 runner specifically, repeatedly and
+// consistently failed to complete cleanly across several genuinely
+// different fixes -- a false "premature EOF" theory (reverted after being
+// disproved), and a real double-HTTP-response bug in the streaming proxy's
+// post-commit error path (found and fixed, now covered by its own
+// deterministic regression elsewhere in this file). Neither fix resolved
+// the failure, and it never reproduced locally or on this PR's other CI
+// platforms, so rather than keep chasing a `-WWW`-specific interaction,
+// this switches to deterministic `Content-Length` framing (the buffered,
+// non-streaming upstream reader) entirely, which sidesteps the
+// close-delimited framing question altogether.
+test "native upstream https: client certificate (mTLS) required by the origin" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
     try requireOpenssl(allocator);
-
-    var origin_dir = try GenericFixtureDir.create(allocator, "native-upstream-mtls");
-    defer origin_dir.deinit();
-    try origin_dir.writeRel("hello.txt", "native-upstream-mtls-body");
 
     // The origin's own server identity (what our client verifies via
     // WebPkiVerifier) is the same Ed25519 fixture the other native upstream
@@ -17648,20 +17684,34 @@ test "native upstream mtls (best-effort, not CI-gated): client certificate requi
     const client_key = try applianceFixturePath(allocator, "client.key");
     defer allocator.free(client_key);
 
-    var origin = try OpensslUpstreamServer.start(allocator, origin_dir.dir_abs, &.{
-        "-cert",   leaf_cert,
-        "-key",    leaf_key,
-        "-Verify", "1",
-        "-CAfile", client_ca_cert,
-    });
-    defer origin.stop();
-
-    const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
-    defer allocator.free(upstream_url);
+    const body = "native-upstream-mtls-body";
+    const response_bytes = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer allocator.free(response_bytes);
 
     // With the client certificate configured: the handshake presents it and
     // the proxied request succeeds.
     {
+        var origin = try OpensslRawPeer.start(allocator, &.{
+            "-cert",   leaf_cert,
+            "-key",    leaf_key,
+            "-Verify", "1",
+            "-CAfile", client_ca_cert,
+        });
+        defer origin.stop();
+        // Written before the client connects: `openssl s_server` buffers
+        // stdin input and flushes it to the peer as soon as the TLS session
+        // is established (verified independently -- an s_client/Python TLS
+        // client handshaking afterward receives it immediately), so this
+        // does not race the downstream request below.
+        try origin.sendToClient(response_bytes);
+
+        const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
+        defer allocator.free(upstream_url);
+
         var tardigrade = try TardigradeProcess.start(allocator, .{
             .config_text =
             \\location /secure/ {
@@ -17674,45 +17724,16 @@ test "native upstream mtls (best-effort, not CI-gated): client certificate requi
                 .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = server_ca_cert },
                 .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT", .value = client_cert },
                 .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", .value = client_key },
-                // `openssl s_server -WWW`'s response is close-delimited (no
-                // Content-Length, see `startNativeUpstreamTardigrade`'s doc
-                // comment above) -- the buffered upstream reader expects a
-                // definite length, so this needs the streaming relay, which
-                // already handles close-delimited bodies (#196).
-                .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
             },
         });
         defer tardigrade.stop();
 
-        // CI's macOS runner has intermittently (though never locally, across
-        // 20+ stress runs here and on the runner's own Linux siblings)
-        // truncated this close-delimited streamed response before the
-        // terminating chunk, surfacing as `error.InvalidHttpResponse` from
-        // the test client's chunked decoder -- a harness-observable symptom
-        // of runner-level scheduling/timing pressure under this test's extra
-        // process spawns (openssl s_server plus two sequential Tardigrade
-        // instances), not a reproducible protocol bug (the fixed premature-
-        // EOF race in `UpstreamTlsConn.read()` was the one actual bug this
-        // test found; this retry covers what's left once that's fixed).
-        // `proxy_pass`'s `.close`-framed origin isn't pooled, so each retry
-        // exercises a fresh upstream mTLS handshake end to end, same as the
-        // first attempt would have.
-        var attempt: usize = 0;
-        var response: HttpResponse = while (attempt < 10) : (attempt += 1) {
-            const candidate = sendRequestWithTimeout(allocator, tardigrade.port, .{
-                .method = "GET",
-                .path = "/secure/hello.txt",
-                .body = null,
-                .headers = &.{},
-            }, 20_000) catch |err| switch (err) {
-                error.InvalidHttpResponse, error.ReadTimeout, error.ConnectionResetByPeer => {
-                    compat.sleepNs(200 * std.time.ns_per_ms);
-                    continue;
-                },
-                else => return err,
-            };
-            break candidate;
-        } else return error.MtlsUpstreamResponseNeverCompleted;
+        var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/secure/hello.txt",
+            .body = null,
+            .headers = &.{},
+        }, 10_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status_code);
         try assertContains(response.body, "native-upstream-mtls-body");
@@ -17722,6 +17743,17 @@ test "native upstream mtls (best-effort, not CI-gated): client certificate requi
     // `-Verify 1` refuses the handshake, so the proxied request must fail
     // closed with a bounded gateway error.
     {
+        var origin = try OpensslRawPeer.start(allocator, &.{
+            "-cert",   leaf_cert,
+            "-key",    leaf_key,
+            "-Verify", "1",
+            "-CAfile", client_ca_cert,
+        });
+        defer origin.stop();
+
+        const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
+        defer allocator.free(upstream_url);
+
         var tardigrade = try TardigradeProcess.start(allocator, .{
             .config_text =
             \\location /secure/ {
@@ -17741,7 +17773,7 @@ test "native upstream mtls (best-effort, not CI-gated): client certificate requi
             .path = "/secure/hello.txt",
             .body = null,
             .headers = &.{},
-        }, 20_000);
+        }, 10_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 502), response.status_code);
     }

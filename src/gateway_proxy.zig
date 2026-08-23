@@ -951,6 +951,11 @@ fn streamViaH2Pool(
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
     proxy_buffer_global: ?*proxy_buffer_account.Aggregate,
+    /// Mirrors `executeStreamingHttpProxyRequest`'s own parameter of the same
+    /// name: set true on an error return once the downstream response head
+    /// has already been written, so the caller never serializes a second
+    /// response onto an already-committed connection.
+    downstream_committed: *bool,
 ) !StreamingProxyResult {
     const deadline_ms: u32 = if (read_deadline_ms > 0)
         read_deadline_ms
@@ -990,7 +995,10 @@ fn streamViaH2Pool(
                 // own, so this is an ordinary HTTP/1 exchange: allocate and
                 // charge at the current config's size, exactly as the h1 path
                 // below does.
-                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global });
+                const res = streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global }) catch |err| {
+                    downstream_committed.* = wrote_downstream;
+                    return err;
+                };
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return res.result;
             },
@@ -1285,6 +1293,12 @@ fn streamViaH2Pool(
                     h2_pool.release(conn);
                     return streamingResultAfterDownstreamAbort(status, reason, 0, ttfb_ms);
                 };
+                // The response head is on the wire from here on: the body
+                // loop's own `cancelStopped` check below can still throw
+                // `error.RequestCancelled` after this point (mid-relay
+                // cancellation, not the pre-commit kind), so the caller must
+                // know not to serialize a second response for it.
+                downstream_committed.* = true;
 
                 var body_bytes: usize = 0;
                 var aborted = false;
@@ -2615,7 +2629,7 @@ pub fn executeStreamingHttpProxyRequest(
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global, downstream_committed);
         }
         if (streaming_body != null) {
             if (pool) |p| p.recordH2StreamingUploadFallback();
@@ -4038,6 +4052,7 @@ const H2ExchangeCtx = struct {
 
 fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
     defer ctx.finished.store(true, .release);
+    var downstream_committed = false;
     const result = streamViaH2Pool(
         std.testing.allocator,
         ctx.pool,
@@ -4063,6 +4078,7 @@ fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
         ctx.limits,
         ctx.observer,
         ctx.global,
+        &downstream_committed,
     ) catch {
         ctx.failed = true;
         return;
@@ -4209,6 +4225,7 @@ test "http2 upload capacity is refused before HEADERS reach the origin" {
     {
         var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{});
         defer pool.deinit();
+        var downstream_committed = false;
 
         try std.testing.expectError(error.ProxyBufferCapacityUnavailable, streamViaH2Pool(
             std.testing.allocator,
@@ -4235,6 +4252,7 @@ test "http2 upload capacity is refused before HEADERS reach the origin" {
             limits,
             counters.observer(),
             &global,
+            &downstream_committed,
         ));
     }
     origin.join();
@@ -5062,6 +5080,7 @@ const H2GatedExchangeCtx = struct {
 fn runH2GatedExchangeThread(ctx: *H2GatedExchangeCtx) void {
     defer ctx.finished.store(true, .release);
     var source = FakeUploadSource{ .data = "" };
+    var downstream_committed = false;
     const result = streamViaH2Pool(
         std.testing.allocator,
         ctx.pool,
@@ -5092,6 +5111,7 @@ fn runH2GatedExchangeThread(ctx: *H2GatedExchangeCtx) void {
         ctx.limits,
         ctx.observer,
         ctx.global,
+        &downstream_committed,
     ) catch {
         ctx.failed = true;
         return;
@@ -5631,6 +5651,7 @@ const H2TrackedExchangeCtx = struct {
 fn runH2TrackedExchange(ctx: *H2TrackedExchangeCtx) void {
     defer ctx.finished.store(true, .release);
     var source = FakeUploadSource{ .data = "" };
+    var downstream_committed = false;
     const result = streamViaH2Pool(
         ctx.allocator,
         ctx.pool,
@@ -5656,6 +5677,7 @@ fn runH2TrackedExchange(ctx: *H2TrackedExchangeCtx) void {
         ctx.limits,
         ctx.counters.observer(),
         ctx.global,
+        &downstream_committed,
     ) catch |err| {
         ctx.failed = true;
         ctx.err = err;
