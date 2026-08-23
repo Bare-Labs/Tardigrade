@@ -328,10 +328,12 @@ jobs:
         with:
           ref: ${{ needs.prepare-release.outputs.release_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Ensure release tag
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
           RELEASE_SHA: ${{ needs.prepare-release.outputs.release_sha }}
         run: |
@@ -341,10 +343,22 @@ jobs:
             tag_commit="$(git rev-list -n 1 "$TAG")"
             test "$tag_commit" = "$RELEASE_SHA"
           else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "$TAG" "$RELEASE_SHA" -m "Tardigrade $TAG"
-            git push origin "$TAG"
+            tag_object_sha="$(
+              gh api --method POST \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/${GITHUB_REPOSITORY}/git/tags" \
+                -f tag="$TAG" \
+                -f message="Tardigrade $TAG" \
+                -f object="$RELEASE_SHA" \
+                -f type=commit \
+                --jq .sha
+            )"
+            test -n "$tag_object_sha"
+            gh api --method POST \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/$TAG" \
+              -f sha="$tag_object_sha" >/dev/null
           fi
 
       - name: Download release notes
