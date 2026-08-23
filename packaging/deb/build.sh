@@ -5,10 +5,12 @@
 #   ./packaging/deb/build.sh [--version VERSION] [--arch ARCH] [--binary PATH]
 #
 # Options:
-#   --version VERSION   Package version (default: inferred from `git describe`)
-#   --arch ARCH         Target architecture: amd64 or arm64 (default: host arch)
-#   --binary PATH       Path to pre-built tardi binary (default: zig-out/bin/tardi)
-#   --output DIR        Output directory for .deb file (default: dist/)
+#   --version VERSION       Package version (default: inferred from `git describe`)
+#   --arch ARCH             Target architecture: amd64 or arm64 (default: host arch)
+#   --binary PATH           Path to pre-built tardi binary (default: zig-out/bin/tardi)
+#   --tls-backend BACKEND   native or openssl-adapter. When omitted, infer from
+#                           the executable binary's `tardi version` output.
+#   --output DIR            Output directory for .deb file (default: dist/)
 #
 # Prerequisites:
 #   dpkg-deb (part of dpkg, available on Debian/Ubuntu)
@@ -20,14 +22,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VERSION=""
 ARCH=""
 BINARY="${REPO_ROOT}/zig-out/bin/tardi"
+TLS_BACKEND=""
 OUTPUT_DIR="${REPO_ROOT}/dist"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version) VERSION="$2"; shift 2 ;;
-        --arch)    ARCH="$2";    shift 2 ;;
-        --binary)  BINARY="$2";  shift 2 ;;
-        --output)  OUTPUT_DIR="$2"; shift 2 ;;
+        --version)     VERSION="$2"; shift 2 ;;
+        --arch)        ARCH="$2"; shift 2 ;;
+        --binary)      BINARY="$2"; shift 2 ;;
+        --tls-backend) TLS_BACKEND="$2"; shift 2 ;;
+        --output)      OUTPUT_DIR="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -46,23 +50,38 @@ if [[ -z "$ARCH" ]]; then
     esac
 fi
 
-if [[ ! -x "$BINARY" ]]; then
-    echo "Binary is not executable: $BINARY" >&2
+if [[ ! -f "$BINARY" ]]; then
+    echo "Binary not found: $BINARY" >&2
     exit 1
 fi
 
 # Package dependency metadata follows the artifact actually being packaged.
-# Official releases build -Dtls-profile=native and therefore declare no
-# OpenSSL runtime dependency. Transitional/local general-profile binaries still
-# get the dependency they genuinely require instead of silently producing a
-# broken package.
-BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
+# Official releases pass --tls-backend native explicitly. For ordinary
+# host-native local builds, infer from the binary's self-report. Cross-compiled
+# binaries that cannot execute on the packaging host remain supported by passing
+# --tls-backend explicitly instead of guessing from the target filename.
+if [[ -z "$TLS_BACKEND" ]]; then
+    if [[ ! -x "$BINARY" ]]; then
+        echo "Binary is not executable on this host; pass --tls-backend native or --tls-backend openssl-adapter" >&2
+        exit 1
+    fi
+    BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
+    case "$BINARY_VERSION_OUTPUT" in
+        *"tls-backend=native"*) TLS_BACKEND="native" ;;
+        *"tls-backend=openssl-adapter"*) TLS_BACKEND="openssl-adapter" ;;
+        *)
+            echo "Unable to determine TLS backend from '$BINARY version'; pass --tls-backend explicitly" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 OPENSSL_DEPENDS=""
-case "$BINARY_VERSION_OUTPUT" in
-    *"tls-backend=native"*) ;;
-    *"tls-backend=openssl-adapter"*) OPENSSL_DEPENDS="Depends: libssl3 | libssl1.1" ;;
+case "$TLS_BACKEND" in
+    native) ;;
+    openssl-adapter) OPENSSL_DEPENDS="Depends: libssl3 | libssl1.1" ;;
     *)
-        echo "Unable to determine TLS backend from '$BINARY version'; refusing to create ambiguous package metadata" >&2
+        echo "Invalid --tls-backend '$TLS_BACKEND' (expected native or openssl-adapter)" >&2
         exit 1
         ;;
 esac
