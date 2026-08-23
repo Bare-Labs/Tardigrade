@@ -46,6 +46,27 @@ if [[ -z "$ARCH" ]]; then
     esac
 fi
 
+if [[ ! -x "$BINARY" ]]; then
+    echo "Binary is not executable: $BINARY" >&2
+    exit 1
+fi
+
+# Package dependency metadata follows the artifact actually being packaged.
+# Official releases build -Dtls-profile=native and therefore declare no
+# OpenSSL runtime dependency. Transitional/local general-profile binaries still
+# get the dependency they genuinely require instead of silently producing a
+# broken package.
+BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
+OPENSSL_DEPENDS=""
+case "$BINARY_VERSION_OUTPUT" in
+    *"tls-backend=native"*) ;;
+    *"tls-backend=openssl-adapter"*) OPENSSL_DEPENDS="Depends: libssl3 | libssl1.1" ;;
+    *)
+        echo "Unable to determine TLS backend from '$BINARY version'; refusing to create ambiguous package metadata" >&2
+        exit 1
+        ;;
+esac
+
 echo "Building tardigrade_${VERSION}_${ARCH}.deb ..."
 
 # ── Package tree ─────────────────────────────────────────────────────────────
@@ -110,14 +131,19 @@ cat > "${DEBIAN_DIR}/conffiles" <<'CONFEOF'
 /etc/tardigrade/tardigrade.env
 CONFEOF
 
-# DEBIAN/control
+# DEBIAN/control. Do not emit a blank paragraph when the native package has no
+# OpenSSL dependency: Debian control-file paragraphs are separated by blanks.
 cat > "${DEBIAN_DIR}/control" <<CONTROL
 Package: tardigrade
 Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Bare Systems <security@baresystems.dev>
 Installed-Size: $(du -sk "$BIN_DIR" | awk '{print $1}')
-Depends: libssl3 | libssl1.1
+CONTROL
+if [[ -n "$OPENSSL_DEPENDS" ]]; then
+    printf '%s\n' "$OPENSSL_DEPENDS" >> "${DEBIAN_DIR}/control"
+fi
+cat >> "${DEBIAN_DIR}/control" <<CONTROL
 Section: net
 Priority: optional
 Homepage: https://github.com/Bare-Systems/Tardigrade

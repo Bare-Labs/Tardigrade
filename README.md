@@ -82,19 +82,24 @@ The installer downloads the matching release archive, verifies it against
 `tardigrade-checksums.txt`, and installs the `tardi` binary (with a
 `tardigrade` compatibility alias) into `$HOME/.local/bin` by default. The
 **currently published latest release still contains Linux x86_64/aarch64
-archives only**. PR #476 adds native Intel and Apple Silicon Darwin release
-rows; macOS becomes a supported `install.sh`/raw-archive path starting with
-the first release that contains that change. See
-[packaging/README.md](packaging/README.md#current-status) for exact status.
+archives only**. The release packaging implemented by #476 adds native Intel
+and Apple Silicon Darwin archives; macOS becomes a supported
+`install.sh`/raw-archive path starting with the first intentional release that
+contains that change. See [packaging/README.md](packaging/README.md#current-status)
+for exact status.
 
-Published release binaries use the default "general" TLS profile, which
-links OpenSSL at runtime — installing via this script or the raw archive
-requires OpenSSL already present on the target host. Linux package installs
-declare that dependency explicitly. Darwin archives produced by #476 use
-Homebrew OpenSSL 3; install it with `brew install openssl@3` before running a
-raw macOS archive. Those Darwin archives are unsigned and not notarized; see
-the Gatekeeper note in [packaging/README.md](packaging/README.md) before
-redistributing browser-downloaded artifacts.
+The release workflow now builds official Linux and Darwin archives (and Linux
+DEB/RPM packages) with the general-purpose native Zig TLS profile
+(`-Dtls-profile=native`). Those new artifacts do not require OpenSSL as a
+Tardigrade build or runtime dependency, and their release dependency inventory
+is audited to reject `libssl`, `libcrypto`, and other foreign TLS/crypto/QUIC/H3
+implementations. Older already-published releases predate that cutover and may
+still use the transitional OpenSSL-backed profile.
+
+The initial Darwin archives are unsigned and not notarized; see the Gatekeeper
+note in [packaging/README.md](packaging/README.md) before redistributing
+browser-downloaded artifacts. Homebrew publication (#466) and launchd lifecycle
+validation (#467) are separate follow-ups.
 
 Other install paths:
 
@@ -113,13 +118,15 @@ layout, permissions, and a locally built Docker image — see the
 Requirements:
 
 - [Zig](https://ziglang.org/) 0.16.0
-- OpenSSL development libraries on Linux, for example `libssl-dev` on Debian or
-  Ubuntu
-- Homebrew `openssl@3` on macOS for the default general TLS profile
+- The repository default remains the transitional `general` TLS profile; that
+  profile needs OpenSSL development libraries (`libssl-dev` on Debian/Ubuntu,
+  Homebrew `openssl@3` on macOS).
+- The official shipping-equivalent `native` profile does **not** require OpenSSL
+  to compile or run Tardigrade.
 - HTTP/3 is served by the built-in native Zig QUIC/H3 stack and requires no
   additional system libraries.
 
-For development:
+For development with the current default profile:
 
 ```bash
 git clone https://github.com/Bare-Systems/Tardigrade.git
@@ -127,17 +134,17 @@ cd Tardigrade
 zig build run
 ```
 
-For a release-mode binary:
+For a shipping-equivalent release-mode native binary:
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dtls-profile=native
 ./zig-out/bin/tardi --help
 ```
 
 With explicit version metadata:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dversion="$(git describe --tags --always)"
+zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion="$(git describe --tags --always)"
 ```
 
 Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-options).
@@ -196,6 +203,7 @@ operate without guessing which config file or pid file is active.
 | HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |
 | HTTP/3 validation evidence | [docs/HTTP3_VALIDATION_EVIDENCE.md](docs/HTTP3_VALIDATION_EVIDENCE.md) |
 | Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
+| Hot-path allocation ownership | [docs/ALLOCATION_OWNERSHIP.md](docs/ALLOCATION_OWNERSHIP.md) |
 | Event-loop backend evaluation (epoll/kqueue vs libxev/std.Io/io_uring) | [docs/EVENT_LOOP_BACKENDS.md](docs/EVENT_LOOP_BACKENDS.md) |
 | Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | Reload, drain, and shutdown | [docs/RELOAD_SHUTDOWN.md](docs/RELOAD_SHUTDOWN.md) |

@@ -27,7 +27,7 @@ Use this checklist before tagging and distributing a Tardigrade release.
 
 - [ ] Confirm `scripts/release-metadata.sh` resolves the intended tag/version
 - [ ] Update `docs/SUPPORT_MATRIX.md` when public behavior or maturity claims changed
-- [ ] Run `./scripts/test-install.sh` against a ReleaseFast build
+- [ ] Run `./scripts/test-install.sh` against a ReleaseFast native build (`-Dtls-profile=native`)
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker
 - [ ] Run `./scripts/test-rpm-package.sh` on a Linux host with Docker
 - [ ] Verify release packaging paths and checksums, including the Linux
@@ -35,13 +35,22 @@ Use this checklist before tagging and distributing a Tardigrade release.
       Darwin (`tardigrade-darwin-x86_64.tar.gz`,
       `tardigrade-darwin-arm64.tar.gz`) archives plus published `.deb`/`.rpm`
       assets
+- [ ] Verify every published archive's `dependency-inventory-*.json` reports
+      `profile=native`, `reported_backend=native`, `links_openssl=false`, and
+      no forbidden foreign TLS/crypto/QUIC/H3 dependency
+- [ ] Verify published DEB/RPM metadata does not declare OpenSSL/libssl/libcrypto
+      as a Tardigrade runtime dependency
 - [ ] Verify both Darwin archives have matching SPDX SBOMs and
       `dependency-inventory-*.json` artifacts, and verify archive provenance
       with `gh attestation verify <archive> --repo Bare-Systems/Tardigrade`
 - [ ] On the first release containing #463, exercise `scripts/install.sh`
-      against the published release on Intel and Apple Silicon macOS with
-      Homebrew `openssl@3` installed, then close #463 if the release assets,
-      checksums, inventories, SBOMs, and attestations are all correct
+      against the published release on Intel and Apple Silicon macOS **without
+      installing Homebrew OpenSSL for Tardigrade**, then verify `tardi version`,
+      the `tardigrade -> tardi` compatibility alias, and a minimal real
+      startup/request path from the installed artifact
+- [ ] Close #463 only after the first published Darwin assets, checksums,
+      inventories, SBOMs, attestations, native-only linkage, installer path,
+      alias, and runtime smoke all verify on both macOS architectures
 - [ ] Note in the release that Homebrew tap publication and launchd lifecycle
       validation are separate from the raw Darwin archives until #466/#467
       close

@@ -9,14 +9,36 @@ versus what is a local-build-only tool.
 
 | Format | Status | Notes |
 | --- | --- | --- |
-| Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, and per-arch SPDX SBOMs. |
-| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Implemented in #476; awaiting first release** | #476 adds `macos-15-intel` and `macos-15` release rows for `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux. A dedicated PR smoke runs native build, architecture, linkage-audit, packaging, extraction, and `tardi version` checks on both architectures. The currently published latest release still predates #476, so these assets are not public until the first intentional release containing it. |
-| DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder (`packaging/deb/build.sh`). Smoke-tested on every PR/push via the `packaging-smoke` CI job (`scripts/test-deb-package.sh`). |
-| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Smoke-tested via `scripts/test-rpm-package.sh`. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
+| Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, per-arch SPDX SBOMs, dependency inventories, and provenance. Releases containing #476 build these official artifacts with `-Dtls-profile=native`; older already-published releases may predate that cutover. |
+| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Implemented in #476; awaiting first release** | #476 adds `macos-15-intel` and `macos-15` release rows for `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux. Both rows build `-Dtls-profile=native` without Homebrew OpenSSL, audit out foreign TLS/crypto/QUIC/H3 linkage, assert the Mach-O architecture, package/extract the archive, verify native build identity, run a real static-site startup/request smoke from the extracted artifact, and exercise the checksum-verifying installer path. The currently published latest release still predates #476, so these assets are not public until the first intentional release containing it. |
+| DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. The builder inspects `tardi version`: native binaries declare no OpenSSL runtime dependency, while a transitional local `general`/OpenSSL binary still gets the dependency it actually needs. |
+| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. The spec's OpenSSL runtime dependency is conditional on the packaged binary reporting the transitional OpenSSL adapter; official native release packages do not declare it. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | The Darwin archive pipeline does not install or exercise launchd. #467 owns a real macOS `launchctl` bootstrap/health/bootout smoke and the final `tardi`/compatibility-alias service contract. |
-| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present; public tap exists but is not usable yet** | `Bare-Systems/homebrew-tap` exists, but #466 owns seeding/automating it. The checked-in formula is not currently installable: its release version is stale, SHA-256 values are placeholders, and the macOS runtime dependency still needs to be represented truthfully. #476 only supplies the Darwin archive filenames the future formula will consume. |
-| Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
+| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present; public tap exists but is not usable yet** | `Bare-Systems/homebrew-tap` exists, but #466 owns seeding/automating it. The checked-in formula is not currently installable: its release version is stale and SHA-256 values are placeholders. #466 must consume the native Darwin artifacts and must not declare OpenSSL as a Tardigrade runtime dependency. |
+| Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. Docker's remaining OpenSSL cutover is tracked by #634 and is separate from the raw release/archive lane in #476. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
+
+## Official release implementation
+
+Releases containing #476 explicitly build the general-purpose native Zig
+shipping profile:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=<version>
+```
+
+The release workflow audits each produced binary with
+`scripts/audit-release-binary.sh --profile native`. That audit fails if the
+artifact links `libssl`, `libcrypto`, or another forbidden foreign
+TLS/crypto/QUIC/H3 implementation and verifies that `tardi version` reports
+`tls-profile=native, tls-backend=native`.
+
+Linux DEB/RPM packages are built from that same audited binary. The release job
+then inspects package metadata and fails if either native package declares an
+OpenSSL/libssl/libcrypto runtime dependency. The package builders remain useful
+for local transitional `general` builds by detecting the packaged binary's
+self-reported backend and adding OpenSSL metadata only when it is genuinely
+required.
 
 ## Quick install (recommended)
 
@@ -28,16 +50,10 @@ curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/i
 
 The currently published latest release resolves only for Linux
 (`x86_64`/`aarch64`). After the first release containing #476, the same script
-will also resolve native Intel and Apple Silicon macOS archives. The release
-checklist requires verifying those first published Darwin assets before #463
-closes.
-
-Published general-profile Darwin binaries link Homebrew OpenSSL 3 at runtime.
-Install it first:
-
-```bash
-brew install openssl@3
-```
+will also resolve native Intel and Apple Silicon macOS archives. Those new
+Darwin artifacts do **not** require Homebrew OpenSSL for Tardigrade itself. The
+release checklist requires verifying the first published Darwin assets on both
+architectures before #463 closes.
 
 ### macOS Gatekeeper / unsigned binary note
 
@@ -81,11 +97,12 @@ Use `tardigrade_<version>_arm64.deb` on `arm64`/`aarch64` hosts.
 ### Build locally
 
 Building your own `.deb` from a pre-built binary is still supported — useful
-for architectures the release workflow doesn't cover, or a custom build:
+for architectures the release workflow doesn't cover, or a custom build. Use
+the native profile for a shipping-equivalent package:
 
 ```bash
 # 1. Build the binary first (cross-compile for the target arch as needed)
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dtls-profile=native
 
 # 2. Build the DEB
 ./packaging/deb/build.sh --version 0.50 --arch amd64
@@ -98,6 +115,11 @@ Install:
 sudo apt install ./dist/tardigrade_0.50_amd64.deb
 sudo systemctl enable --now tardigrade
 ```
+
+The DEB builder inspects the binary's `tardi version` output. Native binaries
+have no OpenSSL package dependency; a transitional local binary reporting
+`tls-backend=openssl-adapter` gets `Depends: libssl3 | libssl1.1`. An unknown
+backend fails packaging rather than generating ambiguous dependency metadata.
 
 The DEB package:
 - Installs the binary to `/usr/bin/tardi`
@@ -145,7 +167,7 @@ identically to `dnf install` for a local file.
 dnf install rpm-build
 
 # 2. Build the binary
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dtls-profile=native
 
 # 3. Build the RPM
 ./packaging/rpm/build.sh --version 0.50
@@ -158,6 +180,11 @@ Install:
 sudo rpm -i dist/tardigrade-0.50-1.x86_64.rpm
 sudo systemctl enable --now tardigrade
 ```
+
+Like the DEB builder, the RPM builder derives dependency metadata from the
+binary's self-report. Native binaries omit `Requires: openssl-libs`; a local
+transitional OpenSSL-adapter binary retains it, and an unknown backend fails
+packaging.
 
 Like the DEB package, the RPM installs a starter
 `/etc/tardigrade/tardigrade.conf`, creates `/var/lib/tardigrade` (the
@@ -177,10 +204,11 @@ docker compose build
 docker compose up -d
 ```
 
-The image is a multi-stage build (Zig toolchain in the build stage only, a
-minimal `tardi` + OpenSSL/CA-certificates runtime in the final stage) that
-runs as a non-root `tardigrade` user. See
-[docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the complete Docker workflow
+The current image is a multi-stage build (Zig toolchain in the build stage,
+`tardi` plus its current runtime dependencies in the final stage) that runs as
+a non-root `tardigrade` user. Docker's native-only shipping cutover is tracked
+separately by #634; #476 does not claim that local image is already migrated.
+See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the complete Docker workflow
 — build, config validation, start, reload, and graceful stop — alongside the
 equivalent systemd path.
 
@@ -227,10 +255,10 @@ current formula installable by itself.
 
 The checked-in `packaging/homebrew/tardigrade.rb` still needs #466 to reconcile
 its release version, replace placeholder checksums with values from one real
-release, declare/handle the macOS OpenSSL runtime dependency correctly, and
-publish/synchronize the formula into the existing public
-`Bare-Systems/homebrew-tap` repository. Do not advertise the tap as a working
-install path until #466's smoke succeeds.
+release, consume the native Darwin archives without declaring OpenSSL as a
+Tardigrade runtime dependency, and publish/synchronize the formula into the
+existing public `Bare-Systems/homebrew-tap` repository. Do not advertise the
+tap as a working install path until #466's smoke succeeds.
 
 The intended eventual public shape is:
 

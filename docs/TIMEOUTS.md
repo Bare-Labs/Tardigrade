@@ -73,7 +73,8 @@ Two principles, from the #196/#141 arc:
   `upstream_timeout`** (`error.Timeout`/`error.WouldBlock`), and non-timeout
   upstream failures map to **502 `upstream_error`**. Saturation (`#239`
   active cap) is deliberately distinct: **503 `upstream_saturated`**, no
-  health impact.
+  health impact. An open circuit breaker is also distinct: **503
+  `upstream_circuit_open`**, no upstream contact.
 - Upstream timeouts count toward passive health / the circuit breaker;
   downstream write timeouts do not (client's fault, not the origin's).
 - Config validation warns on inconsistent relationships

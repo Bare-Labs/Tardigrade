@@ -1,24 +1,32 @@
-# TLS/crypto dependency policy and pure-Zig cutover (#379, epic #327)
+# TLS/crypto dependency policy and pure-Zig cutover (#379, epic #327, #634)
 
 This note records Tardigrade's external-library policy for TLS, crypto, QUIC,
 HTTP/3, and certificate handling, how that policy is enforced in source, build
 configuration, CI, and release artifacts, and the checklist that governs the
-cutover to the pure-Zig implementation. It is the deliverable of research story
-**327-J** and a required v0.5 release gate for the Bare Systems appliance
-(#391).
+cutover to the pure-Zig implementation. It began as the deliverable of
+research story **327-J** and a required v0.5 release gate for the Bare Systems
+appliance (#391); the canonical architecture owner is now **#634**.
 
 ## Why
 
-Tardigrade is moving its TLS/crypto stack from OpenSSL to a pure-Zig
-implementation (epic #327). During that transition two products ship from one
-tree, and their dependency rules differ:
+The project architecture (#634) is that **the native Zig TLS/crypto/PKI/QUIC/
+HTTP implementation is the only implementation that ships to users**:
 
-- The **Bare Systems appliance** must contain no OpenSSL or other foreign
-  TLS/crypto implementation at all — no linkage, no configuration, no hidden
-  runtime fallback.
-- **General-purpose Tardigrade** may keep a single, narrowly isolated OpenSSL
-  adapter as a compatibility backend until the native path reaches the v1.0
-  support contract.
+- Every distributed `tardi` artifact — release archives, packages, containers,
+  Homebrew, installer paths — must be built on the native implementation, with
+  no OpenSSL or other foreign TLS/crypto/QUIC/H3 library linked, configured,
+  or reachable through a hidden runtime fallback.
+- External implementations (OpenSSL, GnuTLS, independent QUIC stacks, …)
+  remain encouraged as **test, interoperability, differential-validation, and
+  benchmark infrastructure**, always outside the shipping link/runtime graph.
+- Appliance vs. general-purpose differences are **product policy** expressed
+  on the same native implementation (cipher/identity/lifecycle policy), not a
+  choice of implementation backend.
+
+During the remaining transition the default `general` build profile still
+links the single, narrowly isolated OpenSSL adapter as a compatibility
+backend. That composition is transitional: it is not a permitted final
+shipping backend, and no new architecture should make it more permanent.
 
 A policy that is only written down drifts. This one is enforced by the build
 graph and by CI, and every release artifact makes its selected profile and
@@ -31,21 +39,48 @@ the binary. There is no runtime switch and no fallback between profiles.
 
 ### Bare Systems appliance profile (`-Dtls-profile=appliance`)
 
-- Uses the native Zig TLS/crypto path only.
+- Uses the native Zig TLS/crypto path only, with the strict Bare Systems
+  product policy on top: a single Ed25519 identity, a required
+  `TARDIGRADE_TLS_SERVER_NAME`, TLS 1.3 only, restart-owned credential
+  rotation. The supported TLS/certificate/client matrix is defined by #391.
 - Must not link `libssl`, `libcrypto`, or any other foreign TLS, crypto, QUIC,
   HTTP/3, or certificate library.
 - The OpenSSL adapter module (`src/http/tls_termination.zig`) is **replaced in
   the module graph** by a no-OpenSSL stub (`src/http/tls_termination_stub.zig`)
   via `src/http/tls_backend.zig`. Because the adapter source is never imported,
   its `@cImport("openssl/...")` is never analyzed and OpenSSL is never linked.
-- Until the native TLS termination path lands, the stub fails closed at startup
-  (`error.ContextInitFailed`) rather than silently degrading. The supported
-  TLS/certificate/client matrix for the appliance is defined by #391.
+  Live termination runs on `src/http/native_tls_connection.zig`; the stub only
+  fills the module graph and fails closed (`error.ContextInitFailed`) if
+  anything ever reaches it.
 
-### General-purpose profile (`-Dtls-profile=general`, default)
+### General-purpose native profile (`-Dtls-profile=native`, #634)
 
-- Links the single approved OpenSSL adapter as a compatibility/reference
-  backend.
+- The general-purpose expression of the same native implementation: generic
+  multi-identity credential loading (default cert/key plus
+  `TARDIGRADE_TLS_SNI_CERTS`), native TCP TLS termination, native QUIC/H3,
+  SIGHUP-driven credential reload, opt-in native resumption
+  (`TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). The credential store is
+  fail-closed on SNI, matching the existing native HTTP/3 behavior: the
+  default identity serves clients that send no SNI, and every host name
+  clients will request must be registered via `TARDIGRADE_TLS_SNI_CERTS`
+  (default-identity SAN matching is part of the remaining #634 parity
+  work).
+- Must not link `libssl`, `libcrypto`, or any other foreign TLS, crypto, QUIC,
+  HTTP/3, or certificate library — audited identically to the appliance
+  profile.
+- OpenSSL-adapter-only settings (TLS 1.2, cipher-string overrides, mTLS client
+  verification, the OpenSSL session cache/tickets, OCSP stapling, CRL checks,
+  ACME, the filesystem credential watcher, PROXY protocol with TLS) fail
+  config validation deterministically (`UnsupportedNativeTlsConfiguration`)
+  instead of being silently ignored; each is either natively implemented later
+  or explicitly dispositioned under #634.
+- This is the profile #634 promotes to the shipping default once feature
+  disposition and release/packaging cutover complete.
+
+### General-purpose OpenSSL profile (`-Dtls-profile=general`, default, transitional)
+
+- Links the single approved OpenSSL adapter as a transitional
+  compatibility/reference backend; superseded as a shipping backend by #634.
 - OpenSSL types and state stay behind the adapter boundary
   (`src/http/tls_termination.zig`, `src/http/acme_client.zig`) and must not
   shape TLS, HTTP, QUIC, PKI, or application interfaces.
@@ -71,6 +106,8 @@ audits can verify an artifact without inspecting its link graph:
 $ tardi version
 0.5.0 (tls-profile=appliance, tls-backend=native)
 $ tardi version
+0.5.0 (tls-profile=native, tls-backend=native)
+$ tardi version
 0.5.0 (tls-profile=general, tls-backend=openssl-adapter)
 ```
 
@@ -94,8 +131,8 @@ Runs before anything is compiled and fails if:
 Inspects a produced binary's dynamic dependencies (`ldd` on Linux, `otool -L`
 on macOS) and emits a machine-readable JSON inventory. It fails if:
 
-- an appliance artifact links OpenSSL or any forbidden foreign library, or does
-  not self-report the native TLS path; or
+- an appliance or native artifact links OpenSSL or any forbidden foreign
+  library, or does not self-report the native TLS path; or
 - a general artifact's actual linkage disagrees with its self-reported backend
   (so the inventory cannot lie).
 
@@ -105,7 +142,7 @@ self-reported backend, full dependency list, and any violations.
 ### CI
 
 The `TLS dependency audit` job in `.github/workflows/ci.yml` runs the source
-audit, builds **both** profiles, and runs the binary audit against each,
+audit, builds **all three** profiles, and runs the binary audit against each,
 uploading the inventories as artifacts. It is a required check: CI fails if any
 forbidden implementation is configured, imported, or linked in any profile.
 
@@ -126,24 +163,32 @@ alongside the release assets and SBOM.
       build-graph decision).
 - [x] Appliance artifact self-reports the native TLS path.
 - [x] CI builds and audits the appliance artifact on every change.
-- [ ] Native TLS termination and client paths implement the #391 appliance
-      support matrix (handshake, certificate verification, session resumption).
-      **Until this lands the appliance profile compiles and audits clean but
-      refuses TLS connections at runtime.**
-- [ ] Appliance integration/interop coverage proves live operation through the
-      native path.
+- [x] Native TLS termination serves live appliance connections
+      (`src/http/native_tls_connection.zig`); CI runs the appliance unit and
+      integration suites on every change.
+- [ ] #391 appliance certification (exact-artifact/device/product-policy
+      gate) complete.
 
-### General-purpose native-TLS parity (governs OpenSSL adapter removal)
+### General-purpose native cutover (#634; governs OpenSSL adapter removal)
 
 - [x] OpenSSL confined to the adapter boundary; no OpenSSL types in TLS/HTTP/
       QUIC/PKI/application interfaces (enforced by source audit).
 - [x] General artifacts expose a complete dependency inventory and identify the
       selected backend.
+- [x] A general-purpose native profile exists (`-Dtls-profile=native`): no
+      foreign linkage, generic multi-identity credentials, deterministic
+      rejection of OpenSSL-adapter-only settings, built and binary-audited in
+      CI.
+- [ ] Every operator-visible OpenSSL-path capability (mTLS, OCSP, CRL, ACME,
+      TLS 1.2, cipher policy, watcher-based reload, upstream TLS) is migrated
+      to native code or explicitly dispositioned per #634.
 - [ ] Native TLS reaches the v1.0 general-purpose support contract
       (`docs/SUPPORT_MATRIX.md`).
 - [ ] Native path passes the TLS/interop conformance suite at parity with the
       OpenSSL adapter.
-- [ ] Default profile flips from `general` to native once parity holds.
+- [ ] Default profile flips from `general` to `native` once parity holds.
+- [ ] Release/package/container/Homebrew artifacts ship the native profile and
+      pass the no-foreign-linkage audit (#634 distribution criteria).
 - [ ] OpenSSL adapter removed from all builds; `configureSsl`, the adapter
       modules, and the general profile retired.
 

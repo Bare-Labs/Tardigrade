@@ -18,6 +18,18 @@
 #   QUICHE_EXAMPLES_DIR  dir containing http3-client/http3-server examples
 #   AIOQUIC_PYTHON       python interpreter with aioquic installed
 #
+# qlog artifact dialect (#625): INTEROP_QLOG_DIALECT selects the
+# h3_interop_tool --qlog-dialect passed alongside --qlog-dir when
+# INTEROP_QLOG is enabled.
+#   current      (default) standards-conformant QlogFileSeq header. This is
+#                what every other consumer of Tardigrade .sqlog output
+#                should expect; the hosted qvis tool's older .sqlog loader
+#                rejects it.
+#   qvis-legacy  adds the compatibility fields the hosted qvis tool's
+#                loader requires (see src/quic/qlog.zig HeaderDialect).
+#                Use this only when the artifact is meant to be opened in
+#                that specific hosted tool.
+#
 # See scripts/interop/README.md for building the peers.
 set -u
 
@@ -51,6 +63,14 @@ fi
 if enabled "${INTEROP_KEYLOG:-}"; then
   keylog_enabled=1
 fi
+qlog_dialect="${INTEROP_QLOG_DIALECT:-current}"
+case "$qlog_dialect" in
+  current|qvis-legacy) ;;
+  *)
+    say "INTEROP_QLOG_DIALECT must be 'current' or 'qvis-legacy', got: $qlog_dialect"
+    exit 1
+    ;;
+esac
 if [ "$qlog_enabled" -eq 1 ] || [ "$keylog_enabled" -eq 1 ]; then
   artifact_dir="${INTEROP_ARTIFACT_DIR:-$workdir/artifacts}"
   mkdir -p "$artifact_dir"
@@ -69,7 +89,7 @@ prepare_native_artifacts() {
   mkdir -p "$case_dir"
   if [ "$qlog_enabled" -eq 1 ]; then
     mkdir -p "$case_dir/qlog-$role"
-    native_artifact_args+=(--qlog-dir "$case_dir/qlog-$role")
+    native_artifact_args+=(--qlog-dir "$case_dir/qlog-$role" --qlog-dialect "$qlog_dialect")
   fi
   if [ "$keylog_enabled" -eq 1 ]; then
     native_artifact_args+=(--keylog-path "$case_dir/$role.keys")
@@ -293,6 +313,12 @@ fi
 
 say ""
 say "interop summary: $pass passed, $fail failed, $skip skipped (logs: $logs)"
+if [ "$qlog_enabled" -eq 1 ]; then
+  say "qlog dialect: $qlog_dialect"
+  if [ "$qlog_dialect" = "current" ]; then
+    say "note: the hosted qvis tool's older .sqlog loader rejects the 'current' dialect; set INTEROP_QLOG_DIALECT=qvis-legacy to produce artifacts it accepts."
+  fi
+fi
 if [ "$fail" -ne 0 ] && [ -n "$artifact_dir" ]; then
   say "interop failure artifacts: $artifact_dir"
 fi

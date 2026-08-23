@@ -12,7 +12,9 @@ Source4:        tardigrade.conf
 Source5:        tardigrade.logrotate
 
 BuildArch:      %{build_arch}
+%if 0%{?tardigrade_requires_openssl}
 Requires:       openssl-libs
+%endif
 
 %description
 High-performance Zig edge gateway and HTTP server for TLS termination,

@@ -566,6 +566,22 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
     defer if (http3_runtime) |*runtime| runtime.deinit();
+    if (tls_terminator != null and native_credentials != null and
+        if (http3_runtime) |*runtime| runtime.snapshot().server_bootstrapped else false)
+    {
+        // #629: this is a mixed OpenSSL-TCP/native-HTTP3 composition, and
+        // native H3 is genuinely live (not just "credentials happened to
+        // load" — `server_bootstrapped` is the same signal
+        // `computeReloadedHttp3Advertisement` already uses to decide
+        // whether H3 is actually serving). Native H3's credential store can
+        // be independently hot-reloaded; suppress the OpenSSL terminator's
+        // own independent identity-reload watcher so its certificate/SNI
+        // identity cannot drift away from H3's outside a coordinated
+        // restart. Checked here (after HTTP/3 bootstrap, not right after
+        // credential load) so a QUIC bootstrap failure doesn't lock TCP's
+        // identity into restart-only for a protocol that never came up.
+        tls_terminator.?.setIdentityReloadEnabled(false);
+    }
     // NOTE (#138): defaulting worker_threads to CPU count is correct for a
     // non-blocking event loop, but Tardigrade currently uses a thread-per-
     // connection blocking model where a worker is held for a connection's whole
@@ -3173,7 +3189,7 @@ fn executeHttp2ProxyRoute(
         return .{ .local_rejection = rejection };
     }
 
-    const matched = http.location_router.matchLocation(request.uri.path, route_cfg.location_blocks) orelse return null;
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse return null;
     if (matched.block.auth == .required) return .{ .local_rejection = .{
         .status_code = @intFromEnum(http.Status.unauthorized),
         .code = "unauthorized",
@@ -3319,16 +3335,16 @@ fn h2UnsupportedProxyOrchestration(cfg: *const edge_config.EdgeConfig, matched: 
         cfg.proxy_streaming_mode.responseStreamingEnabled(),
     )) return true;
 
-    // `upstream_max_fails`/`upstream_fail_timeout_ms` drive passive
-    // upstream health accounting that `handleLocationProxyPass` records
-    // around the low-level executor this path calls directly; skipping it
-    // means a configured circuit breaker silently never opens (or closes)
+    // `upstream_max_fails`/`upstream_fail_timeout_ms` and the process-wide
+    // circuit breaker depend on health/accounting that `handleLocationProxyPass`
+    // records around the low-level executor this path calls directly; skipping
+    // it means configured upstream protection silently never opens (or closes)
     // for traffic negotiated over H2. Deliberately NOT included:
     // `upstream_pool_enabled` -- it defaults to true, and connection
     // pooling itself is already correctly threaded through via
     // `state.upstream_pool`/`state.h2_pool` below, so treating it as
     // unsupported would fail closed on every H2 proxy_pass by default.
-    if (cfg.upstream_max_fails > 0) return true;
+    if (cfg.upstream_max_fails > 0 or cfg.cb_threshold > 0) return true;
 
     const pool = gs.upstreamPoolForScope(cfg, .global);
     return cfg.upstream_retry_attempts > 1 or
@@ -3561,12 +3577,13 @@ fn targetStreamingFallbackReason(
 }
 
 fn streamingUploadEligibilityBeforeBodyRead(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     request: *const http.Request,
 ) RequestUploadStreamingEligibility {
     if (!request.method.hasRequestBody()) return .not_applicable;
 
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks) orelse return .{ .fallback = .unsupported_route_type };
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks) orelse return .{ .fallback = .unsupported_route_type };
     if (!matched.block.proxy_streaming_policy.requestStreamingEnabled(cfg.proxy_streaming_mode.requestStreamingEnabled())) return .{ .fallback = .policy_disabled };
 
     if (cfg.rewrite_rules.len > 0 or cfg.return_rules.len > 0 or
@@ -3611,11 +3628,13 @@ fn traceRejectionStatus(
 }
 
 fn earlyDataPreflightDecisionForH1(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     early_ctx: http.request_context.EarlyDataContext,
     request: *const http.Request,
 ) http.early_data.Decision {
     return ghandlers.earlyDataDecisionForRequest(
+        allocator,
         cfg,
         early_ctx,
         request.method,
@@ -3751,7 +3770,7 @@ fn executeH1PostPreflightOrchestration(
         state.metricsRecordEarlyDataRequest(.h1, source);
     }
 
-    const early_decision = earlyDataPreflightDecisionForH1(cfg, ctx.early_data, request);
+    const early_decision = earlyDataPreflightDecisionForH1(allocator, cfg, ctx.early_data, request);
     switch (early_decision) {
         .ordinary => {
             ctx.early_data_action = .ordinary;
@@ -3921,7 +3940,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         var pre_effective_cfg_storage = cfg.*;
         const pre_effective_cfg = ga.resolveRequestConfig(cfg, head_parse.request.headers.get("host"), &pre_effective_cfg_storage) orelse cfg;
-        const upload_eligibility = streamingUploadEligibilityBeforeBodyRead(pre_effective_cfg, &head_parse.request);
+        const upload_eligibility = streamingUploadEligibilityBeforeBodyRead(allocator, pre_effective_cfg, &head_parse.request);
         switch (upload_eligibility) {
             .stream => {
                 streaming_request_body = streamingRequestBodyFromHead(pre_effective_cfg, &head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
@@ -5136,7 +5155,7 @@ test "streaming upload eligibility reports typed fallback reasons" {
         MAX_REQUEST_SIZE,
     );
     defer upload_head.request.deinit();
-    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(&cfg, &upload_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &upload_head.request));
 
     var chunked_head = try http.Request.parseHead(
         allocator,
@@ -5145,7 +5164,7 @@ test "streaming upload eligibility reports typed fallback reasons" {
     );
     defer chunked_head.request.deinit();
     // A chunked upload is re-framed incrementally rather than buffered (#139).
-    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(&cfg, &chunked_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &chunked_head.request));
 
     var compat_head = try http.Request.parseHead(
         allocator,
@@ -5153,7 +5172,7 @@ test "streaming upload eligibility reports typed fallback reasons" {
         MAX_REQUEST_SIZE,
     );
     defer compat_head.request.deinit();
-    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &compat_head.request));
 
     var compat_chunked_head = try http.Request.parseHead(
         allocator,
@@ -5161,10 +5180,10 @@ test "streaming upload eligibility reports typed fallback reasons" {
         MAX_REQUEST_SIZE,
     );
     defer compat_chunked_head.request.deinit();
-    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_chunked_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &compat_chunked_head.request));
 
     cfg.auth_request_url = "http://auth.example.test/check";
-    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .body_dependent_middleware }, streamingUploadEligibilityBeforeBodyRead(&cfg, &upload_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .body_dependent_middleware }, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &upload_head.request));
 }
 
 test "streaming upload pre-read scan includes server block routes" {

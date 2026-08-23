@@ -64,7 +64,7 @@ jobs:
   # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3
   # dependency names must not be configured, OpenSSL must stay behind the
   # adapter boundary, native paths must be @cImport-free, and produced
-  # appliance/general artifacts must have the expected linkage. This is a
+  # appliance/native/general artifacts must have the expected linkage. This is a
   # required v0.5 release gate for the Bare Systems appliance (#391).
   dependency-audit:
     name: TLS dependency audit
@@ -95,6 +95,16 @@ jobs:
             --binary zig-out/bin/tardi \
             --profile appliance \
             --output "$RUNNER_TEMP/dependency-inventory-appliance.json"
+
+      - name: Build native profile (general-purpose, no OpenSSL, #634)
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native
+
+      - name: Audit native artifact linkage
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardi \
+            --profile native \
+            --output "$RUNNER_TEMP/dependency-inventory-native.json"
 
       - name: Build general profile (OpenSSL adapter)
         run: zig build -Doptimize=ReleaseFast -Dtls-profile=general
@@ -261,6 +271,65 @@ jobs:
             echo "$leaked"
             exit 1
           fi
+
+  # ── General-purpose native profile tests (#634) ─────────────────────────────
+  # Neither job above exercises `-Dtls-profile=native`: `test` above only
+  # builds `general`, and `test-appliance` above only builds `appliance`.
+  # This job runs the `native` profile's own unit suite plus the
+  # native-listener integration suite (#641 review), and deliberately does
+  # NOT install libssl-dev, so a passing build is itself proof the profile
+  # compiles with no OpenSSL development headers available at all -- not
+  # merely that it happens not to link OpenSSL when headers are present.
+  #
+  # The full `test-integration` suite is intentionally not run here yet:
+  # many of its fixtures (restart/rotation/soak/interop cases) authenticate
+  # against `TARDIGRADE_TLS_SERVER_NAME` the way the appliance profile's
+  # single-identity credential owner treats it -- as the served SNI name --
+  # which the `native` profile's generic multi-identity credential store
+  # does not do (it requires the name to be registered via
+  # `TARDIGRADE_TLS_SNI_CERTS`, matching existing native-H3 behavior).
+  # Wiring the full suite through `native` is tracked as related follow-up
+  # to #634, not a change this slice makes to dozens of unrelated fixtures.
+  test-native:
+    name: Test native profile (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-test-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-test-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-test-native-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Print Zig version
+        run: zig version
+
+      - name: Run native profile unit tests
+        run: zig build test -Dtls-profile=native --summary all --error-style verbose
+
+      - name: Run native TLS listener integration tests
+        run: zig build test-integration-native-tls -Dtls-profile=native --summary all --error-style verbose
 
   # ── PKI differential corpus ──────────────────────────────────────────────────
   # Replays the bounded core corpus against the pure-Zig validator, OpenSSL,

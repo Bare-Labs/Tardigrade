@@ -138,14 +138,6 @@ jobs:
           git diff --exit-code
           git diff --cached --exit-code
 
-      - name: Install dependencies (Linux)
-        if: matrix.linux_packages == true
-        run: sudo apt-get install -y libssl-dev
-
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-
       - name: Install packaging prerequisites
         if: matrix.linux_packages == true
         run: sudo apt-get install -y rpm
@@ -175,10 +167,10 @@ jobs:
         if: matrix.linux_packages == true
         run: ./scripts/audit-dependencies.sh
 
-      - name: Build release binary
+      - name: Build native release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native "-Dversion=$VERSION"
 
       - name: Verify macOS binary architecture
         if: runner.os == 'macOS'
@@ -194,13 +186,13 @@ jobs:
           test "$(uname -m)" = "$expected"
           file zig-out/bin/tardi | grep -F "$expected"
 
-      - name: Audit release binary linkage and record inventory
+      - name: Audit native release binary linkage and record inventory
         env:
           INVENTORY_PATH: ${{ steps.archive_artifacts.outputs.inventory_path }}
         run: |
           ./scripts/audit-release-binary.sh \
             --binary zig-out/bin/tardi \
-            --profile general \
+            --profile native \
             --output "$INVENTORY_PATH"
 
       - name: Package artifact
@@ -252,6 +244,31 @@ jobs:
             --arch "$RPM_ARCH" \
             --binary zig-out/bin/tardi \
             --output "$ARTIFACT_DIR"
+
+      - name: Verify native package metadata has no OpenSSL dependency
+        if: matrix.linux_packages == true
+        env:
+          ARTIFACT_DIR: ${{ steps.archive_artifacts.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+
+          deb_path="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          rpm_path="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.rpm' -print -quit)"
+          test -n "$deb_path"
+          test -n "$rpm_path"
+
+          deb_requires="$(dpkg-deb -f "$deb_path" Depends 2>/dev/null || true)"
+          if printf '%s\n' "$deb_requires" | grep -qiE 'libssl|libcrypto|openssl'; then
+            echo "native DEB unexpectedly declares an OpenSSL dependency: $deb_requires" >&2
+            exit 1
+          fi
+
+          rpm_requires="$(rpm -qp --requires "$rpm_path")"
+          if printf '%s\n' "$rpm_requires" | grep -qiE 'libssl|libcrypto|openssl'; then
+            echo "native RPM unexpectedly declares an OpenSSL dependency:" >&2
+            printf '%s\n' "$rpm_requires" >&2
+            exit 1
+          fi
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

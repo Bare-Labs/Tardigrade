@@ -59,8 +59,8 @@ pub const RouteDecision = union(enum) {
 /// fall-through and change behavior. So it stays a pre-check in `routeRequest`
 /// until that matcher is split from its handler. Fold it in with the pre-route
 /// middleware stage (later #201 PR).
-pub fn resolveRoute(cfg: *const edge_config.EdgeConfig, request: *const http.Request) RouteDecision {
-    return resolveRoutePath(cfg.metrics_path, cfg.location_blocks, request.uri.path);
+pub fn resolveRoute(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, request: *const http.Request) RouteDecision {
+    return resolveRoutePath(allocator, cfg.metrics_path, cfg.location_blocks, request.uri.path);
 }
 
 /// Pure route-matching precedence — no I/O, no mutation of `state`/`request`.
@@ -70,13 +70,14 @@ pub fn resolveRoute(cfg: *const edge_config.EdgeConfig, request: *const http.Req
 /// Mirrors the order previously inlined in `routeRequest`: reload-status path,
 /// then the configured metrics path, then location blocks.
 pub fn resolveRoutePath(
+    allocator: std.mem.Allocator,
     metrics_path: []const u8,
     location_blocks: []const http.location_router.LocationBlock,
     path: []const u8,
 ) RouteDecision {
     if (std.mem.eql(u8, path, "/tardigrade/reload/status")) return .reload_status;
     if (metrics_path.len > 0 and std.mem.eql(u8, path, metrics_path)) return .metrics;
-    if (http.location_router.matchLocation(path, location_blocks)) |matched| {
+    if (http.location_router.matchLocation(allocator, path, location_blocks)) |matched| {
         return .{ .location = matched };
     }
     return .unmatched;
@@ -123,16 +124,18 @@ fn isTranscriptRoutePath(path: []const u8) bool {
 }
 
 pub fn earlyDataDecisionForRequest(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     early_ctx: http.request_context.EarlyDataContext,
     method: http.Method,
     path: []const u8,
     has_body_framing: bool,
 ) http.early_data.Decision {
-    return earlyDataDecisionForRawMethod(cfg, early_ctx, method.toString(), path, has_body_framing);
+    return earlyDataDecisionForRawMethod(allocator, cfg, early_ctx, method.toString(), path, has_body_framing);
 }
 
 pub fn earlyDataDecisionForRawMethod(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     early_ctx: http.request_context.EarlyDataContext,
     method: []const u8,
@@ -144,7 +147,7 @@ pub fn earlyDataDecisionForRawMethod(
     if (isTranscriptRoutePath(path)) return .too_early;
     if (hasMatchingMirrorRule(cfg.mirror_rules, method, path)) return .too_early;
 
-    return switch (resolveRoutePath(cfg.metrics_path, cfg.location_blocks, path)) {
+    return switch (resolveRoutePath(allocator, cfg.metrics_path, cfg.location_blocks, path)) {
         .reload_status, .metrics, .unmatched => .too_early,
         .location => |matched| locationEarlyDataDecision(early_ctx, http.early_data.methodSafe(method), matched.block),
     };
@@ -221,22 +224,22 @@ test "resolveRoutePath: reload-status and metrics precede location matching" {
     };
     const Tag = std.meta.Tag(RouteDecision);
     // reload-status wins over a configured metrics path and a catch-all location.
-    try std.testing.expectEqual(Tag.reload_status, std.meta.activeTag(resolveRoutePath("/metrics", &blocks, "/tardigrade/reload/status")));
+    try std.testing.expectEqual(Tag.reload_status, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "/metrics", &blocks, "/tardigrade/reload/status")));
     // metrics path wins over a matching location.
-    try std.testing.expectEqual(Tag.metrics, std.meta.activeTag(resolveRoutePath("/metrics", &blocks, "/metrics")));
+    try std.testing.expectEqual(Tag.metrics, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "/metrics", &blocks, "/metrics")));
     // an empty metrics_path disables the metrics route, falling to the location.
-    try std.testing.expectEqual(Tag.location, std.meta.activeTag(resolveRoutePath("", &blocks, "/metrics")));
+    try std.testing.expectEqual(Tag.location, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "", &blocks, "/metrics")));
 }
 
 test "resolveRoutePath: location match carries the block, else unmatched" {
     const blocks = [_]http.location_router.LocationBlock{
         .{ .match_type = .exact, .pattern = "/app", .priority = 1, .action = .{ .proxy_pass = "" } },
     };
-    switch (resolveRoutePath("/status/metrics", &blocks, "/app")) {
+    switch (resolveRoutePath(std.testing.allocator, "/status/metrics", &blocks, "/app")) {
         .location => |m| try std.testing.expectEqualStrings("/app", m.block.pattern),
         else => try std.testing.expect(false),
     }
-    try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRoutePath("/status/metrics", &blocks, "/nope")));
+    try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "/status/metrics", &blocks, "/nope")));
 }
 
 test "earlyDataDecisionForRequest gates H1 routes before side effects" {
@@ -283,19 +286,19 @@ test "earlyDataDecisionForRequest gates H1 routes before side effects" {
 
     const ordinary = http.request_context.EarlyDataContext{};
     const early = http.request_context.EarlyDataContext{ .transport_early = true };
-    try std.testing.expectEqual(http.early_data.Decision.ordinary, earlyDataDecisionForRequest(&cfg, ordinary, .GET, "/off", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/off", false));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", true));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", true));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .POST, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(&cfg, early, .GET, "/proxy", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/auth", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/rewrite", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, cfg.metrics_path, false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/transcripts", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/missing", false));
+    try std.testing.expectEqual(http.early_data.Decision.ordinary, earlyDataDecisionForRequest(std.testing.allocator, &cfg, ordinary, .GET, "/off", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/off", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .HEAD, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/safe", true));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .HEAD, "/safe", true));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .POST, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/proxy", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/auth", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/rewrite", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, cfg.metrics_path, false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/transcripts", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/missing", false));
 }
 
 test "earlyDataDecisionForRequest rejects matching mirrors before side effects" {
@@ -316,8 +319,8 @@ test "earlyDataDecisionForRequest rejects matching mirrors before side effects" 
     cfg.mirror_rules = mirrors[0..];
 
     const early = http.request_context.EarlyDataContext{ .transport_early = true };
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .HEAD, "/safe", false));
 }
 
 test "writeTooEarlyResponse emits no-store 425 without double-counting callers" {
@@ -544,6 +547,8 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
 
 fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, add_headers: []const edge_config.EdgeConfig.HeaderPair) void {
     initHandlerTestState(state, allocator, add_headers);
+    state.circuit_mutex = .{};
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
     state.upstream_mutex = .{};
     state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
     state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
@@ -660,7 +665,7 @@ pub fn routeRequest(
         return status;
     }
 
-    switch (resolveRoute(cfg, request)) {
+    switch (resolveRoute(allocator, cfg, request)) {
         .reload_status => {
             const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
             state.metricsRecord(status);
@@ -776,7 +781,7 @@ test "enforceLocationAuth records invalid session rejection exactly once" {
     defer request.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks).?;
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks).?;
 
     const status = (try enforceLocationAuth(allocator, &output.writer, &cfg, &state, &ctx, &request, matched, "req-session", false, "127.0.0.1")).?;
 
@@ -810,7 +815,7 @@ test "enforceLocationAuth records invalid authorization rejection exactly once" 
     defer request.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks).?;
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks).?;
 
     const status = (try enforceLocationAuth(allocator, &output.writer, &cfg, &state, &ctx, &request, matched, "req-auth", false, "127.0.0.1")).?;
 
@@ -1835,6 +1840,31 @@ fn applyHttp3ProxyResponse(
     state.metricsRecord(upstream_response.statusCode());
 }
 
+fn recordHttp3ProxyOutcome(
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    selection_base_url: []const u8,
+    absolute_target: bool,
+    status_code: u16,
+    permit: http.circuit_breaker.Permit,
+) void {
+    if (status_code >= 500) {
+        if (absolute_target) {
+            state.circuitRecordFailurePermit(permit);
+        } else {
+            state.recordProxyUpstreamFailure(cfg, selection_base_url, permit);
+        }
+    } else if (status_code != @intFromEnum(http.Status.too_early)) {
+        if (absolute_target) {
+            state.circuitRecordSuccessPermit(permit);
+        } else {
+            state.recordProxyUpstreamSuccess(cfg, selection_base_url, permit);
+        }
+    } else {
+        state.circuitReleasePermit(permit);
+    }
+}
+
 const Http3BufferedProxyAttemptExecutor = struct {
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -1851,8 +1881,10 @@ const Http3BufferedProxyAttemptExecutor = struct {
     forwarded_proto: []const u8,
     incoming_host: ?[]const u8,
     selection_base_url: []const u8,
+    absolute_target: bool,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
+    circuit_permit: ?http.circuit_breaker.Permit = null,
 
     pub fn recordEarlyUpstream425Action(
         self: *Http3BufferedProxyAttemptExecutor,
@@ -1885,6 +1917,9 @@ const Http3BufferedProxyAttemptExecutor = struct {
         forward_early_data: bool,
     ) !gproxy_runtime.DataPlaneProxyResponse {
         _ = attempt;
+        if (self.circuit_permit == null) {
+            self.circuit_permit = self.state.circuitTryAcquirePermit() orelse return error.CircuitOpen;
+        }
         const per_attempt_timeout_ms = try self.perAttemptTimeoutMs();
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
@@ -1933,11 +1968,41 @@ const Http3BufferedProxyAttemptExecutor = struct {
         self.state.logger.warn(self.correlation_id, "h3 proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
     }
 
+    pub fn releaseCircuitProbe(self: *Http3BufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        self.state.circuitReleasePermit(permit);
+        self.circuit_permit = null;
+    }
+
+    fn recordCircuitFailure(self: *Http3BufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        if (self.absolute_target) {
+            self.state.circuitRecordFailurePermit(permit);
+        } else {
+            self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url, permit);
+        }
+        self.circuit_permit = null;
+    }
+
+    fn recordCircuitSuccess(self: *Http3BufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        if (self.absolute_target) {
+            self.state.circuitRecordSuccessPermit(permit);
+        } else {
+            self.state.recordProxyUpstreamSuccess(self.cfg, self.selection_base_url, permit);
+        }
+        self.circuit_permit = null;
+    }
+
     pub fn onTerminalAttemptError(
         self: *Http3BufferedProxyAttemptExecutor,
-        _: anyerror,
+        err: anyerror,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        if (gproxy_runtime.proxyAttemptErrorCountsAsUpstreamFailure(err)) {
+            self.recordCircuitFailure();
+        } else {
+            self.releaseCircuitProbe();
+        }
     }
 
     pub fn onConfiguredErrorRetry(
@@ -1965,6 +2030,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
         self.state.logger.debug(self.correlation_id, "h3 parking early-data upstream 425 retry until downstream handshake completion", .{});
         var plan = try Http3Early425ProxyContinuation.init(self.allocator, self);
         errdefer {
+            plan.circuit_permit = null;
             plan.deinit(self.allocator);
             self.allocator.destroy(plan);
         }
@@ -1973,6 +2039,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
             .resume_fn = Http3Early425ProxyContinuation.run,
             .deinit_fn = Http3Early425ProxyContinuation.destroy,
         });
+        self.circuit_permit = null;
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
     }
@@ -1990,7 +2057,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
         max_attempts: usize,
         result: *gproxy_runtime.DataPlaneProxyResponse,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        self.recordCircuitFailure();
         self.state.logger.warn(self.correlation_id, "h3 proxy attempt {d}/{d} got {d}, retrying", .{ configured_attempt_index + 1, max_attempts, result.statusCode() });
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
@@ -2011,8 +2078,10 @@ const Http3Early425ProxyContinuation = struct {
     forwarded_proto: []u8,
     incoming_host: ?[]u8,
     selection_base_url: []const u8,
+    absolute_target: bool,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
+    circuit_permit: ?http.circuit_breaker.Permit = null,
     transport_early: bool,
     test_execute_ctx: ?*anyopaque = null,
     test_execute_fn: ?*const fn (?*anyopaque, *Http3Early425ProxyContinuation, u32, bool) anyerror!gproxy_runtime.DataPlaneProxyResponse = null,
@@ -2062,13 +2131,19 @@ const Http3Early425ProxyContinuation = struct {
             .forwarded_proto = forwarded_proto,
             .incoming_host = incoming_host,
             .selection_base_url = executor.selection_base_url,
+            .absolute_target = executor.absolute_target,
             .budget_start_ms = executor.budget_start_ms,
+            .circuit_permit = executor.circuit_permit,
             .transport_early = executor.request.transport_early,
         };
         return plan;
     }
 
     fn deinit(self: *Http3Early425ProxyContinuation, allocator: std.mem.Allocator) void {
+        if (self.circuit_permit) |permit| {
+            self.state.circuitReleasePermit(permit);
+            self.circuit_permit = null;
+        }
         self.config_lease.release();
         allocator.free(self.upstream_url);
         allocator.free(self.method);
@@ -2099,6 +2174,9 @@ const Http3Early425ProxyContinuation = struct {
     }
 
     fn execute(self: *Http3Early425ProxyContinuation, per_attempt_timeout_ms: u32, forward_early_data: bool) !gproxy_runtime.DataPlaneProxyResponse {
+        if (self.circuit_permit == null) {
+            self.circuit_permit = self.state.circuitTryAcquirePermit() orelse return error.CircuitOpen;
+        }
         if (self.test_execute_fn) |test_execute| {
             return test_execute(self.test_execute_ctx, self, per_attempt_timeout_ms, forward_early_data);
         }
@@ -2143,6 +2221,10 @@ const Http3Early425ProxyContinuation = struct {
             const per_attempt_timeout_ms = self.perAttemptTimeoutMs() catch |err| {
                 self.state.metricsRecordEarlyDataRetry(.failure);
                 if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (self.circuit_permit) |permit| {
+                    self.state.circuitReleasePermit(permit);
+                    self.circuit_permit = null;
+                }
                 try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
                 return;
             };
@@ -2158,15 +2240,53 @@ const Http3Early425ProxyContinuation = struct {
                 }
                 self.state.metricsRecordEarlyDataRetry(.failure);
                 if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
+                    const permit = self.circuit_permit;
+                    if (err == error.ProxyBudgetExhausted) {
+                        if (permit) |p| self.state.circuitReleasePermit(p);
+                        self.circuit_permit = null;
+                    }
+                    if (err == error.RequestCancelled) {
+                        if (permit) |p| {
+                            if (self.absolute_target) {
+                                self.state.circuitRecordFailurePermit(p);
+                            } else {
+                                self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url, p);
+                            }
+                            self.circuit_permit = null;
+                        }
+                    }
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
                     return;
                 }
                 if (err == error.UpstreamAtCapacity) {
+                    if (self.circuit_permit) |p| self.state.circuitReleasePermit(p);
+                    self.circuit_permit = null;
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", self.correlation_id);
                     return;
                 }
-                self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
-                if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (err == error.CircuitOpen) {
+                    try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", self.correlation_id);
+                    return;
+                }
+                if (err == error.OutOfMemory) {
+                    if (self.circuit_permit) |p| self.state.circuitReleasePermit(p);
+                    self.circuit_permit = null;
+                    return error.OutOfMemory;
+                }
+                const permit = self.circuit_permit;
+                if (gproxy_runtime.proxyAttemptErrorCountsAsUpstreamFailure(err)) {
+                    if (permit) |p| {
+                        if (self.absolute_target) {
+                            self.state.circuitRecordFailurePermit(p);
+                        } else {
+                            self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url, p);
+                        }
+                        self.circuit_permit = null;
+                    }
+                } else {
+                    if (permit) |p| self.state.circuitReleasePermit(p);
+                    self.circuit_permit = null;
+                }
                 const err_status: http.Status = switch (err) {
                     error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
                     else => .bad_gateway,
@@ -2185,6 +2305,10 @@ const Http3Early425ProxyContinuation = struct {
                 self.state.metricsRecordEarlyDataRetry(.too_early);
             } else {
                 self.state.metricsRecordEarlyDataRetry(.success);
+            }
+            if (self.circuit_permit) |permit| {
+                recordHttp3ProxyOutcome(self.state, &self.cfg_snapshot, self.selection_base_url, self.absolute_target, upstream_response.statusCode(), permit);
+                self.circuit_permit = null;
             }
             try applyHttp3ProxyResponse(allocator, response, self.state, &upstream_response, self.correlation_id);
             return;
@@ -2209,6 +2333,7 @@ fn handleHttp3LocationProxyPass(
     defer allocator.free(resolved.url);
     var upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
     defer upstream_url.deinit(allocator);
+    const absolute_target = gs.isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"));
 
     const max_attempts = gproxy_runtime.proxyRetryAttemptLimit(ctx.cfg.upstream_retry_attempts, ctx.cfg.upstream_retry_idempotent_only, request.method);
     var attempt_executor = Http3BufferedProxyAttemptExecutor{
@@ -2227,6 +2352,7 @@ fn handleHttp3LocationProxyPass(
         .forwarded_proto = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
         .incoming_host = request.headers.get(":authority") orelse request.headers.get("host"),
         .selection_base_url = ctx.cfg.upstream_base_url,
+        .absolute_target = absolute_target,
         .budget_start_ms = http.event_loop.monotonicMs(),
     };
 
@@ -2244,6 +2370,10 @@ fn handleHttp3LocationProxyPass(
         .early_425_retry_parked => return error.Http3RequestParked,
         .upstream_at_capacity => {
             try rejectHttp3ProxyError(allocator, response, ctx, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id);
+            return;
+        },
+        .circuit_open => {
+            try rejectHttp3ProxyError(allocator, response, ctx, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", correlation_id);
             return;
         },
         .request_cancelled, .retry_budget_exhausted => {
@@ -2264,6 +2394,10 @@ fn handleHttp3LocationProxyPass(
     };
     defer upstream_response.deinit(allocator);
     defer ctx.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
+    if (attempt_executor.circuit_permit) |permit| {
+        recordHttp3ProxyOutcome(ctx.state, ctx.cfg, ctx.cfg.upstream_base_url, absolute_target, upstream_response.statusCode(), permit);
+        attempt_executor.circuit_permit = null;
+    }
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
 }
 
@@ -2402,7 +2536,7 @@ fn routeHttp3Location(
     // location routes today; the reload-status and metrics endpoints (which the
     // shared resolver ranks ahead of locations) fall through to the caller's 404
     // — h3 does not expose those operational endpoints yet.
-    const route_decision = resolveRoutePath(ctx.cfg.metrics_path, ctx.cfg.location_blocks, request_path);
+    const route_decision = resolveRoutePath(allocator, ctx.cfg.metrics_path, ctx.cfg.location_blocks, request_path);
 
     var early_ctx = http.request_context.EarlyDataContext{
         .transport_early = request.transport_early,
@@ -2418,6 +2552,7 @@ fn routeHttp3Location(
     }
 
     const decision = earlyDataDecisionForRawMethod(
+        allocator,
         ctx.cfg,
         early_ctx,
         request.method,
@@ -2530,6 +2665,26 @@ test "routeHttp3Location rejects auth-required locations before action execution
     try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.err_unauthorized);
+}
+
+test "recordHttp3ProxyOutcome keeps absolute target failures out of passive health" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    state.circuit_mutex = .{};
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 30_000 });
+
+    var cfg = minimalHttp3ProxyConfig(&.{});
+    cfg.upstream_base_url = "http://configured.example";
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+
+    recordHttp3ProxyOutcome(&state, &cfg, cfg.upstream_base_url, true, 500, state.circuitTryAcquirePermit().?);
+
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expect(state.circuitTryAcquirePermit() == null);
+    try std.testing.expectEqualStrings("open", state.circuitStateName());
 }
 
 test "routeHttp3Location rejects prior-hop Early-Data on ordinary 1-RTT before auth side effects" {
@@ -3154,7 +3309,7 @@ test "h3 proxy parked early 425 forwards second 425 without third delivery" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"too_early\"} 1") != null);
 }
 
-test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
+test "h3 proxy parked early 425 carries half-open permit across stale retry" {
     const allocator = std.testing.allocator;
     var origin = try H3ProxyOrigin.start(allocator, &.{425});
     defer origin.stop();
@@ -3179,6 +3334,8 @@ test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
     var state: GatewayState = undefined;
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -3205,6 +3362,8 @@ test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
     try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
     try std.testing.expect(origin.requestContains(0, "\r\nEarly-Data: 1\r\n"));
+    try std.testing.expectEqualStrings("half-open", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() == null);
 
     var continuation = capture.take();
     defer continuation.deinit(allocator);
@@ -3234,6 +3393,7 @@ test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
     try std.testing.expect(execute_script.timeouts_ms.items[1] <= execute_script.timeouts_ms.items[0]);
     try std.testing.expectEqual(original_budget_start_ms, plan.budget_start_ms);
     try std.testing.expectEqual(@as(usize, 0), state.upstream_health.count());
+    try std.testing.expectEqualStrings("closed", state.circuitStateName());
 
     const prom = try state.metrics.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -3265,6 +3425,7 @@ test "h3 proxy parked early 425 records failure after stale recovery exhausts" {
     var state: GatewayState = undefined;
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 30_000 });
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -3314,12 +3475,72 @@ test "h3 proxy parked early 425 records failure after stale recovery exhausts" {
     try std.testing.expectEqual(@as(u16, 502), @intFromEnum(resumed_response.status));
     try std.testing.expectEqual(@as(usize, 3), execute_script.calls);
     try std.testing.expectEqualSlices(bool, &.{ false, false, false }, execute_script.forward_early_data.items);
-    try std.testing.expectEqual(@as(usize, 1), state.upstream_health.count());
+    try std.testing.expectEqual(@as(usize, 0), state.upstream_health.count());
+    try std.testing.expect(state.circuitTryAcquirePermit() == null);
 
     const prom = try state.metrics.toPrometheus(allocator);
     defer allocator.free(prom);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"failure\"} 1") != null);
+}
+
+test "h3 proxy parked half-open 425 releases permit when destroyed before resume" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{425});
+    defer origin.stop();
+    try origin.run();
+
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{origin.port()});
+    defer allocator.free(target);
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/proxy/",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var barrier = TestHttp3RequestHandshake{ .complete = false };
+    var capture = H3ParkCapture{};
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 17,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/proxy/item"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+        .downstream_handshake = barrier.barrier(),
+        .park_early_425_retry = .{ .ctx = &capture, .park_fn = H3ParkCapture.park },
+    };
+    defer request.deinit();
+    var first_response = http.Response.init(allocator);
+    defer first_response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
+    try std.testing.expectEqualStrings("half-open", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() == null);
+
+    var continuation = capture.take();
+    continuation.deinit(allocator);
+
+    const next_probe = state.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
+    defer state.circuitReleasePermit(next_probe);
+    try std.testing.expectEqualStrings("half-open", state.circuitStateName());
 }
 
 test "h3 proxy parked early 425 fails without origin retry after budget expires" {
@@ -3345,6 +3566,8 @@ test "h3 proxy parked early 425 fails without origin retry after budget expires"
     var state: GatewayState = undefined;
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -3370,6 +3593,8 @@ test "h3 proxy parked early 425 fails without origin retry after budget expires"
 
     try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expectEqualStrings("half-open", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() == null);
     compat.sleepNs(3 * std.time.ns_per_ms);
 
     var continuation = capture.take();
@@ -3380,6 +3605,8 @@ test "h3 proxy parked early 425 fails without origin retry after budget expires"
 
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
     try std.testing.expectEqual(@as(u16, 504), @intFromEnum(resumed_response.status));
+    const next_probe = state.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
+    defer state.circuitReleasePermit(next_probe);
 
     const prom = try state.metrics.toPrometheus(allocator);
     defer allocator.free(prom);

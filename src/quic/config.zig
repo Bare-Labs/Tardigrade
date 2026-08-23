@@ -68,6 +68,25 @@ pub const QpackConfig = struct {
 /// RFC 9000 §4.6: stream-count transport parameters above 2^60 are invalid.
 pub const max_initial_streams_transport_parameter: u64 = 1 << 60;
 
+/// Per-connection, per-direction cap on how many closed peer-initiated
+/// streams `StreamManager`'s MAX_STREAMS replenishment (#247 soak finding)
+/// will grant credit for (see `StreamManager.closed_peer_bidi`/`_uni` in
+/// stream.zig). Every closed `Stream` object is retained for the life of the
+/// connection, so replenishing credit without any bound would turn the
+/// previous functional 100-stream lifetime cap into unbounded per-connection
+/// memory growth -- exactly what #247 Lane B's bounded-resource contract
+/// forbids. True retirement (freeing a closed stream's memory while keeping
+/// a small tombstone so late/retransmitted frames for it are recognized
+/// rather than misidentified as a new stream) is the complete fix, but it
+/// requires auditing every caller that reads stream state immediately after
+/// the operation that closed it -- a pervasive existing pattern this
+/// codebase relies on -- and an unaudited attempt at removal produced
+/// use-after-free crashes during development. This fixed ceiling keeps
+/// retained per-connection stream state small and provable without that
+/// audit; raising it is safe at any time, since it only ever changes how
+/// much credit is granted, never how existing streams behave.
+pub const max_retained_closed_streams_per_direction: u64 = 4096;
+
 pub const Config = struct {
     enabled: bool = false,
     versions: VersionSet = .{},

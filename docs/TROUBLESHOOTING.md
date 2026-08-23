@@ -705,7 +705,7 @@ itself is unhealthy.
 
 `503` here is a local capacity/availability signal, not a gateway or
 timeout failure — don't fold it into the 502/504 explanations above. There
-are four independent local-capacity families that all return `503`, and
+are five independent local-capacity/availability families that all return `503`, and
 they need different metrics/response bodies to tell apart:
 
 1. **Accept-time connection/worker-queue saturation** — the global or
@@ -722,7 +722,7 @@ they need different metrics/response bodies to tell apart:
    `Retry-After`, and does **not** move `connection_rejections_total`/
    `queue_rejections_total` — only `tardigrade_error_overload_total` moves.
    Flat connection/queue rejection counters alone don't identify this
-   family, though — families 3 and 4 below also leave those two flat;
+   family, though — families 3, 4, and 5 below also leave those two flat;
    `code:"overloaded"` plus `tardigrade_error_overload_total` rising is
    what actually identifies family 2 specifically.
 3. **Per-origin upstream connection-pool cap** —
@@ -736,11 +736,16 @@ they need different metrics/response bodies to tell apart:
    before any response byte is committed (`error.ProxyBufferCapacityUnavailable`).
    JSON `"code":"proxy_buffer_saturated"`, no `Retry-After`, connection
    closed.
+5. **Process-wide upstream circuit breaker open** —
+   `TARDIGRADE_CB_THRESHOLD` is enabled and recent confirmed upstream
+   failures opened the breaker. Requests fail before contacting the upstream
+   with JSON `"code":"upstream_circuit_open"`, no `Retry-After`, and recover
+   through a single half-open probe after `TARDIGRADE_CB_TIMEOUT_MS`.
 
 The response body's `code` field (`overloaded`/`upstream_saturated`/
-`proxy_buffer_saturated`) plus the family-specific counters below are what
-actually distinguish families 2–4 from each other — not the presence or
-absence of `Retry-After`.
+`proxy_buffer_saturated`/`upstream_circuit_open`) plus the family-specific
+counters below are what actually distinguish families 2–5 from each other —
+not the presence or absence of `Retry-After`.
 
 Marking backends unhealthy (passive failure tracking or active probing —
 see [§8](#8-health-checks-mark-an-upstream-down)) changes backend
@@ -753,17 +758,13 @@ necessarily a `503` — check the access log's `upstream_status`/
 `error_category` for the specific request rather than assuming `503` from
 health state alone.
 
-> `GatewayState`'s circuit-breaker fields
-> (`circuitTryAcquire`/`circuitRecordFailure`/`circuitRecordSuccess`) exist
-> and are unit-tested in isolation, but as of this writing they are not
-> called from the live proxy request path (`gateway_proxy.zig`,
-> `gateway_proxy_runtime.zig`, `gateway_control_plane_proxy.zig`,
-> `gateway_handlers.zig`) — only referenced in comments. Despite
-> `OBSERVABILITY.md`'s troubleshooting table describing a circuit-breaker-
-> open symptom, this guide does not document it as a live `503` cause.
-> Tracked by [#627](https://github.com/Bare-Systems/Tardigrade/issues/627);
-> treat any breaker-shaped symptom you observe as one of the causes above
-> instead until that issue resolves the discrepancy one way or the other.
+For `"code":"upstream_circuit_open"`, check whether the upstream has just
+returned repeated 5xx responses, timed out, reset streams, or failed
+protocol/connection handling. Local proxy capacity refusals, client upload
+errors, and downstream write failures do not trip the breaker. If the origin
+has recovered, wait at least `TARDIGRADE_CB_TIMEOUT_MS` for the half-open
+probe window; one probe is allowed through, and additional concurrent requests
+continue to fail fast until that probe succeeds.
 
 #### Concrete fixes
 
@@ -852,6 +853,13 @@ default build, and conflating them leads to false confidence:
    additionally runs the appliance credential preflight (PEM parse,
    chain shape, leaf/key match, validity-window checks), so it catches
    the supported material/validity failures earlier, at `check` time.
+5. **Native general-purpose profile (`-Dtls-profile=native`, #634):**
+   `tardi check` is config-shape validation like the general profile, but
+   OpenSSL-adapter-only settings (TLS 1.2, cipher overrides, mTLS, session
+   cache/tickets, OCSP, CRL, ACME, the credential watcher, PROXY protocol
+   with TLS) are rejected deterministically at `check` time. Credential
+   parse/mismatch failures surface when `tardi run` loads the files into
+   the native credential store at startup.
 
 Confirm which profile you're running with `tardi version` (it prints
 `tls-profile=...`) before assuming which of the above applies.
@@ -1467,22 +1475,26 @@ time you reloaded.
   config reload, not something that makes TLS config fields themselves
   hot-reloadable.
 
-  **Native HTTP/3 is a documented exception on a general-profile build
-  that also serves H3.** When a `NativeCredentialStore` exists,
-  `SIGHUP`'s `hotReloadConfig()` does prepare and commit a credential
-  reload for the native H3 store from the *proposed* `tls_cert_path`/
-  `tls_key_path`/SNI paths — before the stable TCP/OpenSSL terminator,
-  which only receives the protocol-policy update above. So on a process
-  serving both, a credential-path change can publish to the native H3
-  store while the stable TCP context stays on the old identity until
-  restart — meaning the two protocols can transiently (or, until you
-  restart, persistently) present **different certificates for the same
-  hostname**. Treat this as an experimental-surface caveat (see
-  [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md)), not evidence that stable TCP
-  TLS credentials are reloadable; the mixed-protocol identity split
-  itself is tracked by
-  [#629](https://github.com/Bare-Systems/Tardigrade/issues/629), not yet
-  reconciled in `RELOAD_SHUTDOWN.md`.
+  **On a general-profile build that also serves HTTP/3, TLS identity
+  rotation is entirely restart-owned, not silently split
+  ([#629](https://github.com/Bare-Systems/Tardigrade/issues/629)).** When
+  both a `TlsTerminator` (stable TCP/OpenSSL) and a `NativeCredentialStore`
+  (native H3) exist, `hotReloadConfig()` checks whether the proposed
+  `tls_cert_path`/`tls_key_path`/SNI certificates differ from what is
+  currently published *before* touching either credential owner; if they
+  differ, the whole reload is rejected — same as the appliance bucket-2
+  contract above. When they're unchanged, native H3's credential files are
+  never re-read on that `SIGHUP` either (so a certificate rotated in place
+  at the same configured path isn't picked up), and the OpenSSL terminator's
+  own independent file watcher is disabled for this composition at startup
+  — so neither surface can drift on its own. Native H3 is never allowed to
+  publish a rebuilt identity while stable TCP stays behind on the old one;
+  both surfaces keep serving the previous, coherent identity until a
+  restart. See "TLS Credential Identity" in
+  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md#tls-credential-identity) for the
+  full contract, including why the appliance profile's `ApplianceCredentials`
+  owner — despite technically supporting reload methods — is also fully
+  startup-owned in practice, since `hotReloadConfig` never calls them.
 - **you edited `tardigrade.env`, not `tardigrade.conf`** — `SIGHUP` reloads
   the *config*; it cannot change the *process environment* of an
   already-running process. `tardigrade.env` (and any

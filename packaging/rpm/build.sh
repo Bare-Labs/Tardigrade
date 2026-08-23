@@ -39,6 +39,25 @@ case "$ARCH" in
     *)      RPM_ARCH="$ARCH" ;;
 esac
 
+if [[ ! -x "$BINARY" ]]; then
+    echo "Binary is not executable: $BINARY" >&2
+    exit 1
+fi
+
+# Keep package metadata aligned with the exact artifact being packaged.
+# Official release binaries are native-only and set this macro to 0; a local
+# transitional general-profile binary still gets the OpenSSL dependency it
+# genuinely requires.
+BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
+case "$BINARY_VERSION_OUTPUT" in
+    *"tls-backend=native"*) RPM_REQUIRES_OPENSSL=0 ;;
+    *"tls-backend=openssl-adapter"*) RPM_REQUIRES_OPENSSL=1 ;;
+    *)
+        echo "Unable to determine TLS backend from '$BINARY version'; refusing to create ambiguous package metadata" >&2
+        exit 1
+        ;;
+esac
+
 echo "Building tardigrade-${VERSION}-1.${RPM_ARCH}.rpm ..."
 
 WORK_DIR=$(mktemp -d)
@@ -79,6 +98,7 @@ LREOF
 rpmbuild --define "_topdir ${WORK_DIR}" \
          --define "version ${VERSION}" \
          --define "build_arch ${RPM_ARCH}" \
+         --define "tardigrade_requires_openssl ${RPM_REQUIRES_OPENSSL}" \
          --define "_unitdir /usr/lib/systemd/system" \
          --target "${RPM_ARCH}-linux" \
          -bb "${WORK_DIR}/SPECS/tardigrade.spec"

@@ -648,6 +648,7 @@ fn isConfigValidationError(err: anyerror) bool {
         error.InvalidCertificateChainOrder,
         error.CertificateSignatureInvalid,
         error.UnsupportedApplianceConfiguration,
+        error.UnsupportedNativeTlsConfiguration,
         => true,
         else => false,
     };
@@ -1070,7 +1071,7 @@ fn writeConfigSummary(writer: anytype, resolved_config_path: ?[]const u8, cfg: *
 }
 
 fn countLocationBlocks(cfg: *const edge_config.EdgeConfig) usize {
-    var total: usize = 0;
+    var total: usize = cfg.location_blocks.len;
     for (cfg.server_blocks) |block| total += block.location_blocks.len;
     return total;
 }

@@ -1,14 +1,19 @@
 const std = @import("std");
 
-/// TLS/crypto build profile (#379, epic #327). `general` links the single
-/// approved OpenSSL adapter as a compatibility backend; `appliance` is the
-/// Bare Systems profile: no OpenSSL configuration, import, or linkage — the
-/// OpenSSL adapter module is replaced with a native stub at the build graph
-/// level, so `@cImport("openssl/...")` is never analyzed and `libssl`/
-/// `libcrypto` are never linked. There is no runtime fallback between
+/// TLS/crypto build profile (#379, epic #327, cutover #634). `general`
+/// links the single approved OpenSSL adapter as a transitional
+/// compatibility backend. `appliance` and `native` are native-only builds:
+/// no OpenSSL configuration, import, or linkage — the OpenSSL adapter
+/// module is replaced with a native stub at the build graph level, so
+/// `@cImport("openssl/...")` is never analyzed and `libssl`/`libcrypto`
+/// are never linked. `appliance` additionally applies the Bare Systems
+/// product policy (single Ed25519 identity, required server name, fixed
+/// TLS 1.3 policy); `native` is the general-purpose native profile
+/// (multi-identity SNI, generic credential loader) that #634 promotes to
+/// the sole shipping implementation. There is no runtime fallback between
 /// profiles; the selection is embedded in the binary and reported by
 /// `tardi version`. See docs/TLS_DEPENDENCY_POLICY.md.
-const TlsProfile = enum { general, appliance };
+const TlsProfile = enum { general, appliance, native };
 
 /// Resolves the source revision embedded in benchmark/diagnostic metadata
 /// (e.g. `crypto_bench`'s `_meta.tardigrade_commit`, #378's benchmark
@@ -79,7 +84,7 @@ pub fn build(b: *std.Build) void {
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
-        "TLS/crypto profile: 'general' (default) links the approved OpenSSL adapter; 'appliance' forbids all foreign TLS/crypto linkage (#379)",
+        "TLS/crypto profile: 'general' (default) links the transitional OpenSSL adapter; 'native' is the general-purpose pure-Zig profile and 'appliance' the Bare Systems policy profile — both forbid all foreign TLS/crypto linkage (#379, #634)",
     ) orelse .general;
     const link_openssl_adapter = tls_profile == .general;
 
@@ -823,6 +828,43 @@ pub fn build(b: *std.Build) void {
     const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
     quic_step.dependOn(&run_quic_h3_udp_tests.step);
     test_step.dependOn(&run_quic_h3_udp_tests.step);
+
+    // Bounded production H3 soak (#247 Lane B): concurrent real-UDP clients
+    // driving repeated connect/request/close cycles against the same
+    // `http3_runtime.Runtime` production module, with before/peak/
+    // after-settle resource observations. PR-safe by default; scale to the
+    // heavier tier locally/in scheduled runs with `TARDIGRADE_SOAK_HEAVY=1`.
+    const http3_soak_mod = b.createModule(.{
+        .root_source_file = b.path("tests/http3_soak.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    http3_soak_mod.addImport("quic", quic_mod);
+    http3_soak_mod.addImport("http3", http3_mod);
+    http3_soak_mod.addImport("tls_core", tls_core_mod);
+    http3_soak_mod.addImport("zig_compat", compat_mod);
+    http3_soak_mod.addImport("build_options", build_options.createModule());
+    http3_soak_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+    const soak_http3_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/http3_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    soak_http3_runtime_mod.addImport("zig_compat", compat_mod);
+    soak_http3_runtime_mod.addImport("stream_transport", stream_transport_mod);
+    soak_http3_runtime_mod.addImport("quic", quic_mod);
+    soak_http3_runtime_mod.addImport("http3", http3_mod);
+    soak_http3_runtime_mod.addImport("tls_core", tls_core_mod);
+    soak_http3_runtime_mod.addImport("crypto", crypto_mod);
+    soak_http3_runtime_mod.addImport("build_options", build_options.createModule());
+    soak_http3_runtime_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+    http3_soak_mod.addImport("http3_runtime", soak_http3_runtime_mod);
+    const http3_soak_tests = b.addTest(.{ .root_module = http3_soak_mod, .filters = quic_test_filters });
+    const run_http3_soak_tests = b.addRunArtifact(http3_soak_tests);
+    quic_step.dependOn(&run_http3_soak_tests.step);
+    test_step.dependOn(&run_http3_soak_tests.step);
 
     // Shared interop/conformance matrix vocabulary (#338): the single place
     // that maps a matrix row's cipher-suite/group/signature/ALPN names onto
