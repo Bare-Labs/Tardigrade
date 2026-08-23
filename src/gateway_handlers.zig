@@ -1729,10 +1729,12 @@ fn shapeHttp3ReturnResponse(
             return 405;
         },
         .redirect => |r| {
+            // Matches H1's `http.Response.redirect`: status + `Location`
+            // header only, zero response bytes -- no body, no content-type.
+            // A prior version set the redirect target as the body too,
+            // diverging from H1/H2 for no protocol-specific reason.
             _ = response
                 .setStatus(@enumFromInt(r.status))
-                .setBody(r.location)
-                .setContentType("text/plain; charset=utf-8")
                 .setHeader(http.correlation.HEADER_NAME, correlation_id)
                 .setHeader("location", r.location);
             return r.status;
@@ -1759,7 +1761,7 @@ test "shapeHttp3ReturnResponse: non-redirect return on a non-GET/HEAD method ren
     try std.testing.expect(response.body != null);
 }
 
-test "shapeHttp3ReturnResponse: redirect sets status and Location header" {
+test "shapeHttp3ReturnResponse: redirect sets status and Location header with zero body, matching H1" {
     const allocator = std.testing.allocator;
     var response = http.Response.init(allocator);
     defer response.deinit();
@@ -1767,6 +1769,9 @@ test "shapeHttp3ReturnResponse: redirect sets status and Location header" {
     try std.testing.expectEqual(@as(u16, 302), status);
     try std.testing.expectEqual(@as(u16, 302), @intFromEnum(response.status));
     try std.testing.expectEqualStrings("/new", response.headers.get("location") orelse "");
+    // Matches `http.Response.redirect` (H1's renderer): the redirect target
+    // lives only in the `Location` header, never duplicated into the body.
+    try std.testing.expect(response.body == null);
 }
 
 test "shapeHttp3ReturnResponse: GET body path renders the body" {

@@ -570,18 +570,15 @@ pub const UpstreamTlsConn = struct {
     /// surfaces through `drive()`'s own failure path instead (truncation is
     /// not silently treated as a clean end of body).
     ///
-    /// `record.peer_closed` becoming true (the `close_notify` alert was
-    /// parsed) does not by itself mean every byte the peer sent has been
-    /// decrypted yet — a trailing application-data record can still be
-    /// sitting unparsed in the carrier's raw-ciphertext buffer alongside it,
-    /// e.g. if it arrived in the same read as the alert but `drive()`'s
-    /// per-call budget only processed part of the batch. Concluding EOF the
-    /// moment `peer_closed` is observed, without giving `drive()` a chance to
-    /// finish draining that buffer first, risks reporting `0` while real
-    /// response bytes are still waiting — so every empty-plaintext iteration
-    /// below calls `drive()` at least once, and only falls through to the
-    /// `peer_closed` EOF check once a call reports no further progress is
-    /// possible (`inbound_carrier` genuinely has nothing left to parse).
+    /// Checking `record.peer_closed` before calling `drive()` again (rather
+    /// than after) is safe, not merely a shortcut: once `handleAlert`
+    /// processes `close_notify` and sets `peer_closed`,
+    /// `canProcessCarrierInput()` and `feedCiphertextInternal()` both
+    /// short-circuit on it (`encrypted_stream.zig`), so nothing past that
+    /// point ever gets parsed — every byte the peer sent is necessarily
+    /// already in `inbound_plaintext` by the time `peer_closed` is observed,
+    /// since TLS records (including the alert itself) are only ever
+    /// consumed in wire order.
     pub fn read(self: *UpstreamTlsConn, buf: []u8) TlsError!usize {
         const record = &self.state.record;
         const fd = self.state.fd;
@@ -589,15 +586,15 @@ pub const UpstreamTlsConn = struct {
             if (record.inbound_plaintext.len > 0) {
                 return record.readPlaintext(buf) catch return error.TlsReadFailed;
             }
-            const result = record.drive() catch return error.TlsReadFailed;
-            if (record.inbound_plaintext.len > 0) continue;
-            if (result.made_progress) continue;
             if (record.peer_closed) {
                 return record.readPlaintext(buf) catch |err| switch (err) {
                     error.EndOfStream => return 0,
                     else => return error.TlsReadFailed,
                 };
             }
+            const result = record.drive() catch return error.TlsReadFailed;
+            if (record.inbound_plaintext.len > 0 or record.peer_closed) continue;
+            if (result.made_progress) continue;
             try waitForFd(fd, record.readiness(), error.TlsReadFailed);
         }
     }
