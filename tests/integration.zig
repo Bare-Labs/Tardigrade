@@ -17728,12 +17728,20 @@ test "native upstream https: client certificate (mTLS) required by the origin" {
         });
         defer tardigrade.stop();
 
+        // 20s, not a tight bound: this test spawns two extra processes
+        // (openssl s_server and this Tardigrade instance) on top of two TLS
+        // handshakes, and CI's macos-14 runner has shown itself to need more
+        // real wall-clock headroom for that than a fast local machine does
+        // (a prior attempt at 10s timed out there with zero bytes read,
+        // i.e. Tardigrade's own upstream exchange simply hadn't finished
+        // yet -- not a hang, just slow). This is one bounded attempt, not a
+        // retry loop: any failure here is still a real failure.
         var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
             .method = "GET",
             .path = "/secure/hello.txt",
             .body = null,
             .headers = &.{},
-        }, 10_000);
+        }, 20_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status_code);
         try assertContains(response.body, "native-upstream-mtls-body");
@@ -17773,7 +17781,7 @@ test "native upstream https: client certificate (mTLS) required by the origin" {
             .path = "/secure/hello.txt",
             .body = null,
             .headers = &.{},
-        }, 10_000);
+        }, 20_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 502), response.status_code);
     }
