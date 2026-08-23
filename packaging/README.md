@@ -14,7 +14,7 @@ versus what is a local-build-only tool.
 | DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. Host-native builds infer dependency metadata from `tardi version`; cross-compiled binaries can declare `--tls-backend native|openssl-adapter` explicitly. Native binaries declare no OpenSSL runtime dependency, while a transitional local `general`/OpenSSL binary still gets the dependency it actually needs. |
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Host-native builds infer the backend and cross-compiled builds can pass it explicitly. The spec's OpenSSL runtime dependency is conditional on the packaged binary/backend; official native release packages do not declare it. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
-| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | The Darwin archive pipeline does not install or exercise launchd. #467 owns a real macOS `launchctl` bootstrap/health/bootout smoke and the final `tardi`/compatibility-alias service contract. |
+| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **CI-validated user LaunchAgent template** | The Darwin release-smoke workflow renders the checked-in host-style `/usr/local/...` template into an isolated prefix on the `macos-15` Apple Silicon runner, stages the native Darwin archive's `tardi` binary plus `tardigrade -> tardi` compatibility alias, and proves a real `launchctl bootstrap` -> readiness/request -> `bootout` lifecycle in the current user's launchd domain. |
 | Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present; public tap exists but is not usable yet** | `Bare-Systems/homebrew-tap` exists, but #466 owns seeding/automating it. The checked-in formula is not currently installable: its release version is stale and SHA-256 values are placeholders. #466 must consume the native Darwin artifacts and must not declare OpenSSL as a Tardigrade runtime dependency. |
 | Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. Docker's remaining OpenSSL cutover is tracked by #634 and is separate from the raw release/archive lane in #476. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
 
@@ -289,7 +289,50 @@ Pre-built service files for host-native installs:
 | File | Purpose |
 |---|---|
 | [`systemd/tardigrade.service`](systemd/tardigrade.service) | systemd service unit (Linux) |
-| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) — archive publication is handled by #476; real launchd lifecycle validation remains #467 |
+| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd user LaunchAgent plist (macOS) validated by `.github/workflows/darwin-release-smoke.yml` on `macos-15` |
+
+### launchd validation scope
+
+The launchd plist is a host-style service template, not an automatic service
+installer. Its checked-in paths assume an operator-created layout:
+
+- `/usr/local/bin/tardigrade`
+- `/usr/local/etc/tardigrade/tardigrade.conf`
+- `/usr/local/var/tardigrade`
+- `/usr/local/var/log/tardigrade/stdout.log`
+- `/usr/local/var/log/tardigrade/stderr.log`
+
+The Darwin release smoke consumes the same native Darwin archive contract used
+by release packaging. That archive contains canonical `tardi` plus the supported
+`tardigrade -> tardi` compatibility alias; the plist intentionally invokes the
+alias because that is the host path existing installations are expected to
+provide.
+
+CI does not write into `/usr/local`. `scripts/test-launchd-service.sh` stages the
+archive shape, config file, working directory, public fixture, log destinations,
+and LaunchAgent plist under temporary paths, renders only the host-specific path
+values from the canonical plist, then asserts the rendered `Label`,
+`ProgramArguments`, `TARDIGRADE_CONFIG_PATH`, `KeepAlive`, `RunAtLoad`,
+`WorkingDirectory`, and stdout/stderr redirection fields with native plist
+tools. It also verifies the program-argument config path and
+`TARDIGRADE_CONFIG_PATH` point to the same staged file, runs `tardi check` on
+that exact config, bootstraps the service with real user-domain launchd
+(`gui/$UID`), waits for the launchd-owned process to serve `/health` and a real
+static response, boots it out, and verifies the job and captured process are
+gone. Cleanup is idempotent and refuses to overwrite or boot out an unrelated
+pre-existing `io.baresystems.tardigrade` LaunchAgent.
+
+What this proves: deterministic plist rendering, plist syntax, user LaunchAgent
+bootstrap, launchd-owned readiness and HTTP request handling, bootout, process
+removal, and cleanup for the native Darwin archive/alias contract.
+
+What this does not prove: automatic launchd installation by `scripts/install.sh`,
+creation of the full `/usr/local` service layout, Homebrew publication (#466),
+signing/notarization, `.pkg` or DMG installation, privileged machine-wide
+LaunchDaemon behavior, or broad macOS performance. `scripts/install.sh` only
+installs `tardi` and the `tardigrade` compatibility alias; operators must still
+create writable config, working, and log paths for the prefix they choose before
+loading the plist.
 
 ## Related docs
 
