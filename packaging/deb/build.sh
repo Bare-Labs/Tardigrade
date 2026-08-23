@@ -5,10 +5,12 @@
 #   ./packaging/deb/build.sh [--version VERSION] [--arch ARCH] [--binary PATH]
 #
 # Options:
-#   --version VERSION   Package version (default: inferred from `git describe`)
-#   --arch ARCH         Target architecture: amd64 or arm64 (default: host arch)
-#   --binary PATH       Path to pre-built tardi binary (default: zig-out/bin/tardi)
-#   --output DIR        Output directory for .deb file (default: dist/)
+#   --version VERSION       Package version (default: inferred from `git describe`)
+#   --arch ARCH             Target architecture: amd64 or arm64 (default: host arch)
+#   --binary PATH           Path to pre-built tardi binary (default: zig-out/bin/tardi)
+#   --tls-backend BACKEND   native or openssl-adapter. When omitted, infer from
+#                           the executable binary's `tardi version` output.
+#   --output DIR            Output directory for .deb file (default: dist/)
 #
 # Prerequisites:
 #   dpkg-deb (part of dpkg, available on Debian/Ubuntu)
@@ -20,14 +22,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VERSION=""
 ARCH=""
 BINARY="${REPO_ROOT}/zig-out/bin/tardi"
+TLS_BACKEND=""
 OUTPUT_DIR="${REPO_ROOT}/dist"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version) VERSION="$2"; shift 2 ;;
-        --arch)    ARCH="$2";    shift 2 ;;
-        --binary)  BINARY="$2";  shift 2 ;;
-        --output)  OUTPUT_DIR="$2"; shift 2 ;;
+        --version)     VERSION="$2"; shift 2 ;;
+        --arch)        ARCH="$2"; shift 2 ;;
+        --binary)      BINARY="$2"; shift 2 ;;
+        --tls-backend) TLS_BACKEND="$2"; shift 2 ;;
+        --output)      OUTPUT_DIR="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -45,6 +49,42 @@ if [[ -z "$ARCH" ]]; then
         *) echo "Unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
     esac
 fi
+
+if [[ ! -f "$BINARY" ]]; then
+    echo "Binary not found: $BINARY" >&2
+    exit 1
+fi
+
+# Package dependency metadata follows the artifact actually being packaged.
+# Host-native binaries (including the official release binary after its native
+# linkage audit) are inferred from their self-report. Cross-compiled binaries
+# that cannot execute on the packaging host remain supported by passing
+# --tls-backend explicitly instead of guessing from the target filename.
+if [[ -z "$TLS_BACKEND" ]]; then
+    if [[ ! -x "$BINARY" ]]; then
+        echo "Binary is not executable on this host; pass --tls-backend native or --tls-backend openssl-adapter" >&2
+        exit 1
+    fi
+    BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
+    case "$BINARY_VERSION_OUTPUT" in
+        *"tls-backend=native"*) TLS_BACKEND="native" ;;
+        *"tls-backend=openssl-adapter"*) TLS_BACKEND="openssl-adapter" ;;
+        *)
+            echo "Unable to determine TLS backend from '$BINARY version'; pass --tls-backend explicitly" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+OPENSSL_DEPENDS=""
+case "$TLS_BACKEND" in
+    native) ;;
+    openssl-adapter) OPENSSL_DEPENDS="Depends: libssl3 | libssl1.1" ;;
+    *)
+        echo "Invalid --tls-backend '$TLS_BACKEND' (expected native or openssl-adapter)" >&2
+        exit 1
+        ;;
+esac
 
 echo "Building tardigrade_${VERSION}_${ARCH}.deb ..."
 
@@ -110,14 +150,19 @@ cat > "${DEBIAN_DIR}/conffiles" <<'CONFEOF'
 /etc/tardigrade/tardigrade.env
 CONFEOF
 
-# DEBIAN/control
+# DEBIAN/control. Do not emit a blank paragraph when the native package has no
+# OpenSSL dependency: Debian control-file paragraphs are separated by blanks.
 cat > "${DEBIAN_DIR}/control" <<CONTROL
 Package: tardigrade
 Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Bare Systems <security@baresystems.dev>
 Installed-Size: $(du -sk "$BIN_DIR" | awk '{print $1}')
-Depends: libssl3 | libssl1.1
+CONTROL
+if [[ -n "$OPENSSL_DEPENDS" ]]; then
+    printf '%s\n' "$OPENSSL_DEPENDS" >> "${DEBIAN_DIR}/control"
+fi
+cat >> "${DEBIAN_DIR}/control" <<CONTROL
 Section: net
 Priority: optional
 Homepage: https://github.com/Bare-Systems/Tardigrade

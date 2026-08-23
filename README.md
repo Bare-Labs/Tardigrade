@@ -78,17 +78,28 @@ The fastest way to install the latest release is the official install script:
 curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
 ```
 
-The installer downloads the matching Linux release archive (`x86_64` or
-`aarch64`), verifies it against `tardigrade-checksums.txt`, and installs the
-`tardi` binary (with a `tardigrade` compatibility alias) into
-`$HOME/.local/bin` by default. Published archives currently cover Linux
-only; macOS is not yet built or published by the release workflow (see
-[packaging/README.md](packaging/README.md#current-status) for exact status).
+The installer downloads the matching release archive, verifies it against
+`tardigrade-checksums.txt`, and installs the `tardi` binary (with a
+`tardigrade` compatibility alias) into `$HOME/.local/bin` by default. The
+**currently published latest release still contains Linux x86_64/aarch64
+archives only**. The release packaging implemented by #476 adds native Intel
+and Apple Silicon Darwin archives; macOS becomes a supported
+`install.sh`/raw-archive path starting with the first intentional release that
+contains that change. See [packaging/README.md](packaging/README.md#current-status)
+for exact status.
 
-Published release binaries use the default "general" TLS profile, which
-links OpenSSL at runtime — installing via this script or the raw archive
-requires OpenSSL 1.1/3.x already present on the target host, the same
-runtime dependency the DEB/RPM packages declare explicitly.
+The release workflow now builds official Linux and Darwin archives (and Linux
+DEB/RPM packages) with the general-purpose native Zig TLS profile
+(`-Dtls-profile=native`). Those new artifacts do not require OpenSSL as a
+Tardigrade build or runtime dependency, and their release dependency inventory
+is audited to reject `libssl`, `libcrypto`, and other foreign TLS/crypto/QUIC/H3
+implementations. Older already-published releases predate that cutover and may
+still use the transitional OpenSSL-backed profile.
+
+The initial Darwin archives are unsigned and not notarized; see the Gatekeeper
+note in [packaging/README.md](packaging/README.md) before redistributing
+browser-downloaded artifacts. Homebrew publication (#466) and launchd lifecycle
+validation (#467) are separate follow-ups.
 
 Other install paths:
 
@@ -107,12 +118,15 @@ layout, permissions, and a locally built Docker image — see the
 Requirements:
 
 - [Zig](https://ziglang.org/) 0.16.0
-- OpenSSL development libraries on Linux, for example `libssl-dev` on Debian or
-  Ubuntu
+- The repository default remains the transitional `general` TLS profile; that
+  profile needs OpenSSL development libraries (`libssl-dev` on Debian/Ubuntu,
+  Homebrew `openssl@3` on macOS).
+- The official shipping-equivalent `native` profile does **not** require OpenSSL
+  to compile or run Tardigrade.
 - HTTP/3 is served by the built-in native Zig QUIC/H3 stack and requires no
   additional system libraries.
 
-For development:
+For development with the current default profile:
 
 ```bash
 git clone https://github.com/Bare-Systems/Tardigrade.git
@@ -120,17 +134,17 @@ cd Tardigrade
 zig build run
 ```
 
-For a release-mode binary:
+For a shipping-equivalent release-mode native binary:
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dtls-profile=native
 ./zig-out/bin/tardi --help
 ```
 
 With explicit version metadata:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dversion="$(git describe --tags --always)"
+zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion="$(git describe --tags --always)"
 ```
 
 Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-options).

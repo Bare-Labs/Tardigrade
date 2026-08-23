@@ -1,0 +1,148 @@
+name: Darwin Release Smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/darwin-release-smoke.yml"
+      - ".github/workflows/release.yml"
+      - "build.zig"
+      - "build.zig.zon"
+      - "src/**"
+      - "scripts/install-zig.sh"
+      - "scripts/install.sh"
+      - "scripts/test-install.sh"
+      - "scripts/audit-release-binary.sh"
+      - "scripts/package-release-archive.sh"
+      - "packaging/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darwin-release-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  darwin-release-smoke:
+    name: Darwin release smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            archive_name: tardigrade-darwin-x86_64
+            expected_arch: x86_64
+          - os: macos-15
+            archive_name: tardigrade-darwin-arm64
+            expected_arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Print Zig version
+        run: zig version
+
+      - name: Build native release binary
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=0.0.0-ci-smoke
+
+      - name: Verify macOS binary architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          file zig-out/bin/tardi | grep -F "$EXPECTED_ARCH"
+
+      - name: Audit native release binary linkage
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardi \
+            --profile native \
+            --output "$RUNNER_TEMP/dependency-inventory-${{ matrix.archive_name }}.json"
+
+      - name: Package artifact
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          ./scripts/package-release-archive.sh \
+            --archive-name "$ARCHIVE_NAME" \
+            --binary zig-out/bin/tardi \
+            --staging-dir dist \
+            --output-dir "$RUNNER_TEMP/release-artifacts"
+
+      - name: Smoke test extracted archive
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          extract_dir="$RUNNER_TEMP/extracted"
+          mkdir -p "$extract_dir"
+          tar -xzf "$RUNNER_TEMP/release-artifacts/$ARCHIVE_NAME.tar.gz" -C "$extract_dir"
+          test -x "$extract_dir/tardi"
+          test "$(readlink "$extract_dir/tardigrade")" = tardi
+
+          version_output="$("$extract_dir/tardi" version)"
+          printf '%s\n' "$version_output"
+          printf '%s\n' "$version_output" | grep -F 'tls-profile=native'
+          printf '%s\n' "$version_output" | grep -F 'tls-backend=native'
+
+      - name: Production-shaped smoke from extracted archive
+        run: |
+          set -euo pipefail
+
+          tardi="$RUNNER_TEMP/extracted/tardi"
+          smoke_dir="$RUNNER_TEMP/runtime-smoke"
+          mkdir -p "$smoke_dir/public"
+          printf '%s\n' '<h1>Darwin release smoke</h1>' > "$smoke_dir/public/index.html"
+
+          cd "$smoke_dir"
+          "$tardi" init static > tardigrade.conf
+          "$tardi" check
+          "$tardi" run > tardi.log 2>&1 &
+          pid=$!
+
+          cleanup() {
+            if kill -0 "$pid" >/dev/null 2>&1; then
+              kill -INT "$pid" >/dev/null 2>&1 || true
+              wait "$pid" || true
+            fi
+          }
+          trap cleanup EXIT
+
+          body=""
+          ready=false
+          for _ in {1..50}; do
+            if body="$(curl -fsS http://localhost:8080/ 2>/dev/null)"; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$pid" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.2
+          done
+
+          if [ "$ready" != true ]; then
+            cat tardi.log >&2
+            echo "extracted Darwin artifact did not become ready" >&2
+            exit 1
+          fi
+
+          test "$body" = '<h1>Darwin release smoke</h1>'
+          test "$(curl -fsS http://localhost:8080/health)" = 'ok'
+
+          kill -INT "$pid"
+          wait "$pid"
+          trap - EXIT
+
+      - name: Smoke test installer path
+        run: ./scripts/test-install.sh

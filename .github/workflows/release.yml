@@ -24,19 +24,37 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
-    permissions:
-      contents: write
 
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      release_sha: ${{ steps.meta.outputs.release_sha }}
       should_publish: ${{ steps.meta.outputs.should_publish }}
 
     steps:
-      - name: Checkout
+      - name: Select release commit
+        id: release_target
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            release_sha="$WORKFLOW_RUN_SHA"
+          else
+            release_sha="$DISPATCH_SHA"
+          fi
+          test -n "$release_sha"
+          echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ steps.release_target.outputs.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Fetch tags
         run: git fetch --force --tags origin
@@ -49,24 +67,20 @@ jobs:
 
           version="$(./scripts/release-metadata.sh version)"
           tag="$(./scripts/release-metadata.sh tag)"
-          current_sha="${GITHUB_SHA}"
+          release_sha="$(git rev-parse HEAD)"
           should_publish="true"
 
           if git rev-parse "$tag" >/dev/null 2>&1; then
             tag_commit="$(git rev-list -n 1 "$tag")"
-            if [ "$tag_commit" != "$current_sha" ]; then
+            if [ "$tag_commit" != "$release_sha" ]; then
               should_publish="false"
             fi
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "$tag" "$current_sha" -m "Tardigrade $tag"
-            git push origin "$tag"
           fi
 
           {
             echo "version=$version"
             echo "tag=$tag"
+            echo "release_sha=$release_sha"
             echo "should_publish=$should_publish"
           } >> "$GITHUB_OUTPUT"
 
@@ -99,15 +113,24 @@ jobs:
             archive_name: tardigrade-linux-x86_64
             deb_arch: amd64
             rpm_arch: x86_64
+            linux_packages: true
           - os: ubuntu-24.04-arm
             archive_name: tardigrade-linux-aarch64
             deb_arch: arm64
             rpm_arch: aarch64
+            linux_packages: true
+          - os: macos-15-intel
+            archive_name: tardigrade-darwin-x86_64
+            linux_packages: false
+          - os: macos-15
+            archive_name: tardigrade-darwin-arm64
+            linux_packages: false
 
     steps:
-      - name: Checkout
+      - name: Checkout release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
           persist-credentials: false
 
       - name: Verify checkout is clean
@@ -115,10 +138,8 @@ jobs:
           git diff --exit-code
           git diff --cached --exit-code
 
-      - name: Install dependencies
-        run: sudo apt-get install -y libssl-dev
-
       - name: Install packaging prerequisites
+        if: matrix.linux_packages == true
         run: sudo apt-get install -y rpm
 
       - name: Install Zig
@@ -143,20 +164,35 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Source and configuration audit
+        if: matrix.linux_packages == true
         run: ./scripts/audit-dependencies.sh
 
-      - name: Build release binary
+      - name: Build native release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native "-Dversion=$VERSION"
 
-      - name: Audit release binary linkage and record inventory
+      - name: Verify macOS binary architecture
+        if: runner.os == 'macOS'
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          case "$ARCHIVE_NAME" in
+            tardigrade-darwin-x86_64) expected=x86_64 ;;
+            tardigrade-darwin-arm64) expected=arm64 ;;
+            *) echo "unexpected Darwin archive name: $ARCHIVE_NAME" >&2; exit 1 ;;
+          esac
+          test "$(uname -m)" = "$expected"
+          file zig-out/bin/tardi | grep -F "$expected"
+
+      - name: Audit native release binary linkage and record inventory
         env:
           INVENTORY_PATH: ${{ steps.archive_artifacts.outputs.inventory_path }}
         run: |
           ./scripts/audit-release-binary.sh \
             --binary zig-out/bin/tardi \
-            --profile general \
+            --profile native \
             --output "$INVENTORY_PATH"
 
       - name: Package artifact
@@ -184,6 +220,7 @@ jobs:
           subject-path: ${{ steps.archive_artifacts.outputs.archive_path }}
 
       - name: Build DEB package
+        if: matrix.linux_packages == true
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           DEB_ARCH: ${{ matrix.deb_arch }}
@@ -196,6 +233,7 @@ jobs:
             --output "$ARTIFACT_DIR"
 
       - name: Build RPM package
+        if: matrix.linux_packages == true
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           RPM_ARCH: ${{ matrix.rpm_arch }}
@@ -206,6 +244,31 @@ jobs:
             --arch "$RPM_ARCH" \
             --binary zig-out/bin/tardi \
             --output "$ARTIFACT_DIR"
+
+      - name: Verify native package metadata has no OpenSSL dependency
+        if: matrix.linux_packages == true
+        env:
+          ARTIFACT_DIR: ${{ steps.archive_artifacts.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+
+          deb_path="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          rpm_path="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.rpm' -print -quit)"
+          test -n "$deb_path"
+          test -n "$rpm_path"
+
+          deb_requires="$(dpkg-deb -f "$deb_path" Depends 2>/dev/null || true)"
+          if printf '%s\n' "$deb_requires" | grep -qiE 'libssl|libcrypto|openssl'; then
+            echo "native DEB unexpectedly declares an OpenSSL dependency: $deb_requires" >&2
+            exit 1
+          fi
+
+          rpm_requires="$(rpm -qp --requires "$rpm_path")"
+          if printf '%s\n' "$rpm_requires" | grep -qiE 'libssl|libcrypto|openssl'; then
+            echo "native RPM unexpectedly declares an OpenSSL dependency:" >&2
+            printf '%s\n' "$rpm_requires" >&2
+            exit 1
+          fi
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -232,6 +295,7 @@ jobs:
           retention-days: 14
 
       - name: Upload DEB artifact
+        if: matrix.linux_packages == true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: deb-${{ matrix.archive_name }}
@@ -240,6 +304,7 @@ jobs:
           retention-days: 1
 
       - name: Upload RPM artifact
+        if: matrix.linux_packages == true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rpm-${{ matrix.archive_name }}
@@ -258,8 +323,43 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
+      - name: Checkout release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ensure release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare-release.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            tag_commit="$(git rev-list -n 1 "$TAG")"
+            test "$tag_commit" = "$RELEASE_SHA"
+          else
+            tag_object_sha="$(
+              gh api --method POST \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/${GITHUB_REPOSITORY}/git/tags" \
+                -f tag="$TAG" \
+                -f message="Tardigrade $TAG" \
+                -f object="$RELEASE_SHA" \
+                -f type=commit \
+                --jq .sha
+            )"
+            test -n "$tag_object_sha"
+            gh api --method POST \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/$TAG" \
+              -f sha="$tag_object_sha" >/dev/null
+          fi
 
       - name: Download release notes
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
