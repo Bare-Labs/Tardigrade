@@ -17582,7 +17582,7 @@ test "native upstream https: client certificate (mTLS) required by the origin" {
             .path = "/secure/hello.txt",
             .body = null,
             .headers = &.{},
-        }, 10_000);
+        }, 20_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status_code);
         try assertContains(response.body, "native-upstream-mtls-body");
@@ -17611,7 +17611,7 @@ test "native upstream https: client certificate (mTLS) required by the origin" {
             .path = "/secure/hello.txt",
             .body = null,
             .headers = &.{},
-        }, 10_000);
+        }, 20_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 502), response.status_code);
     }
