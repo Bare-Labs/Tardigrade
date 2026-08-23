@@ -646,6 +646,17 @@ presents. This applies identically on every `-Dtls-profile` build (#634):
 the same knobs, the same 502-on-failure mapping, and the same "fix the
 certificate, don't disable verification" guidance apply.
 
+**Native-profile-specific cause:** under `-Dtls-profile=native`/`appliance`,
+certificate chain verification only authenticates signatures made with
+Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 (`src/pki/verify.zig`, #343).
+An origin whose chain is signed with classic RSA PKCS#1 v1.5
+(`sha256WithRSAEncryption`, still common among public CAs) or another
+unsupported combination (e.g. ECDSA/SHA-384) fails closed here even with a
+correct CA bundle and hostname — this is a native signature-algorithm
+coverage gap, not a misconfiguration, and disabling verification is still not
+the fix. Until the native matrix is extended, such an origin needs
+`-Dtls-profile=general` (OpenSSL) to be proxied with verification enabled.
+
 #### Verify the fix
 
 ```bash

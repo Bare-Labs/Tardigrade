@@ -3084,11 +3084,26 @@ fn respondHttp2Stream(
                 }
                 state.metricsRecordErrorCode(rejection.code);
             },
-            .return_response => |ret| {
-                status_code = ret.status_code;
-                body_alloc = try allocator.dupe(u8, ret.body);
-                body = body_alloc.?;
-                try response_headers.append(.{ .name = "content-type", .value = "text/plain; charset=utf-8" });
+            .return_response => |plan| {
+                switch (plan) {
+                    .method_not_allowed => {
+                        status_code = 405;
+                        body_alloc = try gp.buildApiErrorJson(allocator, "invalid_request", "Method Not Allowed", correlation_id);
+                        body = body_alloc.?;
+                    },
+                    .redirect => |r| {
+                        status_code = r.status;
+                        body = "";
+                        try response_headers.append(.{ .name = "location", .value = r.location });
+                        try response_headers.append(.{ .name = "content-type", .value = "text/plain; charset=utf-8" });
+                    },
+                    .body => |b| {
+                        status_code = b.status;
+                        body_alloc = try allocator.dupe(u8, b.body);
+                        body = body_alloc.?;
+                        try response_headers.append(.{ .name = "content-type", .value = "text/plain; charset=utf-8" });
+                    },
+                }
             },
         }
     }
@@ -3140,10 +3155,7 @@ fn respondHttp2Stream(
 const Http2ProxyRouteResult = union(enum) {
     response: gp.BufferedUpstreamResponse,
     local_rejection: Http2LocalRejection,
-    return_response: struct {
-        status_code: u16,
-        body: []const u8,
-    },
+    return_response: ghandlers.ReturnResponsePlan,
 };
 
 const Http2LocalRejection = struct {
@@ -3209,12 +3221,7 @@ fn executeHttp2ProxyRoute(
         .proxy_pass => |value| value,
         .return_response => |ret| {
             const is_get_or_head = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
-            if (!is_get_or_head) return .{ .local_rejection = .{
-                .status_code = @intFromEnum(http.Status.method_not_allowed),
-                .code = "invalid_request",
-                .message = "Method Not Allowed",
-            } };
-            return .{ .return_response = .{ .status_code = ret.status, .body = ret.body } };
+            return .{ .return_response = ghandlers.planReturnResponse(is_get_or_head, ret.status, ret.body) };
         },
         else => return null,
     };

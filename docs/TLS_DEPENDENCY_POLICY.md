@@ -82,6 +82,21 @@ the binary. There is no runtime switch and no fallback between profiles.
   skips identity checking. See `docs/CONFIGURATION.md` for the full knob
   list and `docs/TROUBLESHOOTING.md` for native-profile-specific upstream TLS
   failure modes.
+  **Signature algorithm caveat:** chain validation authenticates each
+  certificate's signature through the pre-existing #343 native matrix
+  (`src/pki/verify.zig`), which supports Ed25519, ECDSA P-256/SHA-256, and
+  RSA-PSS/SHA-256 only. Classic `sha256WithRSAEncryption` (RSA PKCS#1 v1.5)
+  and other common public-WebPKI variants (e.g. ECDSA/SHA-384) are not yet
+  supported; a chain signed with one of them fails closed with a verification
+  error, mapped through the same bounded upstream-TLS failure path as any
+  other handshake/certificate failure (see `docs/TROUBLESHOOTING.md`). This is
+  a pre-existing #343 scope limit, not new to this upstream client — but it is
+  now user-visible for arbitrary upstream origins rather than only
+  Tardigrade's own Ed25519/P-256 downstream identities. Extending the native
+  signature matrix to cover RSA PKCS#1 v1.5 (and other common public-CA
+  variants) is tracked separately; until then, native-profile upstream HTTPS
+  is production-ready only against origins whose certificate chain uses one
+  of the three supported signature algorithms.
 - Must not link `libssl`, `libcrypto`, or any other foreign TLS, crypto, QUIC,
   HTTP/3, or certificate library — audited identically to the appliance
   profile.
@@ -201,7 +216,14 @@ alongside the release assets and SBOM.
 - [x] Native upstream HTTPS/TLS client: `proxy_pass https://…` upstreams work
       under `-Dtls-profile=native` with native PKI verification, hostname/SAN
       checking, SNI, ALPN/protocol selection, connection pooling/reuse, and
-      bounded failure mapping — no OpenSSL, no runtime fallback.
+      bounded failure mapping — no OpenSSL, no runtime fallback. Verification
+      is currently limited to chains signed with Ed25519, ECDSA P-256/SHA-256,
+      or RSA-PSS/SHA-256 (the pre-existing #343 signature matrix); see the
+      caveat above.
+- [ ] Native certificate-signature matrix (`src/pki/verify.zig`) extended to
+      cover classic RSA PKCS#1 v1.5 (and other common public-WebPKI signature
+      variants) so native-profile upstream verification is not restricted to
+      a subset of real-world certificate authorities.
 - [x] Default downstream identity SAN/SNI eligibility: a default certificate
       may satisfy a requested SNI its own SAN actually covers, without
       requiring an explicit `TARDIGRADE_TLS_SNI_CERTS` entry; explicit

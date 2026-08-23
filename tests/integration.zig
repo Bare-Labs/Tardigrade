@@ -3182,6 +3182,86 @@ fn pureZigH2GetBody(allocator: std.mem.Allocator, port: u16, headers: []const hp
     return error.H2ResponseNotFound;
 }
 
+const H2Response = struct {
+    status: u16,
+    headers: []hpack.HeaderField,
+    body: []u8,
+
+    fn header(self: *const H2Response, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    fn deinit(self: *H2Response, allocator: std.mem.Allocator) void {
+        var decoded = hpack.DecodeResult{ .headers = self.headers };
+        hpack.deinitDecoded(allocator, &decoded);
+        allocator.free(self.body);
+    }
+};
+
+/// Like `pureZigH2GetBody`, but also captures the response HEADERS frame so
+/// callers can assert on `:status` and other response headers (e.g.
+/// `location`) rather than only the response body.
+fn pureZigH2GetResponse(allocator: std.mem.Allocator, port: u16, headers: []const hpack.HeaderField) !H2Response {
+    const client = try PureZigTlsClient.create(allocator, port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+    const request_block = try hpack.encodeLiteralHeaderBlock(allocator, headers);
+    defer allocator.free(request_block);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, request_block); // END_STREAM | END_HEADERS
+
+    var response_body = std.array_list.Managed(u8).init(allocator);
+    errdefer response_body.deinit();
+    var response_headers: ?hpack.DecodeResult = null;
+    errdefer if (response_headers) |*rh| hpack.deinitDecoded(allocator, rh);
+
+    var frame_count: usize = 0;
+    while (frame_count < 12) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+
+        switch (frame.typ) {
+            0x4 => {
+                if ((frame.flags & 0x1) == 0) {
+                    try client.writeHttp2Frame(0x4, 0x1, 0, &.{}); // SETTINGS ACK
+                }
+            },
+            0x1 => {
+                if (frame.stream_id == 1) {
+                    response_headers = try hpack.decode(allocator, frame.payload);
+                }
+            },
+            0x0 => {
+                if (frame.stream_id == 1) {
+                    try response_body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) {
+                        const decoded = response_headers orelse return error.H2ResponseNotFound;
+                        response_headers = null;
+                        var status: u16 = 0;
+                        for (decoded.headers) |h| {
+                            if (std.mem.eql(u8, h.name, ":status")) {
+                                status = std.fmt.parseInt(u16, h.value, 10) catch 0;
+                            }
+                        }
+                        return .{
+                            .status = status,
+                            .headers = decoded.headers,
+                            .body = try response_body.toOwnedSlice(),
+                        };
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return error.H2ResponseNotFound;
+}
+
 fn pureZigH2GetBodyWithWindowUpdates(allocator: std.mem.Allocator, port: u16, headers: []const hpack.HeaderField) ![]u8 {
     const client = try PureZigTlsClient.create(allocator, port, "h2");
     defer client.destroy();
@@ -6180,6 +6260,90 @@ test "interop.h2.proxy_passive_health_tracking_fails_closed" {
     try assertContains(body, "\"code\":\"h2_proxy_policy_unsupported\"");
     compat.sleepNs(200 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+}
+
+test "interop.h2.return_directive matches shared H1/H3 redirect and method-enforcement semantics" {
+    // H2's `return` handling previously reimplemented only part of
+    // gateway_handlers.planReturnResponse()'s protocol-neutral policy: it
+    // rejected every non-GET/HEAD request outright (so a POST redirect wrongly
+    // 405'd instead of following H1/H3 and redirecting method-agnostically),
+    // and it rendered a 3xx return's body as response content instead of a
+    // `location` header. This proves H2 now matches H1/H3 on both points.
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        \\
+        \\location = /redirect-me {
+        \\    return 302 /new-place;
+        \\}
+    ;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // GET a redirect: 302 with a Location header and an empty body, same as
+    // H1/H3.
+    {
+        const headers = [_]hpack.HeaderField{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/redirect-me" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        };
+        var resp = try pureZigH2GetResponse(allocator, tardigrade.port, headers[0..]);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 302), resp.status);
+        try std.testing.expectEqualStrings("/new-place", resp.header("location") orelse "");
+        try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+    }
+
+    // POST a redirect: redirects are method-agnostic (ASVS-14.5.1 only
+    // constrains non-redirect returns), so this must also redirect rather
+    // than 405.
+    {
+        const headers = [_]hpack.HeaderField{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/redirect-me" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        };
+        var resp = try pureZigH2GetResponse(allocator, tardigrade.port, headers[0..]);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 302), resp.status);
+        try std.testing.expectEqualStrings("/new-place", resp.header("location") orelse "");
+        try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+    }
+
+    // POST a non-redirect return: still GET/HEAD-only, so this must 405
+    // rather than execute as if it were GET.
+    {
+        const headers = [_]hpack.HeaderField{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/healthz" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        };
+        var resp = try pureZigH2GetResponse(allocator, tardigrade.port, headers[0..]);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 405), resp.status);
+    }
 }
 
 test "interop.h2.proxy_circuit_breaker_fails_closed" {

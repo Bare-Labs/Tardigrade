@@ -324,6 +324,13 @@ file (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
 `native`; if neither an explicit bundle nor a well-known location is usable,
 verification fails deterministically rather than silently trusting nothing.
 
+`appliance`/`native` verification currently authenticates certificate chain
+signatures made with Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 only
+(the pre-existing #343 native signature matrix); an origin signed with
+classic RSA PKCS#1 v1.5 or another unsupported algorithm fails verification
+even with a correct CA bundle and hostname (see `docs/TROUBLESHOOTING.md`).
+`general` has no such restriction.
+
 ### Health Checks And Circuit Breaking
 
 For active-probe aliases, `TARDIGRADE_UPSTREAM_PROBE_*` names are preferred only
