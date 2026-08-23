@@ -366,12 +366,16 @@ test "upstream ALPN policy validates selected protocol strictly" {
 }
 
 /// A native (pure-Zig) TLS client connection to a TCP stream, used for
-/// upstream HTTPS connections (#634). `fd` must already be a connected,
-/// *blocking* socket — callers that want bounded connect/read/write
-/// behavior configure `SO_RCVTIMEO`/`SO_SNDTIMEO` on it before/around calling
+/// upstream HTTPS connections (#634). `fd` must already be a connected
+/// socket; `connect` immediately puts it in nonblocking mode internally
+/// (see the module doc comment above), but presents the OpenSSL adapter's
+/// synchronous, *blocking-socket-shaped* contract at the API boundary —
+/// callers still configure bounded connect/read/write behavior via
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` on the fd before/around calling
 /// `connect`/`read`/`writeAll`, exactly as the OpenSSL adapter's
 /// `SSL_connect`/`SSL_read`/`SSL_write` rely on for their own blocking
-/// timeout behavior; this type never sets `O_NONBLOCK` on `fd`.
+/// timeout behavior; that configured timeout becomes `waitForFd`'s bounded
+/// `poll()` deadline instead of a per-syscall kernel timeout.
 /// The heap-stable connection state `UpstreamTlsConn` points to. Allocated
 /// once and never moved for the life of the connection: the record layer's
 /// handshake driver captures a permanent pointer to `backend`
@@ -486,6 +490,15 @@ pub const UpstreamTlsConn = struct {
             );
         }
 
+        // `state.backend` is definitely initialized from here on and owns
+        // handshake secrets that must be wiped on every failure path below.
+        // Ownership transfers to `state.record` once it is constructed
+        // (mirroring `native_tls_connection.zig`'s `backend_owned_by_record`
+        // pattern): `record.deinit()` tears the backend down transitively,
+        // so exactly one of the two guards below is ever live at a time.
+        var backend_owned_by_record = false;
+        errdefer if (!backend_owned_by_record) state.backend.deinit();
+
         var loaded_client_identity: ?tls_core.identity_loader.LoadedIdentity = null;
         defer if (loaded_client_identity) |*loaded| loaded.deinit();
         var client_credential: tls_core.credentials.FixedCredentialProvider = undefined;
@@ -518,10 +531,9 @@ pub const UpstreamTlsConn = struct {
                 .owns_handle = false,
             },
             state.backend.backend(),
-        ) catch {
-            state.backend.deinit();
-            return error.ContextInitFailed;
-        };
+        ) catch return error.ContextInitFailed;
+        backend_owned_by_record = true;
+        errdefer state.record.deinit();
         // The backend's `Trust`/`auth_policy` alone is not sufficient to open
         // an unverified connection: the record layer requires this separate,
         // explicit opt-in (mirroring the QUIC driver's own policy) so
@@ -533,10 +545,7 @@ pub const UpstreamTlsConn = struct {
         // to actually deliver the "verification disabled" contract.
         state.record.allow_unverified_certificate = opts.skip_verify;
 
-        driveUntilHandshakeComplete(&state.record, fd) catch |err| {
-            state.record.deinit();
-            return err;
-        };
+        try driveUntilHandshakeComplete(&state.record, fd);
 
         const protocol = try opts.alpn_policy.select(state.record.negotiatedAlpn());
         return .{ .state = state, .fd = fd, .protocol = protocol };
@@ -767,4 +776,29 @@ test "stub terminator fails closed" {
 // system CA bundle installed.
 test "native upstream TLS connect fails closed on an unusable fd" {
     try std.testing.expectError(error.ContextInitFailed, UpstreamTlsConn.connect(-1, "example.com", .{ .skip_verify = true }));
+}
+
+// A staged-ownership regression test: `state.backend` is fully initialized by
+// this point (it happens before client-mTLS-credential setup), so a failure
+// here must deinitialize it rather than only freeing the raw `state`
+// allocation via the outer `errdefer allocator.destroy(state)` — a bug fixed
+// alongside the equivalent post-`state.record`-init case (both previously
+// leaked handshake state on every error exit after their respective
+// initialization point). `client_key_path` empty with `client_cert_path` set
+// is the cheapest deterministic way to reach this exact failure point: it
+// needs no filesystem access and no live peer, since it is rejected before
+// `identity_loader.loadIdentity` ever runs. A valid-but-unconnected socket
+// (one end of a socketpair) is enough — `setNonBlocking` needs a real fd, but
+// this failure path returns before any handshake I/O is attempted on it.
+test "native upstream TLS connect deinitializes the backend when client mTLS credential setup fails" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    try std.testing.expectError(error.PrivateKeyLoadFailed, UpstreamTlsConn.connect(fds[1], "example.com", .{
+        .skip_verify = true,
+        .client_cert_path = "unused.crt",
+        .client_key_path = "",
+    }));
 }

@@ -6332,7 +6332,12 @@ test "interop.h2.return_directive matches shared H1/H3 redirect and method-enfor
     }
 
     // POST a non-redirect return: still GET/HEAD-only, so this must 405
-    // rather than execute as if it were GET.
+    // rather than execute as if it were GET, and — like H1's `.local_rejection`
+    // and H2's own adjacent `.local_rejection` branch — must record the
+    // `invalid_request` error-code metric exactly once, not silently skip it.
+    var metrics_before = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics_before.deinit();
+    const invalid_request_before = prometheusMetricValue(metrics_before.body, "tardigrade_error_invalid_request_total") orelse 0;
     {
         const headers = [_]hpack.HeaderField{
             .{ .name = ":method", .value = "POST" },
@@ -6344,6 +6349,11 @@ test "interop.h2.return_directive matches shared H1/H3 redirect and method-enfor
         defer resp.deinit(allocator);
         try std.testing.expectEqual(@as(u16, 405), resp.status);
     }
+
+    var metrics_after = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics_after.deinit();
+    const invalid_request_after = prometheusMetricValue(metrics_after.body, "tardigrade_error_invalid_request_total") orelse 0;
+    try std.testing.expectEqual(invalid_request_before + 1, invalid_request_after);
 }
 
 test "interop.h2.proxy_circuit_breaker_fails_closed" {

@@ -217,7 +217,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.warn(null, "upstream TLS certificate verification disabled", .{});
     }
     if (cfg.upstream_tls_client_cert.len > 0 or cfg.upstream_tls_server_name.len > 0) {
-        state.logger.info(null, "upstream mTLS client cert and/or SNI override configured; applies to OpenSSL-backed connections", .{});
+        state.logger.info(null, "upstream mTLS client cert and/or SNI override configured; applies to every upstream TLS connection regardless of -Dtls-profile", .{});
     }
 
     // Appliance TLS profile (#392): load and fully validate the one
@@ -3090,6 +3090,7 @@ fn respondHttp2Stream(
                         status_code = 405;
                         body_alloc = try gp.buildApiErrorJson(allocator, "invalid_request", "Method Not Allowed", correlation_id);
                         body = body_alloc.?;
+                        state.metricsRecordErrorCode("invalid_request");
                     },
                     .redirect => |r| {
                         status_code = r.status;

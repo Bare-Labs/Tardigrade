@@ -213,17 +213,26 @@ alongside the release assets and SBOM.
       foreign linkage, generic multi-identity credentials, deterministic
       rejection of OpenSSL-adapter-only settings, built and binary-audited in
       CI.
-- [x] Native upstream HTTPS/TLS client: `proxy_pass https://…` upstreams work
-      under `-Dtls-profile=native` with native PKI verification, hostname/SAN
-      checking, SNI, ALPN/protocol selection, connection pooling/reuse, and
-      bounded failure mapping — no OpenSSL, no runtime fallback. Verification
-      is currently limited to chains signed with Ed25519, ECDSA P-256/SHA-256,
-      or RSA-PSS/SHA-256 (the pre-existing #343 signature matrix); see the
-      caveat above.
+- [x] Native upstream HTTPS/TLS client exists and is wired into the data
+      plane: `proxy_pass https://…` upstreams work under `-Dtls-profile=native`
+      through the native TLS engine, record layer, and PKI stack — hostname/
+      SAN checking, SNI, ALPN/protocol selection, connection pooling/reuse,
+      and bounded failure mapping all function — no OpenSSL, no runtime
+      fallback.
+- [ ] Native upstream HTTPS/TLS client is **production-ready against ordinary
+      public HTTPS origins** (#634's actual upstream criterion) — **not yet
+      true, and this is a partial implementation until this box is checked.**
+      Verification currently authenticates only Ed25519, ECDSA P-256/SHA-256,
+      and RSA-PSS/SHA-256 certificate-chain signatures (the pre-existing #343
+      matrix, see the caveat above); a public origin signed with classic RSA
+      PKCS#1 v1.5 — still common among public CAs — or another unsupported
+      algorithm fails closed with a native-profile 502 even with a correct CA
+      bundle and hostname. Tracked by #645.
 - [ ] Native certificate-signature matrix (`src/pki/verify.zig`) extended to
       cover classic RSA PKCS#1 v1.5 (and other common public-WebPKI signature
       variants) so native-profile upstream verification is not restricted to
-      a subset of real-world certificate authorities.
+      a subset of real-world certificate authorities. Closing this item also
+      closes the one directly above (#645).
 - [x] Default downstream identity SAN/SNI eligibility: a default certificate
       may satisfy a requested SNI its own SAN actually covers, without
       requiring an explicit `TARDIGRADE_TLS_SNI_CERTS` entry; explicit
