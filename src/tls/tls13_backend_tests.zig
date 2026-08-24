@@ -2601,6 +2601,98 @@ test "the ClientHello wire-encodes early_data before pre_shared_key only when 0-
     resumed.server_driver = DirectDriver.init(.server, resumed.server_backend.backend());
 }
 
+/// Records the raw `extension_data` of `signature_algorithms` (13) and
+/// `signature_algorithms_cert` (50) from a parsed ClientHello, for #645's
+/// wire-level separation regression below.
+const SignatureAlgorithmsExtensions = struct {
+    signature_algorithms: ?[]const u8 = null,
+    signature_algorithms_cert: ?[]const u8 = null,
+
+    fn observe(ctx: *anyopaque, observation: tls_core.negotiation.ExtensionObservation) tls_core.negotiation.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const sig_algs_id: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.signature_algorithms);
+        const sig_algs_cert_id: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.signature_algorithms_cert);
+        if (observation.id == sig_algs_id) self.signature_algorithms = observation.data;
+        if (observation.id == sig_algs_cert_id) self.signature_algorithms_cert = observation.data;
+    }
+};
+
+/// Whether `scheme`'s wire code point appears in a `signature_algorithms`/
+/// `signature_algorithms_cert` extension's `extension_data` (a 2-byte
+/// `SignatureScheme` vector length followed by the list itself, RFC 8446
+/// §4.2.3).
+fn signatureSchemeListContains(extension_data: []const u8, scheme: tls_core.algorithms.SignatureScheme) !bool {
+    var r = tls_core.messages.Reader{ .bytes = extension_data };
+    var list = tls_core.messages.Reader{ .bytes = try r.slice(try r.u16_()) };
+    try r.expectEnd();
+    const wanted: u16 = @intFromEnum(scheme);
+    while (list.remaining() > 0) {
+        if (try list.u16_() == wanted) return true;
+    }
+    return false;
+}
+
+/// #645 merge-blocking regression: decodes a real client-role ClientHello
+/// message (header included, as `nthInitialCryptoBytes`/`.handshake_bytes`
+/// events capture it) and proves both sides of the RFC 8446 §4.2.3 boundary
+/// this PR must hold — `signature_algorithms` (CertificateVerify) excludes
+/// every `rsa_pkcs1` scheme, while `signature_algorithms_cert`
+/// (certificate-chain signatures) includes both `rsa_pkcs1_sha256` and
+/// `rsa_pkcs1_sha384`. This makes the separation testable directly from the
+/// engine's own wire bytes, rather than relying on an OpenSSL peer's
+/// RFC 8446-permitted-but-not-guaranteed fallback behavior when it cannot
+/// build a chain matching the client's advertised certificate-signature
+/// algorithms.
+fn expectSignatureAlgorithmsCertSeparation(client_hello_raw: []const u8) !void {
+    const message = try tls_core.messages.decode(client_hello_raw);
+    var observer = SignatureAlgorithmsExtensions{};
+    _ = try tls_core.negotiation.parseClientHelloObserved(message.body, .{ .ctx = &observer, .observeFn = SignatureAlgorithmsExtensions.observe });
+
+    const signature_algorithms = observer.signature_algorithms orelse return error.TestExpectedEqual;
+    const signature_algorithms_cert = observer.signature_algorithms_cert orelse return error.TestExpectedEqual;
+
+    try std.testing.expect(!try signatureSchemeListContains(signature_algorithms, .rsa_pkcs1_sha256));
+    try std.testing.expect(!try signatureSchemeListContains(signature_algorithms, .rsa_pkcs1_sha384));
+
+    try std.testing.expect(try signatureSchemeListContains(signature_algorithms_cert, .rsa_pkcs1_sha256));
+    try std.testing.expect(try signatureSchemeListContains(signature_algorithms_cert, .rsa_pkcs1_sha384));
+}
+
+test "#645: signature_algorithms excludes RSA PKCS#1 while signature_algorithms_cert includes it, in both ClientHello1 and ClientHello2" {
+    var client_provider_storage: ProviderStorage = .{};
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        client_provider_storage.init(client_provider_seed),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        // `.empty` initial key share mode deterministically drives a
+        // HelloRetryRequest (see the #484 comment in `sendClientHello`)
+        // without needing a real server, so ClientHello2's own
+        // `signature_algorithms_cert` write (`onHelloRetryRequest`) is
+        // exercised here directly, alongside ClientHello1's.
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    const ch1_raw = nthInitialCryptoBytes(&sink, 0);
+    try expectSignatureAlgorithmsCertSeparation(ch1_raw);
+
+    var hrr_buf: [256]u8 = undefined;
+    const hrr_raw = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = null,
+    }, &hrr_buf);
+    try client.backend().receive(.initial, hrr_raw, &sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, client.core.retry_state);
+    const ch2_raw = nthInitialCryptoBytes(&sink, 1);
+    try expectSignatureAlgorithmsCertSeparation(ch2_raw);
+}
+
 test "early-data intent does not trim a later 1-RTT PSK when identity 0 is resume-only at the ClientHello boundary" {
     var client_provider_storage: ProviderStorage = .{};
     const first_psk = [_]u8{0x41} ** tls_backend.hash_len;
@@ -3220,17 +3312,25 @@ test "record and extension profiles preserve independent traffic-secret goldens"
     // `X25519.KeyPair.generateDeterministic`, so the ECDHE shared secret —
     // and every secret derived from it — legitimately changed. Still fully
     // deterministic; recomputed by capturing this harness's own output.
+    //
+    // #645: both goldens moved again when the client-role ClientHello began
+    // offering `signature_algorithms_cert` (RFC 8446 §4.2.3) — unlike
+    // `record_size_limit` above, this extension is not transport-specific
+    // (it lets a peer know which certificate-chain signature algorithms this
+    // client accepts, independent of record vs QUIC transport), so *both*
+    // profiles' ClientHellos gained it and both transcripts — and therefore
+    // every secret below them — legitimately changed together.
     const record_goldens = [_][tls_backend.hash_len]u8{
-        secretGolden("663e88bfb6fe69034d56689f1825afa53464eb9a7e25f184fd1d4dca038b9a22"),
-        secretGolden("ddd6d6d7b9dd196dd7b9b290ebb15d004efd16e17080cb66cce6e332687a8ba0"),
-        secretGolden("c2702e261bd5db283a6c35315479ac04bdb4a07c466d5160287a7f65762b03cc"),
-        secretGolden("59cc7445ab6f017d6108884c074492b094c6ab8a06cddad3354c94f11dc6f5b2"),
+        secretGolden("fe45c278cea0c44788f4df8af64775e9ec98124d7ca3e4e30ec0098155c809ee"),
+        secretGolden("7fb72273b8871b53766332e885a0f12dc9c371fc3cde429689095a703a6f87e2"),
+        secretGolden("c776ac120c754ea1a59753645006695a0644b56dbf084681fc069a39227b7c05"),
+        secretGolden("13b119f390259feb8fd8b574f750aa2b6121844cbdea38afcdc7d5fed08b4d4e"),
     };
     const extension_goldens = [_][tls_backend.hash_len]u8{
-        secretGolden("77072190f185201fe873979e7041bad67727e1194d2baf8adfdd4ebf99ab10c1"),
-        secretGolden("a9e4c2a45510720ac70302594e138dd07d599b7ca473db7e5b8d5fed9f47e022"),
-        secretGolden("18bee27e9bf23a392bfba4ac122528f47aeabfeb924ca615ce3c2d01ce608e12"),
-        secretGolden("61fe811bb5d5a02a8fa1c9b27dbc68185e66b3ca3f697a70d0644d482966ac55"),
+        secretGolden("b8a440b76f0c45503df079319feb5af700e9959c90c2c4491fd71eb14a8ccad3"),
+        secretGolden("68608487c5dae563617a02d5b060b5199d0d90b034d04c936444e57178557582"),
+        secretGolden("35de4a599812ca338993caa36f7709ae48c8fe67eafd7cf4d300876eaa0e946c"),
+        secretGolden("160c9e5fdd9c9b8410335cb596bd4604613b36e1fb0feafc5c5699a387040cbd"),
     };
     const record_actual = [_][tls_backend.hash_len]u8{
         record.observed.handshake_write_secret[0].?.bytes[0..tls_backend.hash_len].*,
@@ -4516,12 +4616,19 @@ fn findSecretEvent(sink: *const DirectSink, epoch: events.EncryptionEpoch, direc
 /// `record_size_limit`. Both ClientHellos carry the new extension, so the
 /// rebound binder transcript — and therefore every secret below it — changed
 /// with the wire bytes. Nothing about the key schedule itself moved.
-const kat_rebound_transcript_hash = "fb3115c0b053ab6507ece8e0ab58bbe58e2a00d19e63c4b4a17cfe9855380afb";
-const kat_ch2_binder = "9a3afd7699f66a9aaa4b683fea77c1555a64bb8527c57102dc2254d9a83194bc";
-const kat_client_hs_traffic = "b00b934b5a2a5c6ff0c8fcc91f377d9756b4bbbe91a76fc7ad0451180e42ece9";
-const kat_server_hs_traffic = "b3a6cf46713e7b25f67b539c18adf220eef3d4f2dc8ccf45b1c02d71aaaa2058";
-const kat_client_ap_traffic = "7982ae3d8d5555420ee9db003b4072133fd06780202ca4b5aff65a5f5afe716f";
-const kat_server_ap_traffic = "97500698f9c2f3f6be6e966ea363f4f280366c54f1aecac72940b059676e0a39";
+///
+/// #645: repinned again when the client-role ClientHello began offering
+/// `signature_algorithms_cert` (RFC 8446 §4.2.3) — this is record-mode-only
+/// state in this test (`.record` profile), but the extension itself is
+/// transcript input regardless of transport, so the rebound binder transcript
+/// and every derived secret below it legitimately changed once more. Nothing
+/// about the key schedule itself moved.
+const kat_rebound_transcript_hash = "e992e4d90faadafe517a207d8d04b9e2cdc6ff3639535501e75846bf41260cdd";
+const kat_ch2_binder = "e01c75c5dbdb1fd937aa7091ac13cc61dbbc93ff86ed63b7fce7488fc43e0b8d";
+const kat_client_hs_traffic = "f898809ab76193cdbb3072eb1585cacb9bcf3644398e88101442b2e39ae813b2";
+const kat_server_hs_traffic = "e24da47717beb8427a5914bf889469e0f100cdbfd306cff2b87057a70a18949e";
+const kat_client_ap_traffic = "337e7025e70bae719002007b83a140f610d0bfc723c224d26b3a570e5c7d43e3";
+const kat_server_ap_traffic = "6a0ba4d7921d9ac00eaa909e451deb2030eb83420ef16284de858dd61f07db2a";
 
 test "#485 KAT: PSK-resumed HRR handshake/application secrets match an independently computed RFC 8446 key schedule" {
     var client_provider_storage: ProviderStorage = .{};

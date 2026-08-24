@@ -83,20 +83,26 @@ the binary. There is no runtime switch and no fallback between profiles.
   list and `docs/TROUBLESHOOTING.md` for native-profile-specific upstream TLS
   failure modes.
   **Signature algorithm caveat:** chain validation authenticates each
-  certificate's signature through the pre-existing #343 native matrix
-  (`src/pki/verify.zig`), which supports Ed25519, ECDSA P-256/SHA-256, and
-  RSA-PSS/SHA-256 only. Classic `sha256WithRSAEncryption` (RSA PKCS#1 v1.5)
-  and other common public-WebPKI variants (e.g. ECDSA/SHA-384) are not yet
-  supported; a chain signed with one of them fails closed with a verification
-  error, mapped through the same bounded upstream-TLS failure path as any
-  other handshake/certificate failure (see `docs/TROUBLESHOOTING.md`). This is
-  a pre-existing #343 scope limit, not new to this upstream client — but it is
-  now user-visible for arbitrary upstream origins rather than only
-  Tardigrade's own Ed25519/P-256 downstream identities. Extending the native
-  signature matrix to cover RSA PKCS#1 v1.5 (and other common public-CA
-  variants) is tracked separately (#645); until then, native-profile upstream
-  HTTPS is production-ready only against origins whose certificate chain uses
-  one of the three supported signature algorithms.
+  certificate's signature through the native matrix (`src/pki/verify.zig`),
+  originally #343 (Ed25519, ECDSA P-256/SHA-256, RSA-PSS/SHA-256) and
+  extended by #645 to also cover classic `sha256WithRSAEncryption`/
+  `sha384WithRSAEncryption` (RSA PKCS#1 v1.5/SHA-256 and SHA-384) —
+  still-common signature algorithms among public CAs and intermediates. RSA
+  PKCS#1 v1.5 support is certificate-chain-signature verification only: RFC
+  8446 §4.2.3 forbids `rsa_pkcs1` schemes in TLS 1.3 `CertificateVerify`, so
+  the native handshake engine's own proof-of-possession step continues to use
+  only Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 regardless of what
+  algorithm signed the certificate chain (`src/tls/crypto_profile.zig`'s
+  `supportsSignatureScheme` unconditionally refuses to advertise or select
+  it). Other public-WebPKI variants — ECDSA/SHA-384 and RSA PKCS#1 v1.5/
+  SHA-512 among them — remain unsupported; a chain signed with one of them
+  still fails closed with a verification error, mapped through the same
+  bounded upstream-TLS failure path as any other handshake/certificate
+  failure (see `docs/TROUBLESHOOTING.md`). Extending the native signature
+  matrix further (e.g. ECDSA/SHA-384) remains tracked separately; until then,
+  native-profile upstream HTTPS is production-ready only against origins
+  whose certificate chain uses one of the five now-supported signature
+  algorithms.
   **Certificate/handshake size caveat (#646, resolved):** the shared
   handshake engine (`src/tls/tls13_backend.zig`) used to hard-cap every peer
   `CertificateEntry` at `max_certificate_len` (2048 bytes) and the whole
@@ -234,23 +240,25 @@ alongside the release assets and SBOM.
 - [ ] Native upstream HTTPS/TLS client is **production-ready against ordinary
       public HTTPS origins** (#634's actual upstream criterion) — **not yet
       true, and this is a partial implementation until this box is checked.**
-      One remaining tracked gap blocks it:
-      1. Verification currently authenticates only Ed25519, ECDSA
-         P-256/SHA-256, and RSA-PSS/SHA-256 certificate-chain signatures (the
-         pre-existing #343 matrix, see the caveat above); a public origin
-         signed with classic RSA PKCS#1 v1.5 — still common among public CAs
-         — or another unsupported algorithm fails closed with a
-         native-profile 502 even with a correct CA bundle and hostname.
-         Tracked by #645.
-      A second, independent gap — the shared handshake engine's
-      `max_certificate_len`/`max_message_len` bounds rejecting some
-      otherwise-valid, already-supported public certificates/chains purely on
-      size — was resolved by #646 (see the caveat above); #645 is what
-      remains before this box can be checked.
-- [ ] Native certificate-signature matrix (`src/pki/verify.zig`) extended to
-      cover classic RSA PKCS#1 v1.5 (and other common public-WebPKI signature
-      variants) so native-profile upstream verification is not restricted to
-      a subset of real-world certificate authorities (#645).
+      The two gaps this box previously tracked are both now resolved:
+      #645 extended the certificate-signature matrix past the original #343
+      three algorithms, and #646 raised the handshake engine's
+      `max_certificate_len`/`max_message_len` bounds past ordinary public
+      WebPKI norms (see both caveats above). This box stays unchecked because
+      other public-WebPKI signature algorithms (e.g. ECDSA/SHA-384, RSA
+      PKCS#1 v1.5/SHA-512) remain unsupported and still fail closed with a
+      native-profile 502 even with a correct CA bundle and hostname — closing
+      those, or otherwise establishing that the remaining gap is
+      acceptable, is what remains before this box can be checked.
+- [x] Native certificate-signature matrix (`src/pki/verify.zig`) extended to
+      cover classic RSA PKCS#1 v1.5/SHA-256 and SHA-384 (`sha256WithRSAEncryption`/
+      `sha384WithRSAEncryption`) so native-profile upstream verification is not
+      restricted to the original #343 three-algorithm matrix (#645). This is
+      certificate-chain-signature verification only, not a TLS 1.3
+      `CertificateVerify` option — see the signature algorithm caveat above.
+      Other public-WebPKI variants (e.g. ECDSA/SHA-384) remain unsupported;
+      #645 did not claim to close every possible signature algorithm, only
+      the classic RSA PKCS#1 v1.5 gap.
 - [x] Native handshake engine's client-role certificate/message size bounds
       made practical for ordinary public WebPKI chains without weakening the
       fail-closed posture for genuinely oversized ones (#646).

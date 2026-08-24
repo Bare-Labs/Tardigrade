@@ -790,7 +790,13 @@ test "tampered signature, wrong issuer key, and typed signature defects stay dis
     try expectRejected(&malformed_result, .signature_malformed, 0);
 
     var unsupported = fx.certs.items[0];
-    unsupported.signature_algorithm.oid = try oid.ObjectIdentifier.fromComponents(&oid.well_known.sha256_with_rsa);
+    // sha512WithRSAEncryption remains outside the matrix even after #645
+    // added rsa_pkcs1_sha256/384: `resolveScheme` (src/pki/verify.zig)
+    // classifies it as `.rsa_pkcs1_sha512`, which still falls through to the
+    // `else => error.UnsupportedSignatureAlgorithm` arm regardless of issuer
+    // key type — unlike sha256_with_rsa, which #645 made supported and whose
+    // key-type mismatch is exercised as its own distinct case below.
+    unsupported.signature_algorithm.oid = try oid.ObjectIdentifier.fromComponents(&oid.well_known.sha512_with_rsa);
     const unsupported_elements = [_]path_builder.Element{
         .{ .certificate = &unsupported, .source = .leaf, .input_index = 0 },
         tampered_elements[1],

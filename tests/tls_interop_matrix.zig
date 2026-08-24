@@ -67,6 +67,7 @@ pub fn signatureSchemeName(scheme: SignatureScheme) []const u8 {
         .ecdsa_secp256r1_sha256 => "ecdsa-p256-sha256",
         .rsa_pss_rsae_sha256 => "rsa-pss-rsae-sha256",
         .rsa_pkcs1_sha256 => "rsa-pkcs1-sha256",
+        .rsa_pkcs1_sha384 => "rsa-pkcs1-sha384",
     };
 }
 
@@ -110,7 +111,7 @@ pub fn identityKeyForSignature(scheme: SignatureScheme) tls_policy.IdentityKey {
     return switch (scheme) {
         .ed25519 => .ed25519,
         .ecdsa_secp256r1_sha256 => .ecdsa_secp256r1,
-        .rsa_pss_rsae_sha256, .rsa_pkcs1_sha256 => .rsa,
+        .rsa_pss_rsae_sha256, .rsa_pkcs1_sha256, .rsa_pkcs1_sha384 => .rsa,
     };
 }
 
