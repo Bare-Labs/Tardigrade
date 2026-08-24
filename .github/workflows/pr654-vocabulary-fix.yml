@@ -26,17 +26,16 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          def replace(path: str, old: str, new: str, expected: int = 1) -> None:
+          def replace(path: str, old: str, new: str) -> None:
               p = Path(path)
               text = p.read_text()
-              found = text.count(old)
-              if found != expected:
-                  raise SystemExit(f"{path}: expected {expected} occurrence(s) of {old!r}, found {found}")
+              if old not in text:
+                  raise SystemExit(f"{path}: expected stale text not found: {old!r}")
               p.write_text(text.replace(old, new))
 
           replace("docs/UPSTREAM_POOLING.md", "src/http/tls_termination.zig", "src/http/upstream_tls.zig")
           replace("src/http/upstream_pool.zig", "entry owns the OpenSSL connection;", "entry owns the native `UpstreamTlsConn`;")
-          replace("src/http/upstream_pool.zig", "`tls` holds the heap-owned OpenSSL connection (allocated with the pool's", "`tls` holds the heap-owned native `UpstreamTlsConn` (allocated with the pool's")
+          replace("src/http/upstream_pool.zig", "`tls` holds the heap-owned OpenSSL connection", "`tls` holds the heap-owned native `UpstreamTlsConn`")
 
           replace(
               "src/http/upstream_h2.zig",
@@ -44,38 +43,30 @@ jobs:
               "//! `read([]u8) !usize`, `writeAll([]const u8) !void`, and `pending() usize`.\n//! `pending()` reports already-decrypted plaintext buffered by the transport,\n//! so poll-bounded reads do not miss bytes already available above the socket.\n//! Reads are bounded with `poll(2)` so a hung origin cannot block a worker\n//! indefinitely (the #196 guarantee).",
           )
 
-          replace(
-              "src/edge_config.zig",
-              "/// (#392). Required (and strictly validated) in the appliance TLS profile;\n    /// unused by the general OpenSSL terminator.",
-              "/// (#392). Required (and strictly validated) in the appliance TLS profile;\n    /// not used by the general profile.",
-          )
+          replace("src/edge_config.zig", "unused by the general OpenSSL terminator.", "not used by the general profile.")
           replace(
               "src/edge_config.zig",
               "/// Deliberately distinct from the `tls_session_*`/`tls_session_tickets_*`\n    /// fields above, which remain OpenSSL-facing only — native settings\n    /// affect only the native TLS-over-TCP and QUIC/H3 engines and must\n    /// never be conflated with the OpenSSL terminator's own session config.",
               "/// Deliberately distinct from the `tls_session_*`/`tls_session_tickets_*`\n    /// fields above, which are retired legacy knobs rejected by native builds.\n    /// These settings configure the native TLS-over-TCP and QUIC/H3 engines and\n    /// remain separate from those unsupported compatibility fields.",
           )
 
-          replace("src/edge_gateway.zig", "// HTTP, OpenSSL-only, resumption-disabled, or replay-mode-disabled", "// HTTP, no-native-TLS-path, resumption-disabled, or replay-mode-disabled")
-          replace("src/edge_gateway.zig", "/// sufficient — a native (non-OpenSSL) TLS backend that could ever accept", "/// sufficient — a native TLS path that could ever accept")
+          replace("src/edge_gateway.zig", "HTTP, OpenSSL-only, resumption-disabled, or replay-mode-disabled", "HTTP, no-native-TLS-path, resumption-disabled, or replay-mode-disabled")
+          replace("src/edge_gateway.zig", "a native (non-OpenSSL) TLS backend that could ever accept", "a native TLS path that could ever accept")
           replace(
               "src/edge_gateway.zig",
               "/// The OpenSSL terminator owns its own independent session cache and never\n/// consults this seam at all, so plain HTTP, OpenSSL-only, or\n/// resumption-disabled deployments must never gain the configured-entry\n/// allocation or a new startup-failure path for a security feature they\n/// cannot use.",
               "/// Plain HTTP or configurations without a native TLS/QUIC credential path do\n/// not consult this seam, so those and resumption-disabled deployments must\n/// never gain the configured-entry allocation or a new startup-failure path\n/// for a security feature they cannot use.",
           )
-          replace(
-              "src/edge_gateway.zig",
-              "/// never construct a store, even when a native path exists, so plain HTTP,\n/// OpenSSL-only, resumption-disabled, or explicitly opted-out deployments",
-              "/// never construct a store, even when a native path exists, so plain HTTP,\n/// no-native-TLS-path, resumption-disabled, or explicitly opted-out deployments",
-          )
+          replace("src/edge_gateway.zig", "OpenSSL-only, resumption-disabled, or explicitly opted-out deployments", "no-native-TLS-path, resumption-disabled, or explicitly opted-out deployments")
           replace(
               "src/edge_gateway.zig",
               "// OpenSSL-only TCP with HTTP/3 disabled: native resumption enabled, but\n    // neither a native TCP provider nor an eligible H3 path exists.",
               "// No native TCP credential provider and HTTP/3 disabled: resumption may be\n    // enabled in config, but no native PSK/early-data path can exist.",
           )
 
-          replace("src/http/negotiated_dispatch.zig", 'test "shared runtime dispatch accepts OpenSSL-shaped and EncryptedStream connection shapes" {', 'test "shared runtime dispatch accepts generic and EncryptedStream connection shapes" {')
-          replace("src/http/negotiated_dispatch.zig", "TestOpenSslConn", "TestGenericConn", expected=5)
-          replace("src/http/negotiated_dispatch.zig", "openssl_conn", "generic_conn", expected=4)
+          replace("src/http/negotiated_dispatch.zig", "OpenSSL-shaped and EncryptedStream connection shapes", "generic and EncryptedStream connection shapes")
+          replace("src/http/negotiated_dispatch.zig", "TestOpenSslConn", "TestGenericConn")
+          replace("src/http/negotiated_dispatch.zig", "openssl_conn", "generic_conn")
 
           checks = {
               "docs/UPSTREAM_POOLING.md": ["src/http/tls_termination.zig"],
