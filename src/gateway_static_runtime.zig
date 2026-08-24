@@ -467,7 +467,7 @@ test "writeStaticServedResponse: compresses buffered body when compression enabl
     const config: http.compression.CompressionConfig = .{
         .enabled = true,
         .min_size = 64, // lower than body.len
-        .brotli_enabled = false, // deterministic: brotli requires a shared lib at runtime
+        .brotli_enabled = false,
     };
 
     // Simulate the compression path in writeStaticServedResponse.

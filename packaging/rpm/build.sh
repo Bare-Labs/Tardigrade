@@ -2,11 +2,11 @@
 # Build an RPM package for Tardigrade.
 #
 # Usage:
-#   ./packaging/rpm/build.sh [--version VERSION] [--arch ARCH] [--binary PATH] [--tls-backend BACKEND] [--output DIR]
+#   ./packaging/rpm/build.sh [--version VERSION] [--arch ARCH] [--binary PATH] [--tls-backend native] [--output DIR]
 #
 # ARCH accepts Debian-style names (amd64, arm64) or RPM-style (x86_64, aarch64).
-# --tls-backend accepts native or openssl-adapter. When omitted, it is inferred
-# from an executable host-native binary's `tardi version` output.
+# --tls-backend must be native when supplied. When omitted, it is inferred from
+# an executable host-native binary's `tardi version` output.
 # Prerequisites:
 #   rpm-build (dnf install rpm-build / apt-get install rpm-build)
 #   A pre-built tardi binary
@@ -51,29 +51,27 @@ fi
 # Keep package metadata aligned with the exact artifact being packaged.
 # Host-native binaries (including the official release binary after its native
 # linkage audit) are inferred from their self-report. Cross-compiled binaries
-# remain packageable by passing the backend explicitly rather than attempting
-# to infer it by executing a foreign-architecture file.
+# remain packageable by passing the native backend explicitly rather than
+# attempting to infer it by executing a foreign-architecture file.
 if [[ -z "$TLS_BACKEND" ]]; then
     if [[ ! -x "$BINARY" ]]; then
-        echo "Binary is not executable on this host; pass --tls-backend native or --tls-backend openssl-adapter" >&2
+        echo "Binary is not executable on this host; pass --tls-backend native" >&2
         exit 1
     fi
     BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
     case "$BINARY_VERSION_OUTPUT" in
         *"tls-backend=native"*) TLS_BACKEND="native" ;;
-        *"tls-backend=openssl-adapter"*) TLS_BACKEND="openssl-adapter" ;;
         *)
-            echo "Unable to determine TLS backend from '$BINARY version'; pass --tls-backend explicitly" >&2
+            echo "Unable to determine native TLS backend from '$BINARY version'; pass --tls-backend native explicitly" >&2
             exit 1
             ;;
     esac
 fi
 
 case "$TLS_BACKEND" in
-    native) RPM_REQUIRES_OPENSSL=0 ;;
-    openssl-adapter) RPM_REQUIRES_OPENSSL=1 ;;
+    native) ;;
     *)
-        echo "Invalid --tls-backend '$TLS_BACKEND' (expected native or openssl-adapter)" >&2
+        echo "Invalid --tls-backend '$TLS_BACKEND' (expected native)" >&2
         exit 1
         ;;
 esac
@@ -118,7 +116,6 @@ LREOF
 rpmbuild --define "_topdir ${WORK_DIR}" \
          --define "version ${VERSION}" \
          --define "build_arch ${RPM_ARCH}" \
-         --define "tardigrade_requires_openssl ${RPM_REQUIRES_OPENSSL}" \
          --define "_unitdir /usr/lib/systemd/system" \
          --target "${RPM_ARCH}-linux" \
          -bb "${WORK_DIR}/SPECS/tardigrade.spec"

@@ -8,8 +8,8 @@
 #   --version VERSION       Package version (default: inferred from `git describe`)
 #   --arch ARCH             Target architecture: amd64 or arm64 (default: host arch)
 #   --binary PATH           Path to pre-built tardi binary (default: zig-out/bin/tardi)
-#   --tls-backend BACKEND   native or openssl-adapter. When omitted, infer from
-#                           the executable binary's `tardi version` output.
+#   --tls-backend BACKEND   must be native when supplied. When omitted, infer
+#                           from the executable binary's `tardi version` output.
 #   --output DIR            Output directory for .deb file (default: dist/)
 #
 # Prerequisites:
@@ -59,29 +59,26 @@ fi
 # Host-native binaries (including the official release binary after its native
 # linkage audit) are inferred from their self-report. Cross-compiled binaries
 # that cannot execute on the packaging host remain supported by passing
-# --tls-backend explicitly instead of guessing from the target filename.
+# --tls-backend native explicitly instead of guessing from the target filename.
 if [[ -z "$TLS_BACKEND" ]]; then
     if [[ ! -x "$BINARY" ]]; then
-        echo "Binary is not executable on this host; pass --tls-backend native or --tls-backend openssl-adapter" >&2
+        echo "Binary is not executable on this host; pass --tls-backend native" >&2
         exit 1
     fi
     BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
     case "$BINARY_VERSION_OUTPUT" in
         *"tls-backend=native"*) TLS_BACKEND="native" ;;
-        *"tls-backend=openssl-adapter"*) TLS_BACKEND="openssl-adapter" ;;
         *)
-            echo "Unable to determine TLS backend from '$BINARY version'; pass --tls-backend explicitly" >&2
+            echo "Unable to determine native TLS backend from '$BINARY version'; pass --tls-backend native explicitly" >&2
             exit 1
             ;;
     esac
 fi
 
-OPENSSL_DEPENDS=""
 case "$TLS_BACKEND" in
     native) ;;
-    openssl-adapter) OPENSSL_DEPENDS="Depends: libssl3 | libssl1.1" ;;
     *)
-        echo "Invalid --tls-backend '$TLS_BACKEND' (expected native or openssl-adapter)" >&2
+        echo "Invalid --tls-backend '$TLS_BACKEND' (expected native)" >&2
         exit 1
         ;;
 esac
@@ -150,8 +147,8 @@ cat > "${DEBIAN_DIR}/conffiles" <<'CONFEOF'
 /etc/tardigrade/tardigrade.env
 CONFEOF
 
-# DEBIAN/control. Do not emit a blank paragraph when the native package has no
-# OpenSSL dependency: Debian control-file paragraphs are separated by blanks.
+# DEBIAN/control. The native-only package has no foreign implementation runtime
+# dependency; Debian control-file paragraphs are separated by blanks.
 cat > "${DEBIAN_DIR}/control" <<CONTROL
 Package: tardigrade
 Version: ${VERSION}
@@ -159,9 +156,6 @@ Architecture: ${ARCH}
 Maintainer: Bare Systems <security@baresystems.dev>
 Installed-Size: $(du -sk "$BIN_DIR" | awk '{print $1}')
 CONTROL
-if [[ -n "$OPENSSL_DEPENDS" ]]; then
-    printf '%s\n' "$OPENSSL_DEPENDS" >> "${DEBIAN_DIR}/control"
-fi
 cat >> "${DEBIAN_DIR}/control" <<CONTROL
 Section: net
 Priority: optional

@@ -82,15 +82,14 @@ jobs:
           ruby -c packaging/homebrew/tardigrade.rb
           ./scripts/test-homebrew-tap-sync.sh
 
-  # ── TLS dependency audit ──────────────────────────────────────────────────────
-  # Enforces the external-library policy (#379, #649): forbidden TLS/crypto/QUIC/H3
-  # dependency names must not be configured, OpenSSL must not appear anywhere in
-  # production source, native paths must be @cImport-free, and produced
-  # appliance/general artifacts (both native-only since #649) must have the
-  # expected no-foreign-linkage. This is a required v0.5 release gate for the
-  # Bare Systems appliance (#391).
+  # ── Production dependency audit ───────────────────────────────────────────────
+  # Enforces the external-library policy (#379, #649, #651): shipping `tardi`
+  # source/build/package/container surfaces may use Zig, Zig stdlib, reviewed
+  # pure-Zig packages, and narrow OS/platform ABI substrate, but no foreign
+  # product implementation boundary. Produced appliance/general artifacts (both
+  # native-only since #649) must have the expected no-foreign-linkage.
   dependency-audit:
-    name: TLS dependency audit
+    name: Production dependency audit (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -102,6 +101,9 @@ jobs:
 
       - name: Source and configuration audit
         run: ./scripts/audit-dependencies.sh
+
+      - name: Source audit regression fixtures
+        run: ./scripts/audit-dependencies.sh --self-test
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -130,8 +132,41 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dependency-inventory
+          name: dependency-inventory-linux
           path: ${{ runner.temp }}/dependency-inventory-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-audit-darwin:
+    name: Production binary audit (macOS)
+    runs-on: macos-14
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Build general profile (default, no OpenSSL since #649)
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=general
+
+      - name: Audit general artifact linkage
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardi \
+            --profile general \
+            --output "$RUNNER_TEMP/dependency-inventory-darwin-general.json"
+
+      - name: Upload dependency inventory
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-inventory-darwin
+          path: ${{ runner.temp }}/dependency-inventory-darwin-general.json
           if-no-files-found: error
           retention-days: 14
 

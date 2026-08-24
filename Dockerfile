@@ -7,7 +7,7 @@ FROM debian@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl xz-utils libssl-dev \
+        ca-certificates curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -17,8 +17,8 @@ COPY . .
 RUN sh ./scripts/install-zig.sh 0.16.0 /opt/zig \
     && ln -s "$(find /opt/zig -maxdepth 3 -type f -name zig)" /usr/local/bin/zig
 
-# Default "general" TLS profile: links the approved OpenSSL adapter (see
-# docs/TLS_DEPENDENCY_POLICY.md). Requires libssl-dev above.
+# Default "general" TLS profile: pure-Zig native implementation, with no
+# OpenSSL build or runtime dependency.
 RUN zig build -Doptimize=ReleaseFast
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ ARG TARDIGRADE_UID=10001
 ARG TARDIGRADE_GID=10001
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid "$TARDIGRADE_GID" tardigrade \
     && useradd --system --uid "$TARDIGRADE_UID" --gid "$TARDIGRADE_GID" \

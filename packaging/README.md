@@ -11,12 +11,12 @@ versus what is a local-build-only tool.
 | --- | --- | --- |
 | Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, per-arch SPDX SBOMs, dependency inventories, and provenance. Releases containing #476 build these official artifacts with the default `-Dtls-profile=general` (pure-Zig native since #649); older already-published releases may predate that cutover. |
 | macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Implemented in #476; awaiting first release** | #476 adds `macos-15-intel` and `macos-15` release rows for `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux. Both rows build with the default `-Dtls-profile=general` (pure-Zig native since #649) without Homebrew OpenSSL, audit out foreign TLS/crypto/QUIC/H3 linkage, assert the Mach-O architecture, package/extract the archive, verify native build identity, run a real static-site startup/request smoke from the extracted artifact, and exercise the checksum-verifying installer path. The currently published latest release still predates #476, so these assets are not public until the first intentional release containing it. |
-| DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. Host-native builds infer dependency metadata from `tardi version`; cross-compiled binaries can declare `--tls-backend native|openssl-adapter` explicitly. Native binaries declare no OpenSSL runtime dependency, while a transitional local `general`/OpenSSL binary still gets the dependency it actually needs. |
-| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Host-native builds infer the backend and cross-compiled builds can pass it explicitly. The spec's OpenSSL runtime dependency is conditional on the packaged binary/backend; official native release packages do not declare it. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
+| DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. Host-native builds infer native dependency metadata from `tardi version`; cross-compiled binaries can pass `--tls-backend native` explicitly. Packages declare no OpenSSL runtime dependency. |
+| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Host-native builds infer the native backend and cross-compiled builds can pass `--tls-backend native` explicitly. The spec declares no OpenSSL runtime dependency. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **CI-validated user LaunchAgent template** | The Darwin release-smoke workflow renders the checked-in host-style `/usr/local/...` template into an isolated prefix on the `macos-15` Apple Silicon runner, stages the native Darwin archive's `tardi` binary plus `tardigrade -> tardi` compatibility alias, and proves a real `launchctl bootstrap` -> readiness/request -> `bootout` lifecycle in the current user's launchd domain. |
 | Homebrew (`packaging/homebrew/tardigrade.rb`) | **Preparatory; awaiting native release** | `scripts/update-homebrew-formula.sh` renders the formula from one release tag and verifies the referenced archives exist in that same release. The current public `v0.5.0` release predates the native #634 shipping cutover and old/new archive-layout switch, so it must not be used for the public tap formula. Generate and publish the tap formula only after a release publishes native audited archives with canonical `tardi` plus the `tardigrade` alias. |
-| Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. Docker's remaining OpenSSL cutover is tracked by #634 and is separate from the raw release/archive lane in #476. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
+| Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a native-only runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
 
 ## Official release implementation
 
@@ -28,17 +28,17 @@ zig build -Doptimize=ReleaseFast -Dversion=<version>
 ```
 
 The release workflow audits each produced binary with
-`scripts/audit-release-binary.sh --profile native`. That audit fails if the
+`scripts/audit-release-binary.sh --profile general`. That audit fails if the
 artifact links `libssl`, `libcrypto`, or another forbidden foreign
 TLS/crypto/QUIC/H3 implementation and verifies that `tardi version` reports
-`tls-profile=native, tls-backend=native`.
+`tls-profile=general, tls-backend=native`.
 
 Linux DEB/RPM packages are built from that same audited host-native binary. The
 package builders infer its backend from `tardi version`, and the release job then
 inspects the resulting package metadata and fails if either native package
 declares an OpenSSL/libssl/libcrypto runtime dependency. Local cross-compiled
-packages can provide `--tls-backend native|openssl-adapter` explicitly when the
-target binary cannot execute on the packaging host.
+packages can provide `--tls-backend native` explicitly when the target binary
+cannot execute on the packaging host.
 
 ## Quick install (recommended)
 
@@ -122,11 +122,9 @@ sudo systemctl enable --now tardigrade
 
 When `--tls-backend` is omitted, the DEB builder infers it from an executable
 host-native binary's `tardi version` output. Native binaries have no OpenSSL
-package dependency; a transitional local binary reporting
-`tls-backend=openssl-adapter` gets `Depends: libssl3 | libssl1.1`. Unknown
-backends fail rather than generating ambiguous dependency metadata. For a
-foreign-architecture binary, pass `--tls-backend native` or
-`--tls-backend openssl-adapter` explicitly.
+package dependency. Unknown or retired backend reports fail rather than
+generating ambiguous dependency metadata. For a foreign-architecture binary,
+pass `--tls-backend native` explicitly.
 
 The DEB package:
 - Installs the binary to `/usr/bin/tardi`
@@ -191,10 +189,10 @@ sudo rpm -i dist/tardigrade-0.50-1.x86_64.rpm
 sudo systemctl enable --now tardigrade
 ```
 
-Like the DEB builder, the RPM builder auto-detects the backend for executable
-host-native binaries and accepts an explicit backend for cross-compiled input.
-Native binaries omit `Requires: openssl-libs`; a local transitional
-OpenSSL-adapter binary retains it, and an unknown backend fails packaging.
+Like the DEB builder, the RPM builder auto-detects the native backend for
+executable host-native binaries and accepts `--tls-backend native` for
+cross-compiled input. Packages have no OpenSSL runtime requirement; an unknown
+or retired backend fails packaging.
 
 Like the DEB package, the RPM installs a starter
 `/etc/tardigrade/tardigrade.conf`, creates `/var/lib/tardigrade` (the
@@ -215,9 +213,9 @@ docker compose up -d
 ```
 
 The current image is a multi-stage build (Zig toolchain in the build stage,
-`tardi` plus its current runtime dependencies in the final stage) that runs as
-a non-root `tardigrade` user. Docker's native-only shipping cutover is tracked
-separately by #634; #476 does not claim that local image is already migrated.
+`tardi` plus CA certificates in the final stage) that runs as a non-root
+`tardigrade` user. It uses the same native-only production implementation
+boundary as the release archives and packages.
 See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the complete Docker workflow
 — build, config validation, start, reload, and graceful stop — alongside the
 equivalent systemd path.

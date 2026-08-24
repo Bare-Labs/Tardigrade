@@ -308,9 +308,8 @@ pinned Zig toolchain (matching `.github/workflows/ci.yml`) and the default
 build or run `tardi` itself (see
 [TLS_DEPENDENCY_POLICY.md](TLS_DEPENDENCY_POLICY.md)); the runtime stage
 contains only `tardi`, CA-certificate data, and a non-root `tardigrade`
-user. No Zig toolchain or source tree ships in the final image. The
-Dockerfile's own OpenSSL package installs predate #649 and are tracked as
-distribution cleanup separately from this cutover (#634).
+user. No Zig toolchain, source tree, OpenSSL package, or other foreign
+implementation library ships in the final image.
 
 ### Build
 
