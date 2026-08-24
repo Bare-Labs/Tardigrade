@@ -17919,12 +17919,19 @@ test "native upstream https: verification disabled succeeds against the same unt
     });
     defer tardigrade.stop();
 
+    // 20s, not this file's usual 10s: unlike the neighboring fail-closed
+    // tests (which only need the handshake to fail fast), this one needs a
+    // full successful handshake plus response through two stacked native
+    // TLS listeners (this test's own `tardigrade` proxying to a full second
+    // `startNativeUpstreamTardigrade` process), which observably ran past
+    // 10s on loaded macOS CI runners while never doing so locally or on
+    // Linux runners.
     var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
         .method = "GET",
         .path = "/secure/upstream-body",
         .body = null,
         .headers = &.{},
-    }, 10_000);
+    }, 20_000);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try assertContains(response.body, "native-upstream-insecure-body");
@@ -17957,13 +17964,18 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     });
     defer tardigrade.stop();
 
+    // 20s per request, not this file's usual 10s: same reasoning as the
+    // neighboring "verification disabled" test above (a full successful
+    // handshake through two stacked native TLS listeners observably ran
+    // past 10s on loaded macOS CI runners), doubled here since this loop
+    // does it twice.
     for (0..2) |_| {
         var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
             .method = "GET",
             .path = "/secure/upstream-body",
             .body = null,
             .headers = &.{},
-        }, 10_000);
+        }, 20_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status_code);
     }
