@@ -147,7 +147,7 @@ run the exact same parser and produce the same errors.
 | Certificate file size | 256 KiB |
 | Private-key file size | 64 KiB |
 | Chain entries | 8 |
-| Single certificate DER | 2048 bytes (the TLS writer bound) |
+| Single certificate DER | 8192 bytes (the TLS writer bound, `max_certificate_len`, #646) |
 | Encoded TLS Certificate flight | `max_message_len` minus the writer's own worst-case non-certificate flight cost |
 
 The flight bound is preflighted **before publication** using the TLS

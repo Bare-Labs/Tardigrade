@@ -663,13 +663,15 @@ extended further, such an origin needs `-Dtls-profile=general` (OpenSSL) to
 be proxied with verification enabled.
 
 Independently of signature support, the native handshake engine also caps
-each peer certificate entry at 2048 DER bytes and the whole handshake
-message at 8 KiB (`src/tls/tls13_backend.zig`'s `max_certificate_len`/
-`max_message_len`). An origin whose certificate/chain exceeds either bound
-fails closed here even with an otherwise-supported signature algorithm — a
-plain Ed25519 leaf with a large SAN set, or a multi-certificate chain, can
-cross this. Same remedy as above: `-Dtls-profile=general` until the bound is
-raised.
+each peer certificate entry at 8 KiB DER bytes and the whole handshake
+message at 16 KiB (`src/tls/tls13_backend.zig`'s `max_certificate_len`/
+`max_message_len`, #646) — generous enough for ordinary public WebPKI
+certificates/chains, including a leaf with a large SAN set, but still a
+deliberate ceiling. An origin whose certificate/chain genuinely exceeds
+either bound fails closed here even with an otherwise-supported signature
+algorithm; that is expected for a chain this far outside ordinary norms, not
+a bug, and disabling verification does not help (the bound applies before
+verification runs).
 
 #### Verify the fix
 

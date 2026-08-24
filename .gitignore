@@ -28,6 +28,7 @@ secrets.txt
 !tests/fixtures/tls/client.key
 !tests/fixtures/tls/rogue_ca.key
 !tests/fixtures/tls/rogue_client.key
+!tests/fixtures/tls/native_ed25519_bigsan_ca.key
 
 # Agent Context
 changes/

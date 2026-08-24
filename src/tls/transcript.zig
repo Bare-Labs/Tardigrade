@@ -54,11 +54,17 @@ pub const max_digest_len = provider.max_digest_len;
 
 /// One framed handshake message's worth of pre-selection buffering — see
 /// "Bounding the pre-selection buffer" above. Exactly
-/// `tls13_backend.max_message_len` (8 KiB) plus its 4-byte handshake
+/// `tls13_backend.max_message_len` (#646: 16 KiB) plus its 4-byte handshake
 /// header — the same bound the reassembler already admits a single
 /// handshake message up to, so a legitimate ClientHello the engine accepts
 /// can never itself overflow this buffer before its suite is known.
-pub const max_pending_len: usize = 8 * 1024 + 4;
+///
+/// This module cannot import `tls13_backend.zig` to reference that constant
+/// directly (that module already imports this one), so the value is
+/// duplicated here as a literal; `tls13_backend.zig` asserts at comptime
+/// that the two stay in sync, so a future change to one without the other
+/// fails the build rather than silently reopening a size bug.
+pub const max_pending_len: usize = 16 * 1024 + 4;
 
 pub const Error = error{TranscriptOverflow};
 

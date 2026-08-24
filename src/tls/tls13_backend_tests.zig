@@ -2700,9 +2700,12 @@ test "early-data intent does not trim a later 1-RTT PSK when identity 0 is resum
     const one_byte_ticket = [_]u8{'a'};
     const max_ticket = [_]u8{'b'} ** session.Limits.default.max_ticket_len;
 
-    var long_names: [16][255]u8 = undefined;
-    var alpns: [16]tls_core.policy.ProtocolName = undefined;
-    for (long_names[0..15], 0..) |*name, i| {
+    // #646: sized so the ClientHello's maximum extent (`trial_len == 255`)
+    // still clears `max_message_len` (16 KiB) — otherwise the boundary this
+    // test searches for would never be crossed within the loop below.
+    var long_names: [48][255]u8 = undefined;
+    var alpns: [48]tls_core.policy.ProtocolName = undefined;
+    for (long_names[0..47], 0..) |*name, i| {
         @memset(name, @intCast(i + 1));
         alpns[i] = .{ .bytes = name[0..255] };
     }
@@ -2710,8 +2713,8 @@ test "early-data intent does not trim a later 1-RTT PSK when identity 0 is resum
     var found_boundary = false;
     var trial_len: usize = 1;
     while (trial_len <= 255 and !found_boundary) : (trial_len += 1) {
-        @memset(&long_names[15], 0xaa);
-        alpns[15] = .{ .bytes = long_names[15][0..trial_len] };
+        @memset(&long_names[47], 0xaa);
+        alpns[47] = .{ .bytes = long_names[47][0..trial_len] };
 
         var policy = tls_core.policy.Policy.recordDefault();
         policy.alpn_protocols = &alpns;
@@ -4350,10 +4353,10 @@ test "#485 an oversized ClientHello2 PSK offer fails locally and wipes all retai
 
     // Eight identities (the offer-set maximum), each well under
     // `session.Limits.default.max_ticket_len` individually, but packed close
-    // enough to `max_message_len` in total that ClientHello1 still fits
-    // while ClientHello2 — the same offer plus a real key share and a large
-    // HRR cookie — no longer does.
-    const item_identity = [_]u8{'x'} ** 950;
+    // enough to `max_message_len` (#646: 16 KiB) in total that ClientHello1
+    // still fits while ClientHello2 — the same offer plus a real key share
+    // and a large HRR cookie — no longer does.
+    const item_identity = [_]u8{'x'} ** 1950;
     var tickets: [pre_shared_key.max_offered_identities]session.ClientTicketState = undefined;
     for (&tickets) |*t| t.* = try makeCacheTicket(&([_]u8{0x5a} ** tls_backend.hash_len), &item_identity);
     defer for (&tickets) |*t| t.deinit();
@@ -4428,10 +4431,10 @@ test "#564 a near-max-size ClientHello1 followed by an ordinary ServerHello does
         .record,
     );
     defer client.deinit();
-    // Same 950-byte/8-identity shape the oversized-CH2 regression above
+    // Same 1950-byte/8-identity shape the oversized-CH2 regression above
     // uses, which that test's own comment establishes packs ClientHello1
-    // close to `max_message_len` (8 KiB).
-    try offerNearMaxClientHello(&client, 950);
+    // close to `max_message_len` (#646: 16 KiB).
+    try offerNearMaxClientHello(&client, 1950);
 
     var sink = DirectSink{};
     defer sink.deinit();
@@ -4464,10 +4467,10 @@ test "#564 a near-max-size ClientHello1 followed by a HelloRetryRequest does not
     // Smaller than the ordinary-ServerHello case above: ClientHello2 must
     // re-offer the same identities *plus* a real key share, so this leaves
     // enough headroom for that regrowth to still fit under
-    // `max_message_len` — this test is about the transcript's buffering
-    // bound, not the unrelated ClientHello2 local size guard the
-    // oversized-CH2 regression exercises deliberately.
-    try offerNearMaxClientHello(&client, 900);
+    // `max_message_len` (#646: 16 KiB) — this test is about the
+    // transcript's buffering bound, not the unrelated ClientHello2 local
+    // size guard the oversized-CH2 regression exercises deliberately.
+    try offerNearMaxClientHello(&client, 1900);
 
     var sink = DirectSink{};
     defer sink.deinit();
@@ -12303,9 +12306,10 @@ const BigChainProvider = struct {
 
 test "the server flight preflight rejects a chain that fits entries but overflows with framing" {
     var server_provider_storage: ProviderStorage = .{};
-    // Four 2043-byte entries sum to exactly max_message_len once each entry's
-    // 5-byte framing is added, but the Certificate message header pushes it over.
-    var big = BigChainProvider{ .entry_len = 2043, .entry_count = 4 };
+    // Four entries sum to exactly max_message_len once each entry's 5-byte
+    // framing is added, but the Certificate message header pushes it over.
+    const entry_len = tls_backend.max_message_len / 4 - tls_backend.certificate_entry_overhead;
+    var big = BigChainProvider{ .entry_len = entry_len, .entry_count = 4 };
     var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), server_provider_storage.init(server_provider_seed), big.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
@@ -12321,7 +12325,11 @@ test "the server flight preflight rejects a chain that fits entries but overflow
 test "the client flight preflight rejects a chain that overflows with the message header" {
     var server_auth_provider_storage: ProviderStorage = .{};
     var client_provider_storage: ProviderStorage = .{};
-    var big = BigChainProvider{ .entry_len = 2043, .entry_count = 4 };
+    // See the server-flight sibling test above for why this is the exact
+    // per-entry size that overflows the Certificate message once its
+    // header is counted.
+    const entry_len = tls_backend.max_message_len / 4 - tls_backend.certificate_entry_overhead;
+    var big = BigChainProvider{ .entry_len = entry_len, .entry_count = 4 };
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         client_provider_storage.init(client_provider_seed),
