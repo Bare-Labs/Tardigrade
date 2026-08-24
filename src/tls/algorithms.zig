@@ -41,6 +41,12 @@ pub const NamedGroup = enum(u16) {
 pub const SignatureScheme = enum(u16) {
     rsa_pkcs1_sha256 = 0x0401,
     ecdsa_secp256r1_sha256 = 0x0403,
+    /// Certificate-chain-signature-only wire value (#645): valid in
+    /// `signature_algorithms_cert`, never in `signature_algorithms`/
+    /// CertificateVerify (RFC 8446 §4.2.3 forbids `rsa_pkcs1` there). See
+    /// `src/tls/crypto_profile.zig`'s `supportsSignatureScheme`, which
+    /// unconditionally refuses this for the CertificateVerify seam.
+    rsa_pkcs1_sha384 = 0x0501,
     rsa_pss_rsae_sha256 = 0x0804,
     ed25519 = 0x0807,
 };
@@ -59,6 +65,12 @@ pub const ExtensionType = enum(u16) {
     supported_versions = 43,
     cookie = 44,
     psk_key_exchange_modes = 45,
+    /// RFC 8446 §4.2.3. Certificate-chain-signature algorithms a client will
+    /// accept, distinct from `signature_algorithms` (CertificateVerify).
+    /// Client-role only (#645): the native upstream TLS client sends this so
+    /// a conforming origin knows an RSA-PKCS#1-signed chain is acceptable
+    /// even though `signature_algorithms` itself never advertises it.
+    signature_algorithms_cert = 50,
     key_share = 51,
     quic_transport_parameters = 57,
 };

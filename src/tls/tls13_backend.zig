@@ -312,6 +312,7 @@ const ext_key_share: u16 = @intFromEnum(tls_algorithms.ExtensionType.key_share);
 const ext_early_data: u16 = @intFromEnum(tls_algorithms.ExtensionType.early_data);
 const ext_cookie: u16 = @intFromEnum(tls_algorithms.ExtensionType.cookie);
 const ext_record_size_limit: u16 = record_size.extension_type;
+const ext_signature_algorithms_cert: u16 = @intFromEnum(tls_algorithms.ExtensionType.signature_algorithms_cert);
 pub const max_transport_extension_len = 512;
 
 const native_protocol_versions = [_]tls_algorithms.ProtocolVersion{.tls13};
@@ -335,6 +336,26 @@ const native_named_groups = [_]tls_algorithms.NamedGroup{ .x25519, .secp256r1 };
 /// `crypto_profile.zig`'s `enabled_product_profiles`, which the appliance
 /// product deliberately keeps this scheme out of pending #391.
 const native_signature_schemes = [_]tls_algorithms.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 };
+
+/// Certificate-chain-signature algorithms the native WebPKI verifier
+/// (`src/pki/verify.zig`, #343/#645) can authenticate, advertised via the
+/// client-role-only TLS 1.3 `signature_algorithms_cert` extension (RFC 8446
+/// §4.2.3) so a conforming origin knows it may send a chain signed with one
+/// of these — distinct from `native_signature_schemes` above, which is
+/// CertificateVerify-only and must never include an `rsa_pkcs1` scheme. When
+/// `signature_algorithms_cert` is absent (as Tardigrade never sent it before
+/// #645), RFC 8446 says `signature_algorithms` applies to certificates too;
+/// since that list excludes `rsa_pkcs1`, a strictly conforming origin could
+/// have avoided sending a PKCS#1-signed chain to this client even though the
+/// verifier could already authenticate it once received — this extension
+/// closes that signaling gap without touching CertificateVerify at all.
+const native_signature_schemes_cert = [_]tls_algorithms.SignatureScheme{
+    .ed25519,
+    .ecdsa_secp256r1_sha256,
+    .rsa_pss_rsae_sha256,
+    .rsa_pkcs1_sha256,
+    .rsa_pkcs1_sha384,
+};
 
 pub const native_capabilities = tls_policy.Capabilities{
     .protocol_versions = &native_protocol_versions,
@@ -396,6 +417,7 @@ pub const TransportProfile = union(enum) {
                 ext_server_name,
                 ext_supported_groups,
                 ext_signature_algorithms,
+                ext_signature_algorithms_cert,
                 ext_alpn,
                 ext_supported_versions,
                 ext_key_share,
@@ -2743,6 +2765,24 @@ pub const Tls13Backend = struct {
             try w.u16_(@intFromEnum(scheme));
         }
 
+        // RFC 8446 §4.2.3 `signature_algorithms_cert` (#645): certificate-
+        // chain-signature algorithms this client accepts, separate from
+        // `signature_algorithms` immediately above (CertificateVerify only).
+        // Client-role only — `sendClientHello` is never reached for the
+        // server role (see `startImpl`). Always sent (not gated on offering
+        // it only when it would differ from `signature_algorithms`): RFC
+        // 8446 permits sending both even when the sets overlap, and sending
+        // it unconditionally means a conforming origin never has to guess
+        // whether this client's `signature_algorithms` omission of
+        // `rsa_pkcs1` was deliberate (as it is here) or a lower TLS
+        // implementation.
+        try w.u16_(ext_signature_algorithms_cert);
+        try w.u16_(@intCast(2 + 2 * native_signature_schemes_cert.len));
+        try w.u16_(@intCast(2 * native_signature_schemes_cert.len));
+        for (native_signature_schemes_cert) |scheme| {
+            try w.u16_(@intFromEnum(scheme));
+        }
+
         try w.u16_(ext_key_share);
         switch (self.initial_key_share_mode) {
             .normal => {
@@ -3126,6 +3166,7 @@ pub const Tls13Backend = struct {
         len = try checkedAdd(len, 2 + 2 + 1 + 2 * self.policy.protocol_versions.len); // supported_versions
         len = try checkedAdd(len, 2 + 2 + 2 + 2 * offered_groups.len); // supported_groups
         len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.signature_schemes.len); // signature_algorithms
+        len = try checkedAdd(len, 2 + 2 + 2 + 2 * native_signature_schemes_cert.len); // signature_algorithms_cert (#645)
         const key_share_len = switch (self.initial_key_share_mode) {
             .normal => 2 + 2 + 2 + 2 + 2 + try groupPublicLen(offered_groups[0]),
             .empty => 2 + 2 + 2,
@@ -3530,6 +3571,19 @@ pub const Tls13Backend = struct {
         try w.u16_(@intCast(2 + 2 * self.policy.signature_schemes.len));
         try w.u16_(@intCast(2 * self.policy.signature_schemes.len));
         for (self.policy.signature_schemes) |scheme| {
+            try w.u16_(@intFromEnum(scheme));
+        }
+
+        // Same `signature_algorithms_cert` block `sendClientHello` writes for
+        // ClientHello1, in the same relative position, byte-identical since
+        // it is derived from the same fixed `native_signature_schemes_cert`
+        // constant rather than anything server-response-dependent — required
+        // for `hello_retry.validateSecondClientHello`'s stable-extension-order
+        // comparison to pass (#645).
+        try w.u16_(ext_signature_algorithms_cert);
+        try w.u16_(@intCast(2 + 2 * native_signature_schemes_cert.len));
+        try w.u16_(@intCast(2 * native_signature_schemes_cert.len));
+        for (native_signature_schemes_cert) |scheme| {
             try w.u16_(@intFromEnum(scheme));
         }
 

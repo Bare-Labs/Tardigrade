@@ -130,7 +130,12 @@ pub fn supportsSignatureScheme(caps: provider.Capabilities, scheme: policy_mod.S
         .ed25519 => caps.supportsSignature(.ed25519),
         .ecdsa_secp256r1_sha256 => caps.supportsSignature(.ecdsa_secp256r1_sha256),
         .rsa_pss_rsae_sha256 => caps.supportsSignature(.rsa_pss_rsae_sha256),
-        .rsa_pkcs1_sha256 => false,
+        // Certificate-chain-signature-only (#645): RFC 8446 §4.2.3 forbids
+        // rsa_pkcs1 schemes in signature_algorithms/CertificateVerify, so
+        // these are unconditionally refused here regardless of provider
+        // support — they are offered only via signature_algorithms_cert
+        // (src/tls/tls13_backend.zig's native_signature_schemes_cert).
+        .rsa_pkcs1_sha256, .rsa_pkcs1_sha384 => false,
     };
 }
 
