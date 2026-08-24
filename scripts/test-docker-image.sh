@@ -9,6 +9,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_TAG="tardigrade-smoke-test:local"
+BUILD_IMAGE_TAG="tardigrade-smoke-test-build:local"
 CONTAINER_NAME="tardigrade-smoke-test"
 TMPDIR="$(mktemp -d)"
 
@@ -17,7 +18,7 @@ AUDIT_CONTAINER_NAME="${CONTAINER_NAME}-audit"
 
 cleanup() {
     docker rm -f "$CONTAINER_NAME" "$PIDCHECK_CONTAINER_NAME" "$AUDIT_CONTAINER_NAME" >/dev/null 2>&1 || true
-    docker rmi "$IMAGE_TAG" >/dev/null 2>&1 || true
+    docker rmi "$IMAGE_TAG" "$BUILD_IMAGE_TAG" >/dev/null 2>&1 || true
     rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
@@ -55,6 +56,37 @@ fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 docker build -t "$IMAGE_TAG" "$REPO_ROOT"
+docker build --target build -t "$BUILD_IMAGE_TAG" "$REPO_ROOT"
+
+# ── Neither stage explicitly installs an OpenSSL/libcrypto package ─────────
+# The binary linkage audit below proves the shipped artifact doesn't *link*
+# OpenSSL, but that alone would not catch a Dockerfile regression that
+# re-installs libssl-dev/libssl3 without anything ending up linked against
+# them (#650's close rule requires catching Docker re-installing OpenSSL, not
+# just re-linking it).
+#
+# A raw dpkg presence check is not the right test here: on this base image,
+# ca-certificates has a genuine transitive `Depends: openssl` (which in turn
+# depends on libssl3) for its own certificate-bundle tooling, so libssl3 is
+# unavoidably present regardless of anything Tardigrade does -- that is
+# exactly the "ordinary OS/package substrate" the issue says must not be
+# confused with a foreign product implementation. `apt-mark showmanual`
+# distinguishes packages the Dockerfile explicitly named on an `apt-get
+# install` line from ones pulled in only as someone else's dependency, so it
+# catches a real Dockerfile regression without false-failing on
+# ca-certificates' own dependency chain.
+FORBIDDEN_PACKAGES_PATTERN='^(libssl-dev|libssl3|libssl1\.1|openssl)$'
+if docker run --rm --entrypoint sh "$BUILD_IMAGE_TAG" -c "apt-mark showmanual | grep -qE '$FORBIDDEN_PACKAGES_PATTERN'"; then
+    echo "FAIL: build stage explicitly installs an OpenSSL package; Tardigrade's native build needs no OpenSSL headers" >&2
+    exit 1
+fi
+echo "build stage: no OpenSSL package explicitly installed"
+
+if docker run --rm --entrypoint sh "$IMAGE_TAG" -c "apt-mark showmanual | grep -qE '$FORBIDDEN_PACKAGES_PATTERN'"; then
+    echo "FAIL: runtime image explicitly installs an OpenSSL package; Tardigrade's native binary needs no OpenSSL runtime library" >&2
+    exit 1
+fi
+echo "runtime stage: no OpenSSL package explicitly installed"
 
 # ── Audit the exact runtime binary for native-only linkage/identity ─────────
 # Composition must never be inferred from Dockerfile text alone: extract the

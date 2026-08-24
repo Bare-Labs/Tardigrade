@@ -106,10 +106,13 @@ for architectures the release workflow doesn't cover, or a custom build. Use
 the native profile for a shipping-equivalent package:
 
 ```bash
-# 1. Build the binary first (cross-compile for the target arch as needed)
+# 1. Install prerequisites
+apt install jq
+
+# 2. Build the binary first (cross-compile for the target arch as needed)
 zig build -Doptimize=ReleaseFast
 
-# 2. Build the DEB.
+# 3. Build the DEB.
 ./packaging/deb/build.sh \
   --version 0.50 \
   --arch amd64
