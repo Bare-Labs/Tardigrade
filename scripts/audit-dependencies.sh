@@ -335,12 +335,21 @@ resolve_relative_import() {
 
 scan_nonproduction_zig_imports() {
     [ -d "$REPO_ROOT" ] || return 0
-    local zigfile rel import_path target
+    local zigfile rel import_call import_path target
     while IFS= read -r zigfile; do
         rel="$(relpath "$zigfile")"
         is_nonproduction_zig_file "$rel" && continue
-        while IFS= read -r import_path; do
-            [ -n "$import_path" ] || continue
+        while IFS= read -r import_call; do
+            [ -n "$import_call" ] || continue
+            import_path="$(printf '%s\n' "$import_call" | sed -nE 's/.*@import[[:space:]]*\([[:space:]]*"([^"]+)"[[:space:]]*\).*/\1/p')"
+            if [ -z "$import_path" ]; then
+                fail "production Zig source uses unresolved @import expression in $rel: $import_call"
+                continue
+            fi
+            case "$import_path" in
+            *.zig) ;;
+            *) continue ;;
+            esac
             target="$(resolve_relative_import "$rel" "$import_path" || true)"
             [ -n "$target" ] || continue
             case "$target" in
@@ -349,7 +358,7 @@ scan_nonproduction_zig_imports() {
             if is_nonproduction_zig_file "$target"; then
                 fail "production Zig source imports non-production source root $target from $rel"
             fi
-        done < <(zig_import_paths "$zigfile")
+        done < <(stripped "$zigfile" | tr '\n' ' ' | grep -oE '@import[[:space:]]*\([[:space:]]*[^)]*\)' || true)
     done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
@@ -424,10 +433,20 @@ scan_build_production_graph() {
             [ -z "$installed" ] || installed_executables[$installed]=1
             parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.addImport[[:space:]]*\(.*/\1/p')"
             child="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.addImport[[:space:]]*\([^,]+,[[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
-            if [ -n "$parent" ] && [ -n "$child" ]; then
+            if [ -n "$parent" ]; then
                 parent="$(graph_resolve_alias "$parent")"
-                child="$(graph_resolve_alias "$child")"
-                edges[$parent]="${edges[$parent]:-} $child"
+                root="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.addImport[[:space:]]*\(.*b\.createModule[[:space:]]*\(.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
+                if [ -z "$child" ] && [ -n "$root" ]; then
+                    anon="__anonymous_module_$anon_index"
+                    anon_index=$((anon_index + 1))
+                    module_roots[$anon]="$root"
+                    edges[$parent]="${edges[$parent]:-} $anon"
+                elif [ -n "$child" ]; then
+                    child="$(graph_resolve_alias "$child")"
+                    edges[$parent]="${edges[$parent]:-} $child"
+                else
+                    fail "build addImport uses unresolved module expression in $file: $stmt"
+                fi
             fi
             parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.addAnonymousImport[[:space:]]*\(.*/\1/p')"
             root="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.addAnonymousImport[[:space:]]*\(.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
@@ -510,7 +529,7 @@ scan_build_production_graph() {
         if [ -n "$rel" ] && is_nonproduction_zig_file "$rel"; then
             fail "installed tardi module graph reaches non-production source root $rel via $module"
         fi
-        if [ -z "$rel" ] && [ -z "${edges[$module]:-}" ] && [ -z "${executable_names[$module]:-}" ] && ! is_reviewed_generated_build_module "$module"; then
+        if [ -z "$rel" ] && [ -z "${executable_names[$module]:-}" ] && ! is_reviewed_generated_build_module "$module"; then
             fail "installed tardi module graph reaches unresolved module/root $module"
         fi
         while IFS= read -r line; do
@@ -918,6 +937,15 @@ const product = @import
 pub fn main() void { product.load(); }
 EOF
         ;;
+    fail-nonliteral-production-source-import)
+        mkdir -p "$root/benchmarks"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product_path = "../benchmarks/product.zig";
+const product = @import(product_path);
+pub fn main() void { product.load(); }
+EOF
+        ;;
     fail-named-nonproduction-module-import)
         mkdir -p "$root/benchmarks"
         printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
@@ -1007,6 +1035,7 @@ EOF
     fail-reachable-computed-module-root)
         mkdir -p "$root/benchmarks"
         printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        printf 'pub fn ok() void {}\n' >"$root/src/safe.zig"
         cat >"$root/src/main.zig" <<'EOF'
 const product = @import("product");
 pub fn main() void { product.load(); }
@@ -1016,9 +1045,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const product_path = "benchmarks/product.zig";
+    const product_path_value = "benchmarks/product.zig";
+    const product_path = product_path_value;
     const exe_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
+    const safe_mod = b.createModule(.{ .root_source_file = b.path("src/safe.zig"), .target = target, .optimize = optimize });
     const product_mod = b.createModule(.{ .root_source_file = b.path(product_path), .target = target, .optimize = optimize });
+    product_mod.addImport("safe", safe_mod);
     exe_mod.addImport("product", product_mod);
     const exe = b.addExecutable(.{ .name = "tardi", .root_module = exe_mod });
     b.installArtifact(exe);
@@ -1041,6 +1073,29 @@ pub fn build(b: *std.Build) void {
     const product_mod = b.createModule(.{ .root_source_file = b.path("benchmarks/product.zig"), .target = target, .optimize = optimize });
     const product_alias = product_mod;
     exe_mod.addImport("product", product_alias);
+    const exe = b.addExecutable(.{ .name = "tardi", .root_module = exe_mod });
+    b.installArtifact(exe);
+}
+EOF
+        ;;
+    fail-inline-add-import-module)
+        mkdir -p "$root/benchmarks"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product = @import("product");
+pub fn main() void { product.load(); }
+EOF
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const exe_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
+    exe_mod.addImport("product", b.createModule(.{
+        .root_source_file = b.path("benchmarks/product.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     const exe = b.addExecutable(.{ .name = "tardi", .root_module = exe_mod });
     b.installArtifact(exe);
 }
@@ -1365,7 +1420,7 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-build-helper-split-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-split-nonproduction-source-imported fail-named-nonproduction-module-import fail-anonymous-nonproduction-module-import fail-computed-tardi-name fail-install-artifact-alias fail-add-install-artifact fail-reachable-computed-module-root fail-reachable-module-alias fail-oracle-module-installed fail-oracle-object-bridged fail-static-library-bridged fail-evp-oracle-name-production-link fail-assembly-file fail-cinclude-computed fail-cimport-split-foreign-header fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-inline-zon-dependency fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-homebrew-linux-plus-dependency fail-nonproduction-helper-reached-broad fail-release-reusable-workflow fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-build-helper-split-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-split-nonproduction-source-imported fail-nonliteral-production-source-import fail-named-nonproduction-module-import fail-anonymous-nonproduction-module-import fail-computed-tardi-name fail-install-artifact-alias fail-add-install-artifact fail-reachable-computed-module-root fail-reachable-module-alias fail-inline-add-import-module fail-oracle-module-installed fail-oracle-object-bridged fail-static-library-bridged fail-evp-oracle-name-production-link fail-assembly-file fail-cinclude-computed fail-cimport-split-foreign-header fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-inline-zon-dependency fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-homebrew-linux-plus-dependency fail-nonproduction-helper-reached-broad fail-release-reusable-workflow fail-dlopen; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2
