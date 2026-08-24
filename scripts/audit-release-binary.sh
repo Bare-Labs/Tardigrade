@@ -65,7 +65,7 @@ allowed_dynamic_dependency() {
     case "$host_os" in
     Darwin)
         case "$dep" in
-        libSystem.B.dylib) return 0 ;;
+        libSystem.B.dylib | /usr/lib/libSystem.B.dylib) return 0 ;;
         *) return 1 ;;
         esac
         ;;
@@ -91,10 +91,23 @@ evaluate_dependency_list() {
     done <<<"$deps_in"
 }
 
+parse_darwin_dependencies() {
+    awk 'NR > 1 { print $1 }' | sort -u
+}
+
 run_self_test() {
-    local unknown
-    unknown="$(evaluate_dependency_list Darwin $'libSystem.B.dylib\nlibforeigncodec.dylib')"
-    if [ "$unknown" != "libforeigncodec.dylib" ]; then
+    local parsed unknown expected
+    parsed="$(printf '%s\n' \
+        $'fake:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)\n\t@rpath/ForeignCodec.dylib (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/Foreign.framework/Versions/A/Foreign (compatibility version 1.0.0, current version 1.0.0)' |
+        parse_darwin_dependencies)"
+    expected=$'/System/Library/Frameworks/Foreign.framework/Versions/A/Foreign\n/usr/lib/libSystem.B.dylib\n@rpath/ForeignCodec.dylib'
+    if [ "$parsed" != "$expected" ]; then
+        echo "self-test failed: Darwin parser did not preserve every dependency install name" >&2
+        return 1
+    fi
+    unknown="$(evaluate_dependency_list Darwin "$parsed")"
+    expected=$'/System/Library/Frameworks/Foreign.framework/Versions/A/Foreign\n@rpath/ForeignCodec.dylib'
+    if [ "$unknown" != "$expected" ]; then
         echo "self-test failed: Darwin unknown dependency was not rejected" >&2
         return 1
     fi
@@ -177,11 +190,10 @@ Darwin)
         exit 2
     fi
     # otool -L lists the binary path on the first line, then one dependency
-    # path per indented line; keep the shared-library leaf names.
+    # install name per indented line. Keep the full first token so non-lib
+    # dylibs and frameworks cannot disappear before policy evaluation.
     dep_names="$(printf '%s\n' "$deps" |
-        tail -n +2 |
-        grep -oE '(lib[a-zA-Z0-9._+-]+\.dylib)' |
-        sort -u || true)"
+        parse_darwin_dependencies || true)"
     ;;
 *)
     echo "unsupported host OS for binary inspection: $os" >&2

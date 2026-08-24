@@ -9,7 +9,7 @@
 #   explicit test/interop/differential/fuzz/benchmark scopes.
 #
 # Production scope audited here:
-#   - src/**/*.zig production source (comments/prose ignored);
+#   - production-scoped Zig source across the repository (comments/prose ignored);
 #   - build.zig and its imported build helpers plus build.zig.zon;
 #   - .github workflows, packaging metadata, package builders, Dockerfiles,
 #     and non-interop scripts that can affect shipped artifacts.
@@ -151,10 +151,21 @@ resolve_build_sources() {
 
 is_nonproduction_file() {
     case "$1" in
-    tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
+    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
     scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
+}
+
+is_explicit_nonproduction_helper() {
+    case "$1" in
+    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+explicit_nonproduction_helper_pattern() {
+    printf '%s\n' 'scripts/test-deb-package\.sh|scripts/test-rpm-package\.sh|scripts/test-homebrew-formula\.sh|scripts/test-homebrew-release-formula\.sh|scripts/test-homebrew-tap-sync\.sh|scripts/test-install\.sh|scripts/test-docker-image\.sh|scripts/test-launchd-service\.sh'
 }
 
 forbidden_dependency_pattern() {
@@ -204,8 +215,8 @@ resolve_build_string() {
 is_allowed_nonproduction_build_statement() {
     local stmt="$1"
     case "$stmt" in
-    *evp_oracle* | *crypto_openssl_diff* | *pki_openssl_diff* | *interop* | *differential* | *fuzz* | *benchmark*) return 0 ;;
-    *'tests/'*) return 0 ;;
+    *evp_oracle* | *crypto_openssl_diff* | *pki_openssl_diff* | *tls_interop* | *h3_interop*) return 0 ;;
+    *'tests/'*'_interop'* | *'tests/interop'* | *'tests/support/'*) return 0 ;;
     *) return 1 ;;
     esac
 }
@@ -225,7 +236,7 @@ allowed_system_library() {
 }
 
 scan_source_ffi() {
-    [ -d "$REPO_ROOT/src" ] || return 0
+    [ -d "$REPO_ROOT" ] || return 0
     local zigfile rel import_lines headers include_line include_header
     while IFS= read -r zigfile; do
         rel="$(relpath "$zigfile")"
@@ -248,11 +259,11 @@ scan_source_ffi() {
                 fail "foreign/product C header imported from production source $rel:$include_line"
             fi
         done <<<"$headers"
-    done < <(find "$REPO_ROOT/src" -name '*.zig' -type f | sort)
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
 scan_runtime_loading() {
-    [ -d "$REPO_ROOT/src" ] || return 0
+    [ -d "$REPO_ROOT" ] || return 0
     local zigfile rel matches line
     while IFS= read -r zigfile; do
         rel="$(relpath "$zigfile")"
@@ -263,7 +274,7 @@ scan_runtime_loading() {
                 fail "production runtime dynamic loading boundary in $rel: $line"
             done <<<"$matches"
         fi
-    done < <(find "$REPO_ROOT/src" -name '*.zig' -type f | sort)
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
 scan_build_graph() {
@@ -292,7 +303,7 @@ scan_build_graph() {
                     fail "production foreign system library link in $file: $stmt"
                 fi
                 ;;
-            *addCSourceFiles* | *addCSourceFile* | *addObjectFile*)
+            *addCSourceFiles* | *addCSourceFile* | *addObjectFile* | *addTranslateC*)
                 if ! is_allowed_nonproduction_build_statement "$stmt"; then
                     fail "production vendored foreign source/object compilation in $file: $stmt"
                 fi
@@ -301,11 +312,7 @@ scan_build_graph() {
         done < <(logical_zig_statements <(stripped "$REPO_ROOT/$file"))
     done < <(resolve_build_sources)
 
-    if [ -f "$REPO_ROOT/build.zig.zon" ]; then
-        if stripped "$REPO_ROOT/build.zig.zon" | grep -niE '\.(url|path)[[:space:]]*=' | grep -qEi "$(forbidden_dependency_pattern)|\.c(pp)?($|[?#\"])"; then
-            fail "production manifest dependency appears to introduce a foreign runtime implementation in build.zig.zon"
-        fi
-    fi
+    scan_manifest_dependencies
 
     while IFS= read -r srcfile; do
         rel="$(relpath "$srcfile")"
@@ -313,13 +320,65 @@ scan_build_graph() {
         case "$rel" in
         *.c | *.cc | *.cpp | *.cxx | *.m | *.mm) fail "vendored foreign implementation source in production scope: $rel" ;;
         esac
-    done < <(find "$REPO_ROOT/src" -type f | sort 2>/dev/null || true)
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -type f -print | sort 2>/dev/null || true)
+}
+
+approved_manifest_dependency() {
+    local name="$1" path="$2" url="$3" hash="$4"
+    case "$name:$path:$url:$hash" in
+    pure_zig:vendor/pure_zig::reviewed-pure-zig-fixture) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+scan_manifest_dependencies() {
+    [ -f "$REPO_ROOT/build.zig.zon" ] || return 0
+    local manifest deps dep name path url hash pattern
+    pattern="$(forbidden_dependency_pattern)"
+    manifest="$(stripped "$REPO_ROOT/build.zig.zon")"
+    if printf '%s\n' "$manifest" | grep -niE '\.(url|path)[[:space:]]*=' | grep -qEi "$pattern|\.c(pp)?($|[?#\"])"; then
+        fail "production manifest dependency appears to introduce a foreign runtime implementation in build.zig.zon"
+    fi
+    deps="$(printf '%s\n' "$manifest" | awk '
+        /\.dependencies[[:space:]]*=[[:space:]]*\.\{/ { capture=1; depth=1; next }
+        capture {
+            line=$0
+            opens=gsub(/\{/, "{", line)
+            closes=gsub(/\}/, "}", line)
+            depth += opens - closes
+            if (depth <= 0) { capture=0; next }
+            print
+        }
+    ')"
+    while IFS= read -r dep; do
+        name="$(printf '%s\n' "$dep" | sed -nE 's/^[[:space:]]*\.([A-Za-z0-9_]+)[[:space:]]*=.*/\1/p')"
+        [ -n "$name" ] || continue
+        path="$(printf '%s\n' "$deps" | awk -v dep="$name" '
+            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" { capture=1 }
+            capture && /\.path[[:space:]]*=/ { line=$0; sub(/.*\.path[[:space:]]*=[[:space:]]*"/, "", line); sub(/".*/, "", line); print line; exit }
+            capture && /^[[:space:]]*\},?/ { capture=0 }
+        ')"
+        url="$(printf '%s\n' "$deps" | awk -v dep="$name" '
+            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" { capture=1 }
+            capture && /\.url[[:space:]]*=/ { line=$0; sub(/.*\.url[[:space:]]*=[[:space:]]*"/, "", line); sub(/".*/, "", line); print line; exit }
+            capture && /^[[:space:]]*\},?/ { capture=0 }
+        ')"
+        hash="$(printf '%s\n' "$deps" | awk -v dep="$name" '
+            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" { capture=1 }
+            capture && /\.hash[[:space:]]*=/ { line=$0; sub(/.*\.hash[[:space:]]*=[[:space:]]*"/, "", line); sub(/".*/, "", line); print line; exit }
+            capture && /^[[:space:]]*\},?/ { capture=0 }
+        ')"
+        if ! approved_manifest_dependency "$name" "$path" "$url" "$hash"; then
+            fail "production manifest dependency .$name is not in the reviewed pure-Zig dependency allowlist"
+        fi
+    done < <(printf '%s\n' "$deps" | grep -E '^[[:space:]]*\.[A-Za-z0-9_]+[[:space:]]*=' || true)
 }
 
 scan_metadata() {
     local -a scan_files=()
-    local f rel matches line pattern
+    local f rel matches line pattern helper_pattern
     pattern="$(forbidden_dependency_pattern)"
+    helper_pattern="$(explicit_nonproduction_helper_pattern)"
     [ -f "$REPO_ROOT/.github/workflows/release.yml" ] && scan_files+=("$REPO_ROOT/.github/workflows/release.yml")
     while IFS= read -r f; do scan_files+=("$f"); done < <(find "$REPO_ROOT/packaging" -type f 2>/dev/null | sort)
     while IFS= read -r f; do
@@ -329,7 +388,7 @@ scan_metadata() {
         *) scan_files+=("$f") ;;
         esac
     done < <(find "$REPO_ROOT/scripts" -type f 2>/dev/null | sort)
-    while IFS= read -r f; do scan_files+=("$f"); done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name 'Dockerfile*' -type f -print | sort)
+    while IFS= read -r f; do scan_files+=("$f"); done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o \( -name 'Dockerfile*' -o -name 'compose.yaml' -o -name 'compose.yml' \) -type f -print | sort)
 
     for f in "${scan_files[@]}"; do
         [ -f "$f" ] || continue
@@ -338,10 +397,24 @@ scan_metadata() {
         case "$rel" in
         *.md) continue ;;
         esac
+        if ! is_explicit_nonproduction_helper "$rel"; then
+            if matches="$(logical_shell_statements <(stripped "$f") | grep -niE "$helper_pattern" 2>/dev/null)"; then
+                while IFS= read -r line; do
+                    [ -z "$line" ] && continue
+                    fail "production metadata references explicit non-production helper in $rel: $line"
+                done <<<"$matches"
+            fi
+        fi
         if matches="$(logical_shell_statements <(stripped "$f") | grep -niE "(^|[[:space:][:punct:]])(apt(-get)? install|apk add|brew install|depends_on|Depends:|Requires:|RUN .*install|cargo|go get|pip install).*($pattern)" 2>/dev/null)"; then
             while IFS= read -r line; do
                 [ -z "$line" ] && continue
                 fail "production package/container metadata introduces foreign implementation dependency in $rel: $line"
+            done <<<"$matches"
+        fi
+        if matches="$(logical_shell_statements <(stripped "$f") | grep -niE 'LD_PRELOAD|DYLD_INSERT_LIBRARIES|[A-Za-z0-9_./@-]+\.(so|dylib|dll)([^A-Za-z0-9_]|$)|\.framework(/|:|$)' 2>/dev/null)"; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                fail "production metadata can inject or mount a foreign runtime library in $rel: $line"
             done <<<"$matches"
         fi
     done
@@ -427,6 +500,28 @@ pub fn build(b: *std.Build) void {
 }
 EOF
         ;;
+    fail-test-looking-production-target)
+        printf 'foreign object placeholder\n' >"$root/foreign.o"
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const benchmark_tardi = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    benchmark_tardi.addObjectFile(b.path("foreign.o"));
+    b.installArtifact(benchmark_tardi);
+}
+EOF
+        ;;
+    fail-translate-c)
+        cat >"$root/foreign.h" <<'EOF'
+int foreign_impl(void);
+EOF
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    _ = b.addTranslateC(.{ .root_source_file = b.path("foreign.h") });
+}
+EOF
+        ;;
     fail-package)
         printf 'Package: tardigrade\nDepends: libssl3\n' >"$root/packaging/control"
         ;;
@@ -451,6 +546,62 @@ apt-get update \
 EOF
         chmod +x "$root/scripts/test-install-runtime.sh"
         ;;
+    fail-allowlisted-helper-reached)
+        cat >"$root/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN ./scripts/test-install.sh
+EOF
+        cat >"$root/scripts/test-install.sh" <<'EOF'
+#!/usr/bin/env bash
+apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libssl3
+EOF
+        chmod +x "$root/scripts/test-install.sh"
+        ;;
+    fail-outside-src-runtime-loading)
+        mkdir -p "$root/vendor"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so"); }\n' >"$root/vendor/product.zig"
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const product_mod = b.createModule(.{ .root_source_file = b.path("vendor/product.zig") });
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    exe.root_module.addImport("product", product_mod);
+    b.installArtifact(exe);
+}
+EOF
+        ;;
+    fail-neutral-dependency-c)
+        mkdir -p "$root/vendor/fastcodec"
+        cat >"$root/build.zig.zon" <<'EOF'
+.{
+    .dependencies = .{
+        .fastcodec = .{ .path = "vendor/fastcodec" },
+    },
+}
+EOF
+        cat >"$root/vendor/fastcodec/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const lib = b.addStaticLibrary(.{ .name = "fastcodec", .root_source_file = b.path("root.zig") });
+    lib.addCSourceFile(.{ .file = b.path("codec.c") });
+}
+EOF
+        printf 'pub fn ok() void {}\n' >"$root/vendor/fastcodec/root.zig"
+        printf 'int codec(void) { return 1; }\n' >"$root/vendor/fastcodec/codec.c"
+        ;;
+    fail-compose-preload)
+        cat >"$root/compose.yaml" <<'EOF'
+services:
+  tardigrade:
+    image: tardigrade:local
+    environment:
+      LD_PRELOAD: /plugins/ForeignCodec.so
+    volumes:
+      - ./ForeignCodec.so:/plugins/ForeignCodec.so:ro
+EOF
+        ;;
     fail-dlopen)
         printf 'const std = @import("std");\npub fn main() void { _ = std.DynLib.open("libssl.so"); }\n' >"$root/src/main.zig"
         ;;
@@ -472,7 +623,7 @@ EOF
         cat >"$root/build.zig.zon" <<'EOF'
 .{
     .dependencies = .{
-        .pure_zig = .{ .path = "vendor/pure_zig" },
+        .pure_zig = .{ .path = "vendor/pure_zig", .hash = "reviewed-pure-zig-fixture" },
     },
 }
 EOF
@@ -485,7 +636,7 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-package fail-docker-multiline fail-test-helper-reached fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-test-looking-production-target fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-compose-preload fail-dlopen; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2
