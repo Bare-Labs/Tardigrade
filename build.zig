@@ -944,9 +944,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pki_mod.addImport("crypto", crypto_mod);
-    pki_mod.addAnonymousImport("pki_malformed_der", .{
-        .root_source_file = b.path("tests/vectors/pki/malformed-truncated.der"),
-    });
     const pki_test_mod = b.createModule(.{
         .root_source_file = b.path("src/pki/root.zig"),
         .target = target,
