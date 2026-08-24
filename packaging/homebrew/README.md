@@ -18,7 +18,7 @@ Release publication flow:
    ```bash
    ruby -c packaging/homebrew/tardigrade.rb
    ./scripts/test-homebrew-release-formula.sh
-   zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=0.0.0-homebrew-smoke
+   zig build -Doptimize=ReleaseFast -Dversion=0.0.0-homebrew-smoke
    ./scripts/test-homebrew-formula.sh
    ```
 

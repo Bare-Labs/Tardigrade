@@ -15,21 +15,23 @@ protocol code, so that:
 - protocol modules (TLS 1.3, QUIC packet protection, X.509 verification, record
   protection, tickets) never name a concrete primitive or a foreign TLS type;
 - native TLS/QUIC uses the in-process pure-Zig `CryptoProvider`
-  implementation for provider-owned keyed operations;
-- general-purpose OpenSSL TLS remains a separate implementation behind the
-  existing isolated HTTP/TLS adapter/backend;
+  implementation for provider-owned keyed operations, in every shipping
+  profile (`general` and `appliance` — #649 retired the OpenSSL production
+  backend `general` used to link);
 - algorithm selection is explicit and cannot pick something a backend cannot do;
 - secret ownership and lifetime are stated, not assumed;
 - no OpenSSL type or hidden `libcrypto` operation leaks into the native
   TLS/QUIC provider path.
 
-The current architecture is a two-path product model: native TLS/QUIC uses the
-in-process pure-Zig `CryptoProvider` seam for keyed cryptographic work, while the
-separate general-purpose OpenSSL TLS backend remains isolated behind the
-existing adapter/backend and may still be used out of process for
-interoperability and differential testing. The native and general-purpose paths
-share no requirement to implement the same provider vtable, and the native
-provider path never imports or exposes OpenSSL-backed types.
+The architecture is now a single production path: native TLS/QUIC uses the
+in-process pure-Zig `CryptoProvider` seam for keyed cryptographic work in both
+build profiles. #649 retired the general-purpose OpenSSL TLS backend that
+`-Dtls-profile=general` previously linked (`src/http/tls_backend.zig` and the
+OpenSSL implementations of `tls_termination.zig`/`acme_client.zig` were
+deleted); out-of-process OpenSSL remains valid only as an interoperability and
+differential-testing oracle (`evp_oracle`, `tests/crypto_openssl_diff.zig`,
+`tests/pki_openssl_diff.zig`). The native provider path never imports or
+exposes OpenSSL-backed types.
 
 ## Where it lives
 
@@ -49,17 +51,25 @@ provider path never imports or exposes OpenSSL-backed types.
 - `src/crypto/pure_zig.zig` — the concrete in-process `CryptoProvider` used by
   the native TLS/QUIC path; it is built on `std.crypto` and advertises exactly
   those provider capabilities.
-- `src/http/tls_termination.zig` and `src/http/tls_backend.zig` — the existing
-  isolated general-purpose OpenSSL TLS adapter/backend path.
+- `src/http/tls_termination.zig` — the native upstream HTTPS/TLS client
+  (`UpstreamTlsConn`, #634) used for upstream proxying in every profile; no
+  `@cImport`, OpenSSL type, or C linkage. Downstream TLS termination is served
+  by `src/http/native_tls_connection.zig`, not this file. #649 retired this
+  file's former OpenSSL downstream-terminator implementation and deleted
+  `src/http/tls_backend.zig`, the selector layer that used to choose between
+  it and the native stub; the downstream `TlsTerminator`/`TlsConnection`
+  types that remain in this file are now permanently inert (fail closed with
+  `error.ContextInitFailed`), kept only so shared option-struct field shapes
+  compile identically across profiles.
 - `src/crypto/root.zig` — the package aggregator.
 - `docs/CRYPTO_PROVIDER_AUDIT.md` — the current native TLS/QUIC/PKI/resumption
   direct-crypto ownership audit and exception list.
 - Tests run under `zig build test-crypto` and as part of `zig build test`.
 
-There is no current requirement or planned deliverable for an in-process
-OpenSSL `CryptoProvider`. The general-purpose OpenSSL TLS backend remains an
-isolated adapter/backend implementation, and out-of-process OpenSSL remains
-valid as an interoperability and differential oracle.
+There is no in-process OpenSSL `CryptoProvider`, and after #649 there is no
+production OpenSSL TLS backend of any kind — every shipping profile is
+pure-Zig native. Out-of-process OpenSSL remains valid as an interoperability
+and differential oracle.
 
 ## What the boundary covers
 
@@ -91,10 +101,11 @@ separate dimensions, and `src/crypto/profile.zig` records all three as typed
 data, not prose:
 
 - **Primitive/provider support** — `pure_zig_status` and `openssl_status`: can a
-  backend do this at all inside the `CryptoProvider` model. In particular,
-  `openssl_status = .provider_deferred` means that an in-process OpenSSL
-  `CryptoProvider` implementation does not exist; it does not imply that the
-  isolated general-purpose OpenSSL TLS backend lacks the algorithm.
+  backend do this at all inside the `CryptoProvider` model. `openssl_status`
+  predates #649: it never described an in-process OpenSSL `CryptoProvider`
+  (none has ever existed), and after #649 retired the general-purpose OpenSSL
+  TLS backend it used to describe, the field is vestigial — no shipping build
+  consults it.
 - **Protocol integration** — `Row.integrations`, a `(Consumer,
   IntegrationStatus)` list: whether each named native consumer's *live* runtime
   actually calls the provider for it today. This is per consumer because it
@@ -105,19 +116,21 @@ data, not prose:
   `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose_openssl`):
   which product actually selects this capability. This is authored per row, not
   derived from `pure_zig_status`/`openssl_status` — primitive support does not
-  imply product selectability. The standing examples remain secp256r1 and
-  RSA-PSS: the pure-Zig provider and shared native TLS engine support them
-  through `CryptoProvider`, but the native appliance product still does not
-  enable them; the general-purpose OpenSSL product enables them through the
-  separate TLS backend despite `openssl_status = .provider_deferred`.
+  imply product selectability. `.general_purpose_openssl` predates #649's
+  retirement of the general-purpose OpenSSL TLS backend it was written to
+  describe; `src/crypto/profile.zig` has not been updated since, so the matrix
+  still carries the enum value and rows that reference it, but no shipping
+  binary can reach a capability through it any more — only `.native_appliance`
+  corresponds to a real, linkable backend today.
 
 ## Supported profile matrix
 
 The source of truth is `src/crypto/profile.zig`, not prose in this document. The
 matrix below summarizes the checked-in profile for review. The column labeled
-"OpenSSL `CryptoProvider` status" is about the in-process provider model only;
-it does not represent algorithm support in the isolated general-purpose OpenSSL
-TLS backend.
+"OpenSSL `CryptoProvider` status" is about the in-process provider model only,
+which has never existed; the "Product profiles" column's `general-purpose
+OpenSSL` entries are likewise a pre-#649 holdover — no shipping build links an
+OpenSSL TLS backend any more (see "Product enablement" above).
 
 The Zig compatibility floor for this matrix is `0.16.0`; when the project moves
 to a newer compiler or starts carrying compatibility shims for crypto APIs, the
@@ -150,21 +163,20 @@ floor and each affected row must be updated together.
 Protocol configuration must not hand-write provider-derived TLS capabilities.
 Use `tls.crypto_profile.fromProfile(product, provider.capabilities())`, naming
 the caller's `crypto.profile.ProductProfile` explicitly (`.native_appliance`
-for the pure-Zig in-process path, `.general_purpose_openssl` for the OpenSSL
-backend), then pass the returned `asPolicyCapabilities()` slice set to
-`tls.Policy`. This is the TLS-policy adapter for a provider-backed/native TLS
-path: it intersects an actual `CryptoProvider` capability set with the selected
-product-profile policy. The `.general_purpose_openssl` profile entry records
-product availability for the general-purpose backend; it does not mean the
-existing isolated OpenSSL TLS adapter is instantiated through
-`CryptoProvider`. The isolated OpenSSL TLS backend keeps its existing
-backend/adapter configuration path. When a call site must accept hand-written
-TLS capability lists, it should preflight them with
+for the pure-Zig in-process path), then pass the returned
+`asPolicyCapabilities()` slice set to `tls.Policy`. `.general_purpose_openssl`
+is the same pre-#649 holdover described above: still a valid enum value,
+still exercised by `crypto_profile.zig`'s own tests, but named by no
+production call site. This is the TLS-policy adapter for a provider-backed/
+native TLS path: it intersects an actual `CryptoProvider` capability set with
+the selected product-profile policy. When a call site must accept
+hand-written TLS capability lists, it should preflight them with
 `tls.crypto_profile.validateAgainstProvider` before handshake execution.
 
 The native appliance profile remains the deliberately narrow in-process
-pure-Zig path: no OpenSSL or `libcrypto` linkage, and general-purpose OpenSSL
-TLS available only through the existing non-native backend. QUIC packet
+pure-Zig path: no OpenSSL or `libcrypto` linkage. Since #649, the same is true
+of the `general` profile — there is no production build with OpenSSL TLS
+available any more. QUIC packet
 protection — AEAD seal/open and header protection on every send/receive path
 in `src/quic/tls_adapter.zig` — runs through `CryptoProvider`, and so does the
 TLS 1.3 handshake engine underneath it: the key schedule (HKDF-Extract,
@@ -290,8 +302,11 @@ contract calls internally.
   protocol epics.
 - *The native pure-Zig path implements and consumes `CryptoProvider`; the
   general-purpose OpenSSL backend remains behind its separate TLS adapter/backend*
-  — the two paths share no requirement to implement the same provider vtable,
-  and no OpenSSL type crosses into the native/provider architecture.
+  — the original #370 criterion, satisfied for as long as that second backend
+  existed: the two paths shared no requirement to implement the same provider
+  vtable. #649 has since retired the general-purpose OpenSSL backend entirely,
+  so the native pure-Zig path is now the only one; no OpenSSL type crosses
+  into the native/provider architecture.
 - *Capability negotiation is explicit and cannot select unsupported algorithms*
   — see "Capability discovery is explicit" above; covered by tests.
 - *Errors distinguish invalid peer input, unsupported capability, and provider

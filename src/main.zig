@@ -139,11 +139,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var stdout = compat.stdoutWriter(&stdout_buf);
             // The selected TLS profile is part of the artifact's identity
             // (#379): operators and release audits verify from this line
-            // which backend a binary was built with.
-            try stdout.print("{s} (tls-profile={s}, tls-backend={s})\n", .{
+            // which backend a binary was built with. Every supported
+            // production build is native-only (#649) -- there is no
+            // foreign-implementation backend left to report.
+            try stdout.print("{s} (tls-profile={s}, tls-backend=native)\n", .{
                 http.SERVER_VERSION,
                 build_options.tls_profile,
-                if (build_options.tls_openssl_adapter) "openssl-adapter" else "native",
             });
             try stdout.flush();
         },

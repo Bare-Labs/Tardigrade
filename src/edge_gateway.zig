@@ -380,86 +380,23 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var native_tls_provider: ?tls_core.credentials.CredentialProvider = null;
     var h3_credential_provider: ?tls_core.credentials.CredentialProvider = null;
     if (edge_config.hasTlsFiles(cfg)) {
-        var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
-        defer state_allocator.free(sni_specs);
-        for (cfg.tls_sni_certs, 0..) |sc, i| {
-            sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
-        }
-        if (!build_options.tls_openssl_adapter) {
-            if (edge_config.is_appliance_tls_profile) {
-                // Appliance profile: the strict owner is the only credential
-                // source for both native TCP TLS and HTTP/3. There is no
-                // fallback through the permissive generic identity loader.
-                const owner = &appliance_identity.?;
-                native_tls_provider = owner.provider();
-                h3_credential_provider = owner.provider();
-            } else {
-                var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
-                defer state_allocator.free(native_sni_specs);
-                for (cfg.tls_sni_certs, 0..) |sc, i| {
-                    native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
-                }
-                native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
-                try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
-                native_tls_provider = native_credentials.?.provider();
-                h3_credential_provider = native_credentials.?.provider();
-            }
+        if (edge_config.is_appliance_tls_profile) {
+            // Appliance profile: the strict owner is the only credential
+            // source for both native TCP TLS and HTTP/3. There is no
+            // fallback through the permissive generic identity loader.
+            const owner = &appliance_identity.?;
+            native_tls_provider = owner.provider();
+            h3_credential_provider = owner.provider();
         } else {
-            tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
-                .cert_path = cfg.tls_cert_path,
-                .key_path = cfg.tls_key_path,
-                .min_version = cfg.tls_min_version,
-                .max_version = cfg.tls_max_version,
-                .cipher_list = cfg.tls_cipher_list,
-                .cipher_suites = cfg.tls_cipher_suites,
-                .sni_certs = sni_specs,
-                .session_cache_enabled = cfg.tls_session_cache_enabled,
-                .session_cache_size = cfg.tls_session_cache_size,
-                .session_timeout_seconds = cfg.tls_session_timeout_seconds,
-                .session_tickets_enabled = cfg.tls_session_tickets_enabled,
-                .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
-                .ocsp_response_path = cfg.tls_ocsp_response_path,
-                .ocsp_auto_refresh_enabled = cfg.tls_ocsp_auto_refresh,
-                .ocsp_refresh_interval_ms = cfg.tls_ocsp_refresh_interval_ms,
-                .ocsp_refresh_timeout_ms = cfg.tls_ocsp_refresh_timeout_ms,
-                .client_ca_path = cfg.tls_client_ca_path,
-                .client_verify = cfg.tls_client_verify,
-                .client_verify_depth = cfg.tls_client_verify_depth,
-                .crl_path = cfg.tls_crl_path,
-                .crl_check = cfg.tls_crl_check,
-                .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
-                .acme_enabled = cfg.tls_acme_enabled,
-                .acme_cert_dir = cfg.tls_acme_cert_dir,
-                .acme_auto_issue = cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0,
-                .acme_directory_url = cfg.tls_acme_directory_url,
-                .acme_domains = cfg.tls_acme_domains,
-                .acme_email = cfg.tls_acme_email,
-                .acme_account_key_path = cfg.tls_acme_account_key_path,
-                .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
-                .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
-                .http1_enabled = cfg.http1_enabled,
-                .http2_enabled = cfg.http2_enabled,
-                .http1_alpn_fallback_enabled = cfg.tls_http1_no_alpn_fallback,
-            });
-        }
-    }
-    if (build_options.tls_openssl_adapter and cfg.http3_enabled and edge_config.hasTlsFiles(cfg)) {
-        // The native QUIC stack cannot use the OpenSSL terminator's identity
-        // objects; load the same files through the generic native store so
-        // HTTP/3 shares one provider-based credential architecture in every
-        // profile. Failure leaves QUIC unbootstrapped while TCP serves.
-        var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
-        defer state_allocator.free(native_sni_specs);
-        for (cfg.tls_sni_certs, 0..) |sc, i| {
-            native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
-        }
-        native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
-        if (native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs)) |_| {
+            var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+            defer state_allocator.free(native_sni_specs);
+            for (cfg.tls_sni_certs, 0..) |sc, i| {
+                native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+            }
+            native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
+            try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
+            native_tls_provider = native_credentials.?.provider();
             h3_credential_provider = native_credentials.?.provider();
-        } else |err| {
-            state.logger.warn(null, "http3: TLS identity unusable for QUIC ({s}); QUIC bootstrap will remain incomplete", .{@errorName(err)});
-            native_credentials.?.deinit();
-            native_credentials = null;
         }
     }
     defer if (native_credentials) |*store| store.deinit();

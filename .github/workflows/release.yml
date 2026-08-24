@@ -170,7 +170,7 @@ jobs:
       - name: Build native release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native "-Dversion=$VERSION"
+        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
 
       - name: Verify macOS binary architecture
         if: runner.os == 'macOS'
@@ -192,7 +192,7 @@ jobs:
         run: |
           ./scripts/audit-release-binary.sh \
             --binary zig-out/bin/tardi \
-            --profile native \
+            --profile general \
             --output "$INVENTORY_PATH"
 
       - name: Package artifact

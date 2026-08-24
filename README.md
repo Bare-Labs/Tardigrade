@@ -88,13 +88,14 @@ and Apple Silicon Darwin archives; macOS becomes a supported
 contains that change. See [packaging/README.md](packaging/README.md#current-status)
 for exact status.
 
-The release workflow now builds official Linux and Darwin archives (and Linux
+The release workflow builds official Linux and Darwin archives (and Linux
 DEB/RPM packages) with the general-purpose native Zig TLS profile
-(`-Dtls-profile=native`). Those new artifacts do not require OpenSSL as a
-Tardigrade build or runtime dependency, and their release dependency inventory
-is audited to reject `libssl`, `libcrypto`, and other foreign TLS/crypto/QUIC/H3
-implementations. Older already-published releases predate that cutover and may
-still use the transitional OpenSSL-backed profile.
+(`-Dtls-profile=general`, the default). Those artifacts do not require
+OpenSSL as a Tardigrade build or runtime dependency at all, and their
+release dependency inventory is audited to reject `libssl`, `libcrypto`, and
+other foreign TLS/crypto/QUIC/H3 implementations. Older already-published
+releases predate the #649 cutover and may still use the retired
+OpenSSL-backed profile.
 
 The initial Darwin archives are unsigned and not notarized; see the Gatekeeper
 note in [packaging/README.md](packaging/README.md) before redistributing
@@ -124,15 +125,16 @@ layout, permissions, and a locally built Docker image — see the
 Requirements:
 
 - [Zig](https://ziglang.org/) 0.16.0
-- The repository default remains the transitional `general` TLS profile; that
-  profile needs OpenSSL development libraries (`libssl-dev` on Debian/Ubuntu,
-  Homebrew `openssl@3` on macOS).
-- The official shipping-equivalent `native` profile does **not** require OpenSSL
-  to compile or run Tardigrade.
+- Both TLS profiles (`general`, the default, and `appliance`) are pure-Zig
+  native and do **not** require OpenSSL or any other foreign TLS/crypto
+  library to compile or run Tardigrade.
 - HTTP/3 is served by the built-in native Zig QUIC/H3 stack and requires no
   additional system libraries.
+- OpenSSL is only needed to build the optional out-of-process
+  differential/interop test tooling (`zig build test-crypto-openssl` and
+  similar) — never to build or run `tardi` itself.
 
-For development with the current default profile:
+For development with the default profile:
 
 ```bash
 git clone https://github.com/Bare-Systems/Tardigrade.git
@@ -140,17 +142,17 @@ cd Tardigrade
 zig build run
 ```
 
-For a shipping-equivalent release-mode native binary:
+For a shipping-equivalent release-mode binary:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtls-profile=native
+zig build -Doptimize=ReleaseFast
 ./zig-out/bin/tardi --help
 ```
 
 With explicit version metadata:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion="$(git describe --tags --always)"
+zig build -Doptimize=ReleaseFast -Dversion="$(git describe --tags --always)"
 ```
 
 Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-options).

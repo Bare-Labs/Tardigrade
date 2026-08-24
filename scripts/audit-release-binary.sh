@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 # TLS/crypto binary linkage audit and dependency inventory (#379, epic #327,
-# cutover #634).
+# cutover #634, retirement #649).
 #
 # Inspects a produced tardi binary's dynamic dependencies and emits a
-# machine-readable inventory. For the native-only profiles (`appliance` and
-# `native`) it fails if the binary links OpenSSL, libcrypto, or any other
-# foreign TLS/crypto/QUIC/H3/certificate library, and confirms the binary
-# self-reports the native TLS path. For the transitional general profile it
-# records whether the OpenSSL adapter was selected and lists the full
-# dependency set.
+# machine-readable inventory. Every supported profile (`general` and
+# `appliance`) is native-only: this fails if the binary links OpenSSL,
+# libcrypto, or any other foreign TLS/crypto/QUIC/H3/certificate library, and
+# confirms the binary self-reports the native TLS path.
 #
 # Usage:
-#   audit-release-binary.sh --binary PATH --profile {general|appliance|native} \
+#   audit-release-binary.sh --binary PATH --profile {general|appliance} \
 #       [--output inventory.json]
 #
 # Exit code 0 means the audit passed. A forbidden linkage, or a profile that
@@ -25,7 +23,7 @@ OUTPUT=""
 
 usage() {
     cat <<'EOF'
-Usage: audit-release-binary.sh --binary PATH --profile {general|appliance|native} [--output FILE]
+Usage: audit-release-binary.sh --binary PATH --profile {general|appliance} [--output FILE]
 EOF
 }
 
@@ -64,17 +62,16 @@ if [ ! -f "$BINARY" ]; then
     exit 2
 fi
 case "$PROFILE" in
-general | appliance | native) ;;
+general | appliance) ;;
 *)
-    echo "invalid profile: $PROFILE (expected general, appliance, or native)" >&2
+    echo "invalid profile: $PROFILE (expected general or appliance)" >&2
     exit 2
     ;;
 esac
 
 # Foreign TLS/crypto/QUIC/H3/certificate libraries that must never appear in a
-# Tardigrade link graph. openssl/crypto are handled separately: forbidden in
-# the native-only profiles (appliance/native), the approved transitional
-# adapter in the general profile.
+# Tardigrade link graph. openssl/crypto are handled separately below, but are
+# forbidden identically: every supported profile is native-only.
 FORBIDDEN_LIB_PATTERNS='ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libtls|libressl|botan|s2n'
 
 # ── Collect dynamic dependencies across platforms ────────────────────────────
@@ -150,7 +147,6 @@ self_report="$("$BINARY" version 2>/dev/null || true)"
 reported_backend="unknown"
 case "$self_report" in
 *"tls-backend=native"*) reported_backend="native" ;;
-*"tls-backend=openssl-adapter"*) reported_backend="openssl-adapter" ;;
 esac
 reported_profile="$(printf '%s' "$self_report" | sed -nE 's/.*tls-profile=([a-zA-Z0-9_-]+).*/\1/p')"
 [ -n "$reported_profile" ] || reported_profile="unknown"
@@ -173,22 +169,13 @@ if [ "$reported_profile" != "$PROFILE" ]; then
     violations+=("artifact self-reports tls-profile '$reported_profile' but was audited as '$PROFILE'")
 fi
 
-if [ "$PROFILE" = "appliance" ] || [ "$PROFILE" = "native" ]; then
-    if [ "$links_openssl" = true ]; then
-        violations+=("$PROFILE artifact links OpenSSL (libssl/libcrypto)")
-    fi
-    if [ "$reported_backend" != "native" ]; then
-        violations+=("$PROFILE artifact does not self-report the native TLS path (got '$reported_backend')")
-    fi
-else
-    # General profile: OpenSSL is permitted, but the binary's self-report must
-    # match its actual linkage so the inventory is trustworthy.
-    if [ "$links_openssl" = true ] && [ "$reported_backend" != "openssl-adapter" ]; then
-        violations+=("general artifact links OpenSSL but self-reports backend '$reported_backend'")
-    fi
-    if [ "$links_openssl" = false ] && [ "$reported_backend" = "openssl-adapter" ]; then
-        violations+=("general artifact self-reports the OpenSSL adapter but does not link OpenSSL")
-    fi
+# Every supported profile is native-only (#649): no profile-specific carve-out
+# permits OpenSSL linkage any more.
+if [ "$links_openssl" = true ]; then
+    violations+=("$PROFILE artifact links OpenSSL (libssl/libcrypto)")
+fi
+if [ "$reported_backend" != "native" ]; then
+    violations+=("$PROFILE artifact does not self-report the native TLS path (got '$reported_backend')")
 fi
 
 if [ "${#violations[@]}" -gt 0 ]; then

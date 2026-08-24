@@ -313,33 +313,30 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | path | `""` | PEM client certificate for upstream mTLS. | `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT=/etc/tardigrade/upstream.crt` |
 | `TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY` | path | `""` | PEM client private key for upstream mTLS. | `TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY=/etc/tardigrade/upstream.key` |
 
-Behavior is identical across all three `-Dtls-profile` builds (#634): `general`
-uses the OpenSSL adapter's upstream client, `appliance`/`native` use the
-native upstream TLS client (`src/http/tls_termination_stub.zig`'s
-`UpstreamTlsConn`) — same knobs, same semantics, no OpenSSL. "System defaults"
-for an empty `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE` means the OpenSSL default
-verify paths on `general`, or the first readable well-known system CA bundle
-file (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
-`/etc/ssl/cert.pem`, and similar OS-standard locations) on `appliance`/
-`native`; if neither an explicit bundle nor a well-known location is usable,
-verification fails deterministically rather than silently trusting nothing.
+Behavior is identical across both `-Dtls-profile` builds (#634, #649): the
+native upstream TLS client (`src/http/tls_termination.zig`'s
+`UpstreamTlsConn`) serves every profile — same knobs, same semantics, no
+OpenSSL. "System defaults" for an empty `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE`
+means the first readable well-known system CA bundle file
+(`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+`/etc/ssl/cert.pem`, and similar OS-standard locations); if neither an
+explicit bundle nor a well-known location is usable, verification fails
+deterministically rather than silently trusting nothing.
 
-`appliance`/`native` verification currently authenticates certificate chain
-signatures made with Ed25519, ECDSA P-256/SHA-256, RSA-PSS/SHA-256, or (as of
-#645) RSA PKCS#1 v1.5/SHA-256 or SHA-384 (`sha256WithRSAEncryption`/
-`sha384WithRSAEncryption`, still common among public CAs); an origin signed
-with another unsupported algorithm (e.g. ECDSA/SHA-384) fails verification
-even with a correct CA bundle and hostname (see `docs/TROUBLESHOOTING.md`).
-RSA PKCS#1 v1.5 support is certificate-chain-signature verification only —
-the TLS 1.3 handshake's own `CertificateVerify` proof-of-possession still
-only uses Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256, since RFC 8446
-§4.2.3 forbids `rsa_pkcs1` schemes there. Independently, `appliance`/`native`
-also caps each peer certificate entry at 8 KiB DER bytes and the whole
-handshake message at 16 KiB (#646) — generous enough for ordinary public
-WebPKI certificates/chains, including a leaf with a large SAN set; a
-certificate or chain genuinely outside those norms fails even when its
-signature algorithm is otherwise supported. `general` has neither
-restriction.
+Verification currently authenticates certificate chain signatures made with
+Ed25519, ECDSA P-256/SHA-256, RSA-PSS/SHA-256, or (as of #645) RSA PKCS#1
+v1.5/SHA-256 or SHA-384 (`sha256WithRSAEncryption`/`sha384WithRSAEncryption`,
+still common among public CAs); an origin signed with another unsupported
+algorithm (e.g. ECDSA/SHA-384) fails verification even with a correct CA
+bundle and hostname (see `docs/TROUBLESHOOTING.md`). RSA PKCS#1 v1.5 support
+is certificate-chain-signature verification only — the TLS 1.3 handshake's
+own `CertificateVerify` proof-of-possession still only uses Ed25519, ECDSA
+P-256/SHA-256, or RSA-PSS/SHA-256, since RFC 8446 §4.2.3 forbids `rsa_pkcs1`
+schemes there. Each peer certificate entry is also capped at 8 KiB DER bytes
+and the whole handshake message at 16 KiB (#646) — generous enough for
+ordinary public WebPKI certificates/chains, including a leaf with a large
+SAN set; a certificate or chain genuinely outside those norms fails even
+when its signature algorithm is otherwise supported.
 
 ### Health Checks And Circuit Breaking
 
@@ -371,38 +368,41 @@ the primary `PROBE_*` names bypass file/secret lookup.
 
 ### TLS Termination
 
-General release binaries use the transitional OpenSSL-backed TLS profile
-(`-Dtls-profile=general`). The native-TLS builds (`-Dtls-profile=appliance`
-and the general-purpose `-Dtls-profile=native`, #634) have a stricter
-TLS 1.3-only subset and deterministically reject OpenSSL-adapter-only
-settings.
+Both TLS profiles (`general`, the default, and `appliance`) are pure-Zig
+native (#649) and TLS 1.3-only. The settings below that only ever applied to
+the retired OpenSSL adapter (TLS 1.2, cipher overrides, downstream mTLS,
+OpenSSL session cache/tickets, OCSP, CRL, the filesystem credential
+watcher) now deterministically fail config validation in every profile if
+set to anything other than their listed default — see
+[docs/TLS_DEPENDENCY_POLICY.md](TLS_DEPENDENCY_POLICY.md#retired-openssl-capability-disposition)
+for the complete disposition of each.
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_TLS_CERT_PATH` | path | `""` | Required for TLS; must be paired with key path. | `TARDIGRADE_TLS_CERT_PATH=/etc/tls/fullchain.pem` |
 | `TARDIGRADE_TLS_KEY_PATH` | path | `""` | Required for TLS; must be paired with cert path. | `TARDIGRADE_TLS_KEY_PATH=/etc/tls/privkey.pem` |
-| `TARDIGRADE_TLS_MIN_VERSION` | string | `1.2` general, `1.3` appliance/native | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance/native require `1.3`. | `TARDIGRADE_TLS_MIN_VERSION=1.2` |
-| `TARDIGRADE_TLS_MAX_VERSION` | string | `1.3` | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance/native require `1.3`. | `TARDIGRADE_TLS_MAX_VERSION=1.3` |
-| `TARDIGRADE_TLS_CIPHER_LIST` | string | `""` | OpenSSL TLS <=1.2 cipher list. Appliance/native profiles require empty. | `TARDIGRADE_TLS_CIPHER_LIST=ECDHE+AESGCM` |
-| `TARDIGRADE_TLS_CIPHER_SUITES` | string | `""` | TLS 1.3 cipher suites. Appliance/native profiles require empty. | `TARDIGRADE_TLS_CIPHER_SUITES=TLS_AES_256_GCM_SHA384` |
-| `TARDIGRADE_TLS_SERVER_NAME` | DNS name | `""` | Unused by the general/OpenSSL terminator. Appliance requires one non-wildcard DNS name when TLS is enabled; appliance credential/name changes require restart. | `TARDIGRADE_TLS_SERVER_NAME=edge.example.com` |
-| `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name:cert:key&#124;name2:cert2:key2</code>. Appliance profile requires empty. On `native`, an explicit entry always wins for its hostname; for any hostname with no entry, the default (`tls_cert_path`/`tls_key_path`) identity is served instead if its own certificate's SAN already covers that hostname (#634), otherwise the handshake fails closed. | `TARDIGRADE_TLS_SNI_CERTS=api.example.com:/a.crt:/a.key` |
-| `TARDIGRADE_TLS_SESSION_CACHE` | bool | `true` general, `false` appliance/native | OpenSSL session cache. Appliance/native profiles reject true (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | `TARDIGRADE_TLS_SESSION_CACHE=true` |
-| `TARDIGRADE_TLS_SESSION_CACHE_SIZE` | u32 | `20480` | OpenSSL session cache size. | `TARDIGRADE_TLS_SESSION_CACHE_SIZE=40960` |
-| `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS` | u32 | `300` | OpenSSL session timeout. | `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS=600` |
-| `TARDIGRADE_TLS_SESSION_TICKETS` | bool | `true` general, `false` appliance/native | OpenSSL ticket support. Appliance/native profiles reject true (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | `TARDIGRADE_TLS_SESSION_TICKETS=true` |
+| `TARDIGRADE_TLS_MIN_VERSION` | string | `1.3` | Must be exactly `1.3`; anything else is rejected. | `TARDIGRADE_TLS_MIN_VERSION=1.3` |
+| `TARDIGRADE_TLS_MAX_VERSION` | string | `1.3` | Must be exactly `1.3`; anything else is rejected. | `TARDIGRADE_TLS_MAX_VERSION=1.3` |
+| `TARDIGRADE_TLS_CIPHER_LIST` | string | `""` | Retired OpenSSL-format TLS <=1.2 cipher list; must be empty. | (unset) |
+| `TARDIGRADE_TLS_CIPHER_SUITES` | string | `""` | Retired OpenSSL-format TLS 1.3 cipher-suite override; must be empty. | (unset) |
+| `TARDIGRADE_TLS_SERVER_NAME` | DNS name | `""` | Unused by the general profile. Appliance requires one non-wildcard DNS name when TLS is enabled; appliance credential/name changes require restart. | `TARDIGRADE_TLS_SERVER_NAME=edge.example.com` |
+| `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name:cert:key&#124;name2:cert2:key2</code>. Appliance profile requires empty. On `general`, an explicit entry always wins for its hostname; for any hostname with no entry, the default (`tls_cert_path`/`tls_key_path`) identity is served instead if its own certificate's SAN already covers that hostname (#634), otherwise the handshake fails closed. | `TARDIGRADE_TLS_SNI_CERTS=api.example.com:/a.crt:/a.key` |
+| `TARDIGRADE_TLS_SESSION_CACHE` | bool | `false` | Retired OpenSSL session cache; must be false (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | (unset) |
+| `TARDIGRADE_TLS_SESSION_CACHE_SIZE` | u32 | `20480` | Unused; retained for config-file compatibility. | (unset) |
+| `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS` | u32 | `300` | Unused; retained for config-file compatibility. | (unset) |
+| `TARDIGRADE_TLS_SESSION_TICKETS` | bool | `false` | Retired OpenSSL session tickets; must be false (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | (unset) |
 | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS` | u32 ms | `5000` | TLS handshake read timeout. `0` falls back to keep-alive timeout. | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS=3000` |
-| `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` | u64 ms | `5000` general, `0` appliance/native | OpenSSL cert/key watcher interval. Appliance/native profiles require `0`. | `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS=5000` |
+| `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` | u64 ms | `0` | Retired OpenSSL cert/key watcher interval; must be `0` (credential rotation is the explicit SIGHUP reload path instead). | (unset) |
 | `TARDIGRADE_TLS_CLIENT_CA_PATH` | path | `""` | Required when `TARDIGRADE_TLS_CLIENT_VERIFY=true`. | `TARDIGRADE_TLS_CLIENT_CA_PATH=/etc/tls/clients.pem` |
-| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Downstream client cert verification. Appliance/native profiles reject true. | `TARDIGRADE_TLS_CLIENT_VERIFY=true` |
-| `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Client certificate chain depth. | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH=4` |
-| `TARDIGRADE_TLS_CRL_PATH` | path | `""` | CRL file. | `TARDIGRADE_TLS_CRL_PATH=/etc/tls/revoked.pem` |
-| `TARDIGRADE_TLS_CRL_CHECK` | bool | `false` | Enable CRL checking. Appliance/native profiles reject true. | `TARDIGRADE_TLS_CRL_CHECK=true` |
-| `TARDIGRADE_TLS_OCSP_STAPLING` | bool | `false` | Enable OCSP stapling. Appliance/native profiles reject true. | `TARDIGRADE_TLS_OCSP_STAPLING=true` |
-| `TARDIGRADE_TLS_OCSP_RESPONSE_PATH` | path | `""` | DER OCSP response path. | `TARDIGRADE_TLS_OCSP_RESPONSE_PATH=/var/cache/ocsp.der` |
-| `TARDIGRADE_TLS_OCSP_AUTO_REFRESH` | bool | `false` | Refresh OCSP response automatically. Appliance/native profiles reject true. | `TARDIGRADE_TLS_OCSP_AUTO_REFRESH=true` |
-| `TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS` | u64 ms | `3600000` | OCSP refresh interval. | `TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS=1800000` |
-| `TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS` | u32 ms | `10000` | OCSP refresh timeout. | `TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS=5000` |
+| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Retired downstream client-cert (mTLS) verification; must be false. | (unset) |
+| `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Unused; retained for config-file compatibility. | (unset) |
+| `TARDIGRADE_TLS_CRL_PATH` | path | `""` | Unused; retained for config-file compatibility. | (unset) |
+| `TARDIGRADE_TLS_CRL_CHECK` | bool | `false` | Retired CRL checking; must be false. | (unset) |
+| `TARDIGRADE_TLS_OCSP_STAPLING` | bool | `false` | Retired OCSP stapling; must be false. | (unset) |
+| `TARDIGRADE_TLS_OCSP_RESPONSE_PATH` | path | `""` | Unused; retained for config-file compatibility. | (unset) |
+| `TARDIGRADE_TLS_OCSP_AUTO_REFRESH` | bool | `false` | Retired OCSP auto-refresh; must be false. | (unset) |
+| `TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS` | u64 ms | `3600000` | Unused; retained for config-file compatibility. | (unset) |
+| `TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS` | u32 ms | `10000` | Unused; retained for config-file compatibility. | (unset) |
 
 ### Native TLS Resumption And Replay
 
@@ -448,7 +448,7 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_TLS_ACME_ENABLED` | bool | `false` | Enable ACME. Appliance/native profiles reject true (native ACME is tracked by #634). | `TARDIGRADE_TLS_ACME_ENABLED=true` |
+| `TARDIGRADE_TLS_ACME_ENABLED` | bool | `false` | Retired OpenSSL-adapter ACME automation; must be false in every profile. A native ACME client is tracked separately (#391, #634). | (unset) |
 | `TARDIGRADE_TLS_ACME_CERT_DIR` | path | `""` | Certificate storage directory. | `TARDIGRADE_TLS_ACME_CERT_DIR=/var/lib/tardigrade/acme` |
 | `TARDIGRADE_TLS_ACME_DIRECTORY_URL` | URL | `https://acme-v02.api.letsencrypt.org/directory` | ACME directory URL. | `TARDIGRADE_TLS_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory` |
 | `TARDIGRADE_TLS_ACME_DOMAINS` | CSV DNS names | `[]` | Domains to obtain/renew. Empty logs a warning when ACME is enabled. | `TARDIGRADE_TLS_ACME_DOMAINS=example.com,www.example.com` |
@@ -622,8 +622,8 @@ Reloaded settings fall into three operational categories:
 | Reload behavior | Fields / surfaces | Example |
 | --- | --- | --- |
 | Reloadable or rebuilt in place | Request routing and per-request config fields carried by the published `EdgeConfig`; rate limiter; proxy cache store/path/TTL; response and security headers; H3 `Alt-Svc` advertisement; connection caps; proxy and TLS buffer limits; compression config; logger level; access logging after publication. New requests acquire the newly published config after reload publication. | `TARDIGRADE_RATE_LIMIT_RPS=50` |
-| Reload rejected; restart required | Listener-shard topology, native early-data replay mode/capacity, HTTP/3 listener-owned fields (`HTTP3_ENABLED`, `QUIC_PORT`, `HTTP3_ENABLE_0RTT`, `HTTP3_CONNECTION_MIGRATION`, `HTTP3_RETRY_POLICY`, `HTTP3_MAX_DATAGRAM_SIZE`, UDP buffer sizes, ECN, qlog/keylog artifact destinations), native ticket-key source-mode changes, appliance TLS credential configuration (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_SERVER_NAME`, `TLS_SNI_CERTS` — `hotReloadConfig` rejects any change to these outright, regardless of what the underlying credential type technically supports), and — on a general-profile build that links the OpenSSL adapter and also serves native HTTP/3 that is genuinely bootstrapped (`http3_runtime.snapshot().server_bootstrapped`, not merely a constructed `NativeCredentialStore` — a QUIC bootstrap failure does not arm this) — any `TLS_CERT_PATH`/`TLS_KEY_PATH`/SNI change (#629: rejected atomically so stable TCP and native HTTP/3 can never end up presenting different certificates for the same hostname after one reload; on that composition TLS identity rotation is restart-owned in full — not only configured-path changes, since native HTTP/3's credential files are never re-read on an accepted reload and the OpenSSL terminator's own independent file watcher is disabled for the same reason). | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=1200` |
-| Config may publish, but live startup-owned state changes only after restart | Bound TCP socket host/port; event-loop backend and io_uring entries; runtime identity/chroot; PID file; master/worker-process topology; worker thread/queue/recycle/affinity settings; FD soft limit; connection-pool capacity; upstream TLS client state; circuit-breaker construction; idempotency TTL; session TTL/max/store path; access-control object; approval TTL/max-pending/store/escalation state; transcript store path; native resumption mode/ticket lifetime/ticket usage; general/OpenSSL TLS context inputs including min/max version, ciphers, session cache/tickets, client verification/CA/CRL, OCSP/ACME/watcher settings, and configured SNI identity (on this build, a credential-path change without native HTTP/3 also enabled publishes the new config but never rebuilds the live OpenSSL certificate context — see the row above for what happens when native HTTP/3 is also served); SSE event-hub capacity; DNS-discovery construction; coherent shutdown-drain policy; upstream-pool policy. Reload may log a restart-required warning for some of these. | `TARDIGRADE_WORKER_THREADS=8` |
+| Reload rejected; restart required | Listener-shard topology, native early-data replay mode/capacity, HTTP/3 listener-owned fields (`HTTP3_ENABLED`, `QUIC_PORT`, `HTTP3_ENABLE_0RTT`, `HTTP3_CONNECTION_MIGRATION`, `HTTP3_RETRY_POLICY`, `HTTP3_MAX_DATAGRAM_SIZE`, UDP buffer sizes, ECN, qlog/keylog artifact destinations), native ticket-key source-mode changes, appliance TLS credential configuration (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_SERVER_NAME`, `TLS_SNI_CERTS` — `hotReloadConfig` rejects any change to these outright, regardless of what the underlying credential type technically supports), and — in every profile — enabling or disabling TLS itself (`hasTlsFiles` toggling): the native credential owner is startup-fixed, so a reload that would turn TLS on for a process that started plaintext (or off for one that started with TLS) is rejected outright rather than publishing a config the runtime cannot honor (#634). | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=1200` |
+| Config may publish, but live startup-owned state changes only after restart | Bound TCP socket host/port; event-loop backend and io_uring entries; runtime identity/chroot; PID file; master/worker-process topology; worker thread/queue/recycle/affinity settings; FD soft limit; connection-pool capacity; upstream TLS client state; circuit-breaker construction; idempotency TTL; session TTL/max/store path; access-control object; approval TTL/max-pending/store/escalation state; transcript store path; native resumption mode/ticket lifetime/ticket usage; the retired OpenSSL-adapter TLS context inputs (min/max version, ciphers, session cache/tickets, client verification/CA/CRL, OCSP/ACME/watcher settings — these are also rejected outright by config validation if set to anything but their default, see the TLS Termination table above); SSE event-hub capacity; DNS-discovery construction; coherent shutdown-drain policy; upstream-pool policy. On the general profile, a configured SNI identity's certificate/key file *content* at an unchanged path is re-read and applied on every reload — the same store serves both TCP and HTTP/3, so this is a single atomic credential swap, not per-protocol drift (#629's mixed-owner special case, and the OpenSSL terminator it protected against, no longer exist as of #649). Reload may log a restart-required warning for some of these. | `TARDIGRADE_WORKER_THREADS=8` |
 
 `error_log`/`TARDIGRADE_ERROR_LOG_PATH` doesn't fit either row cleanly, and
 the live-relocation behavior is directional. Editing the config file is
@@ -707,9 +707,9 @@ These are configurable in-tree surfaces outside the stable Core v1 baseline.
 ## Full Annotated Example
 
 ```nginx
-# This complete example targets the general/OpenSSL TLS profile. Appliance TLS
-# accepts one top-level identity only, so the server-block TLS material below
-# would be rejected there.
+# This complete example targets the general TLS profile (the default).
+# Appliance TLS accepts one top-level identity only, so the server-block TLS
+# material below would be rejected there.
 
 # `worker_connections` caps total active client connections through
 # TARDIGRADE_MAX_ACTIVE_CONNECTIONS.
@@ -721,8 +721,8 @@ pid /run/tardigrade.pid;
 error_log /var/log/tardigrade/error.log info;
 
 # Serve TLS on 8443 and advertise HTTP/2. Cert/key must be configured together.
-# `tls_server_name` is intentionally omitted because this is a general/OpenSSL
-# example; that field is used by the appliance/native profile.
+# `tls_server_name` is intentionally omitted because this is a general-profile
+# example; that field is required by the appliance profile.
 listen 0.0.0.0:8443 http2;
 tls_cert_path /etc/tardigrade/tls/fullchain.pem;
 tls_key_path /etc/tardigrade/tls/privkey.pem;

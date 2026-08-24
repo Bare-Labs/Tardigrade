@@ -38,10 +38,13 @@
     //
     // Tardigrade has no package-manager dependencies. HTTP/3 and QUIC run on
     // the pure-Zig transport (#328 removed the former C-backed ngtcp2/nghttp3
-    // path); TLS/crypto is either the pure-Zig native path or the single
-    // approved OpenSSL adapter, selected by `-Dtls-profile` and enforced by
-    // scripts/audit-dependencies.sh (#379). External TLS/QUIC/H3
-    // implementations may run only as out-of-process interoperability peers.
+    // path); TLS/crypto is exclusively the pure-Zig native path in every
+    // `-Dtls-profile` (#649 retired the OpenSSL production adapter), enforced
+    // by scripts/audit-dependencies.sh (#379). OpenSSL remains a system
+    // library used only by out-of-process test/interop/differential tooling
+    // (evp_oracle et al.), never linked into `tardi` itself; external
+    // TLS/QUIC/H3 implementations otherwise run only as out-of-process
+    // interoperability peers.
     .dependencies = .{
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{

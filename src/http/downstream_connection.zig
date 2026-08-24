@@ -6,7 +6,7 @@ const metrics_mod = @import("metrics.zig");
 const native_tls_connection = @import("native_tls_connection.zig");
 const request_mod = @import("request.zig");
 const response_mod = @import("response.zig");
-const tls_termination = @import("tls_backend.zig");
+const tls_termination = @import("tls_termination.zig");
 const hpack = @import("hpack.zig");
 
 const encrypted_stream = tls_core.encrypted_stream;

@@ -83,11 +83,12 @@ jobs:
           ./scripts/test-homebrew-tap-sync.sh
 
   # ── TLS dependency audit ──────────────────────────────────────────────────────
-  # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3
-  # dependency names must not be configured, OpenSSL must stay behind the
-  # adapter boundary, native paths must be @cImport-free, and produced
-  # appliance/native/general artifacts must have the expected linkage. This is a
-  # required v0.5 release gate for the Bare Systems appliance (#391).
+  # Enforces the external-library policy (#379, #649): forbidden TLS/crypto/QUIC/H3
+  # dependency names must not be configured, OpenSSL must not appear anywhere in
+  # production source, native paths must be @cImport-free, and produced
+  # appliance/general artifacts (both native-only since #649) must have the
+  # expected no-foreign-linkage. This is a required v0.5 release gate for the
+  # Bare Systems appliance (#391).
   dependency-audit:
     name: TLS dependency audit
     runs-on: ubuntu-latest
@@ -102,9 +103,6 @@ jobs:
       - name: Source and configuration audit
         run: ./scripts/audit-dependencies.sh
 
-      - name: Install system dependencies (general profile)
-        run: sudo apt-get install -y libssl-dev
-
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
 
@@ -118,17 +116,7 @@ jobs:
             --profile appliance \
             --output "$RUNNER_TEMP/dependency-inventory-appliance.json"
 
-      - name: Build native profile (general-purpose, no OpenSSL, #634)
-        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native
-
-      - name: Audit native artifact linkage
-        run: |
-          ./scripts/audit-release-binary.sh \
-            --binary zig-out/bin/tardi \
-            --profile native \
-            --output "$RUNNER_TEMP/dependency-inventory-native.json"
-
-      - name: Build general profile (OpenSSL adapter)
+      - name: Build general profile (default, no OpenSSL since #649)
         run: zig build -Doptimize=ReleaseFast -Dtls-profile=general
 
       - name: Audit general artifact linkage
@@ -192,22 +180,26 @@ jobs:
         run: zig build test --summary all --error-style verbose
 
       # #162: `tardi init <profile>` / `config init --profile` real
-      # generated-config validation, on the default/general (OpenSSL-adapter)
-      # profile this job otherwise never runs `check` against -- the
-      # appliance-profile job below covers the native-profile equivalent.
-      # One Linux leg of the matrix is enough; no need to multiply this
-      # across every OS the `test` job builds for.
+      # generated-config validation, on the default general profile this job
+      # otherwise never runs `check` against -- the appliance-profile job
+      # below covers the appliance equivalent. One Linux leg of the matrix
+      # is enough; no need to multiply this across every OS the `test` job
+      # builds for.
       - name: Run tardi init <profile> real generated-config validation (general profile)
         if: matrix.os == 'ubuntu-latest'
         run: zig build test-integration-init --summary all --error-style verbose
 
   # ── Appliance profile tests ──────────────────────────────────────────────────
-  # The default `test` job above only exercises the general (OpenSSL-adapter)
-  # profile: `requireNativeTlsProfile()` skips every native-listener/appliance
-  # test under it. This job runs the appliance (`-Dtls-profile=appliance`)
-  # profile's own unit suite plus the native-listener and full integration
-  # suites, so appliance credential/TLS regressions (#392) are caught before
-  # merge, not only discovered by a separate manual run.
+  # The default `test` job above only exercises the general profile: no test
+  # in `tests/integration.zig` skips based on profile any more (#649 retired
+  # the OpenSSL adapter, so every profile is native and
+  # `requireNativeTlsProfile()` always passes), but the appliance-only
+  # product-policy cases (`requireApplianceTlsProfile()`) still need an
+  # appliance-profile build to actually run. This job runs the appliance
+  # (`-Dtls-profile=appliance`) profile's own unit suite plus the
+  # native-listener and full integration suites, so appliance credential/TLS
+  # regressions (#392) are caught before merge, not only discovered by a
+  # separate manual run.
   test-appliance:
     name: Test appliance profile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -226,9 +218,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # libssl-dev (not just the `openssl` CLI) is required here now: #649
+      # made the evp_oracle/crypto_openssl_diff differential test tooling
+      # build unconditionally as part of `zig build test`, regardless of
+      # TLS profile, since it's test/interop-only and was never tied to
+      # production linkage.
       - name: Install system dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y openssl
+        run: sudo apt-get install -y openssl libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -294,29 +291,22 @@ jobs:
             exit 1
           fi
 
-  # ── General-purpose native profile tests (#634) ─────────────────────────────
-  # Neither job above exercises `-Dtls-profile=native`: `test` above only
-  # builds `general`, and `test-appliance` above only builds `appliance`.
-  # This job runs the `native` profile's own unit suite plus the
-  # native-listener integration suite (#641 review), and deliberately does
-  # NOT install libssl-dev, so a passing build is itself proof the profile
-  # compiles with no OpenSSL development headers available at all -- not
-  # merely that it happens not to link OpenSSL when headers are present.
-  #
-  # The full `test-integration` suite is intentionally not run here yet:
-  # many of its fixtures (restart/rotation/soak/interop cases) authenticate
-  # against `TARDIGRADE_TLS_SERVER_NAME` the way the appliance profile's
-  # single-identity credential owner treats it -- as the served SNI name --
-  # which the `native` profile's generic multi-identity credential store only
-  # partially mirrors: an SNI not covered by the default identity's own
-  # certificate SAN still requires explicit `TARDIGRADE_TLS_SNI_CERTS`
-  # registration (#634's default-identity SAN/SNI eligibility, exercised by
-  # `test-integration-native-tls` below, narrows this gap but does not close
-  # it for every existing fixture's certificate). Wiring the full suite
-  # through `native` is tracked as related follow-up to #634, not a change
-  # this slice makes to dozens of unrelated fixtures.
-  test-native:
-    name: Test native profile (${{ matrix.os }})
+  # ── General-purpose profile native-TLS-listener integration (#634, #649) ────
+  # `-Dtls-profile=native` was retired by #649 and merged into `general` (the
+  # default `test` job above already covers the general profile's unit
+  # suite, including the differential/interop tooling that needs
+  # libssl-dev). This job's remaining, non-redundant value is
+  # `test-integration-native-tls` for the general/default profile -- not
+  # covered by `test` above (which only runs `test-integration-init`) or by
+  # `test-appliance` (a different profile) -- and it deliberately does NOT
+  # install libssl-dev: `test-integration-native-tls`'s test binary has no
+  # dependency on the evp_oracle/crypto_openssl_diff differential tooling, so
+  # a passing run here is proof this profile's native-listener code paths
+  # compile and pass with no OpenSSL development headers available at all --
+  # not merely that they happen not to link OpenSSL when headers are
+  # present.
+  test-general-native-tls:
+    name: Test general profile native TLS listener (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -342,19 +332,16 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-test-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          key: zig-test-general-native-tls-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
           restore-keys: |
-            zig-test-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
-            zig-test-native-${{ runner.os }}-${{ runner.arch }}-
+            zig-test-general-native-tls-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-test-general-native-tls-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Print Zig version
         run: zig version
 
-      - name: Run native profile unit tests
-        run: zig build test -Dtls-profile=native --summary all --error-style verbose
-
-      - name: Run native TLS listener integration tests
-        run: zig build test-integration-native-tls -Dtls-profile=native --summary all --error-style verbose
+      - name: Run native TLS listener integration tests (general profile)
+        run: zig build test-integration-native-tls --summary all --error-style verbose
 
   # ── PKI differential corpus ──────────────────────────────────────────────────
   # Replays the bounded core corpus against the pure-Zig validator, OpenSSL,
@@ -426,9 +413,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install system dependencies
-        run: sudo apt-get install -y libssl-dev
-
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
 
@@ -443,6 +427,8 @@ jobs:
             zig-examples-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
             zig-examples-${{ runner.os }}-${{ runner.arch }}-
 
+      # No OpenSSL development headers installed (#649): a plain `zig build`
+      # is a production-only build and must not need them.
       - name: Build Tardigrade
         run: zig build
 
@@ -452,7 +438,11 @@ jobs:
   # ── Build validation ──────────────────────────────────────────────────────────
   # Validates Debug, ReleaseSafe, and ReleaseFast builds across platforms.
   # Debug catches assertion failures; ReleaseSafe catches safety-check panics;
-  # ReleaseFast confirms production artifact parity.
+  # ReleaseFast confirms production artifact parity. No OpenSSL development
+  # headers are installed on any leg (#649): the default `zig build` is a
+  # production-only build on every profile and must not need them, and this
+  # job's matrix already covers the platforms #649's validation requires
+  # (Linux x86_64, Linux ARM64, macOS).
   build:
     name: Build (${{ matrix.os }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
@@ -466,10 +456,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -505,9 +491,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install dependencies
-        run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -571,7 +554,7 @@ jobs:
             zig-homebrew-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build native ReleaseFast binary
-        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=0.0.0-homebrew-smoke
+        run: zig build -Doptimize=ReleaseFast -Dversion=0.0.0-homebrew-smoke
 
       - name: Install Homebrew
         env:
@@ -602,7 +585,7 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
-        run: sudo apt-get install -y libssl-dev wrk
+        run: sudo apt-get install -y wrk
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -888,9 +871,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install dependencies
-        run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0

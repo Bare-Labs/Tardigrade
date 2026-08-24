@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const compat = @import("zig_compat");
-const tls_termination = @import("tls_backend.zig");
+const tls_termination = @import("tls_termination.zig");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 pub const Config = struct {

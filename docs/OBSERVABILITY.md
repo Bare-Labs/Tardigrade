@@ -115,9 +115,9 @@ logs are written through `src/http/logger.zig`.
   `tardigrade_tls_buffer_stalled_drives_total{backend}`. Labels are fixed to
   `pure_zig_record`/`openssl`, the four TLS queues, and the two pause
   directions; they never include SNI, URL, IP, request ID, connection ID, or
-  stream ID. OpenSSL-backed adapters expose only measurable adapter/BIO bytes
-  and mark opaque internal OpenSSL memory outside complete stream-owned
-  accounting.
+  stream ID. The `openssl` label value is a pre-#649 holdover in
+  `encrypted_stream.BackendKind` — no shipping build constructs an
+  OpenSSL-backed stream any more, so no live series ever carries it.
 - configured native TLS buffer limits:
   `tardigrade_tls_buffer_config_limit_bytes{queue,limit}` for the pure-Zig
   listener's inbound ciphertext, inbound plaintext, outbound ciphertext, and

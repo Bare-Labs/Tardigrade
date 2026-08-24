@@ -26,7 +26,7 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const frame = @import("http2_frame.zig");
 const hpack = @import("hpack.zig");
-const tls_termination = @import("tls_backend.zig");
+const tls_termination = @import("tls_termination.zig");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5).

@@ -63,7 +63,7 @@ Two principles, from the #196/#141 arc:
 | Shutdown drain | `SHUTDOWN_DRAIN_TIMEOUT_MS` | 30000 | TCP worker-pool drain deadline + native HTTP/3 drain deadline | TCP worker drain is a **soft cap**: queued work is drained/abandoned by the deadline, but active handlers finish naturally; native H3 uses the same value as a hard drain deadline and closes remaining H3 connections at expiry. The final shutdown path uses the startup value today; restart required to change coherently. | 🟡 semantics documented here; a hard TCP process cap is a #169-adjacent decision |
 | Hot reload | — | — | config load/validation + lease-counted publication | no worker-pool drain; in-flight requests keep their request-scoped config lease, may observe reloaded process-shared policy, and failed reloads keep the previous config active for request routing | ✅ |
 | OCSP refresh | `TLS_OCSP_REFRESH_TIMEOUT_MS` | 10000 | bounded fetch | stale staple kept | ✅ |
-| TLS session cache lifetime | `TLS_SESSION_TIMEOUT_SECONDS` | 300 | OpenSSL session cache | session renegotiated | ✅ (cache lifetime, not an I/O deadline) |
+| TLS session cache lifetime | `TLS_SESSION_TIMEOUT_SECONDS` | 300 | Unused; retained for config-file compatibility (#649) | n/a | ✅ (no-op in every profile) |
 
 ## Error / observability conventions
 

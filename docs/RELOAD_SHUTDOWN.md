@@ -101,26 +101,24 @@ config reload rejected: ... restart the process ...
 
 ### TLS Credential Identity
 
-Tardigrade has two TLS credential owner types, depending on build profile
-and which protocols a deployment serves:
+Tardigrade has one TLS credential owner type per build profile, shared by
+every protocol that profile serves (#649 retired the OpenSSL adapter and
+the split-owner composition it used to require):
 
-- The **OpenSSL adapter** (`http.tls_termination.TlsTerminator`), used for
-  stable TCP (H1/H2) on the default `general` build (`tls-profile=general`).
-  Its certificate/key context is loaded once at startup and is **never**
-  rebuilt by `SIGHUP` — only protocol-policy fields (ALPN/H1/H2 enablement)
-  are reload-owned. A separate, independent file-content watcher
-  (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`) can pick up byte changes at
-  the *same, already-configured* certificate/key paths on its own timer —
-  that is not part of `SIGHUP` reload and does not respond to a changed
-  `TLS_CERT_PATH`/`TLS_KEY_PATH` value.
-- The **native credential store** (`http.native_tls_connection.NativeCredentialStore`),
-  used for native HTTP/3 on the `general` build, and for *both* native TCP
-  and native HTTP/3 on the general-purpose native build
-  (`tls-profile=native`, #634); the appliance profile uses
-  `ApplianceCredentials` for both — see below. It supports a real
+- The **native credential store**
+  (`http.native_tls_connection.NativeCredentialStore`), used for *both*
+  native TCP and native HTTP/3 on the general-purpose profile
+  (`tls-profile=general`, the default, #634). It supports a real
   prepare/commit hot-swap of certificate, key, and SNI identity from the
   proposed reload paths, and `hotReloadConfig` uses that capability on
-  every accepted `SIGHUP` where it applies (see below).
+  every accepted `SIGHUP`: the configured certificate/key files' *content*
+  is re-read and republished even when the configured *path* is unchanged,
+  so an in-place certificate rotation at the same path is picked up. Since
+  one store serves both protocols, that swap is a single atomic operation —
+  TCP and HTTP/3 can never end up presenting different certificates for the
+  same hostname (the hazard [#629](https://github.com/Bare-Systems/Tardigrade/issues/629)
+  used to guard against under the old OpenSSL-TCP/native-HTTP3 split no
+  longer exists, because that split no longer exists).
 - **`ApplianceCredentials`**, the strict single-identity owner used on the
   appliance profile (`tls-profile=appliance`) for *both* native TCP and
   native HTTP/3. Although the type itself exposes reload methods, no
@@ -128,55 +126,13 @@ and which protocols a deployment serves:
   reload outright via `applianceCredentialConfigChanged` for any change to
   `TLS_CERT_PATH`/`TLS_KEY_PATH`/`TLS_SERVER_NAME`/`TLS_SNI_CERTS`, so in
   practice appliance credentials are fully startup-owned — a `SIGHUP` never
-  changes what either protocol serves. (On the `native` profile, by
-  contrast, one live-reloadable `NativeCredentialStore` is shared between
-  native TCP and native HTTP/3, so a single accepted `SIGHUP` rotates both
-  surfaces to the same identity atomically — the #629 split-identity
-  hazard is structural to the mixed `general`+H3 composition only. TLS
-  *topology* is still startup-owned on every native build: the store and
-  provider are created only when cert/key paths exist at startup, so
-  `hotReloadConfig` rejects any reload that would turn TLS on for a
-  process that started plaintext, or off for one that started with TLS —
-  "enabling or disabling native TLS requires restart".)
+  changes what either protocol serves.
 
-**On the default `general` build with the OpenSSL adapter linked**, stable
-TCP owns its identity via `TlsTerminator` (startup-owned, as above) while
-native HTTP/3 — if also enabled and genuinely bootstrapped — owns a separate
-`NativeCredentialStore` capable of live reload. Letting native HTTP/3 alone
-pick up a changed credential path (or even a same-path certificate rotation)
-would leave the two protocols presenting different certificates for the same
-hostname. [#629](https://github.com/Bare-Systems/Tardigrade/issues/629)
-makes TLS identity rotation restart-owned across this whole composition, not
-just for configured-path changes, whenever both owners are genuinely live —
-checked via `http3_runtime.snapshot().server_bootstrapped` (the same signal
-the H3 `Alt-Svc` advertisement logic uses), not merely via the
-`NativeCredentialStore` existing, so a QUIC bootstrap failure (for example a
-UDP bind failure) doesn't lock stable TCP into restart-only identity
-rotation for an HTTP/3 stack that never actually came up:
-
-- `hotReloadConfig` rejects the whole reload outright when
-  `TLS_CERT_PATH`/`TLS_KEY_PATH`/SNI certificates change and both a
-  `TlsTerminator` and a bootstrapped `NativeCredentialStore` are present —
-  the previous config stays active on both surfaces, and an operator must
-  restart the process to rotate credentials.
-- When those fields are unchanged, `hotReloadConfig` also never re-reads the
-  native HTTP/3 credential files on this composition, so a certificate
-  rotated in place at the *same* configured path is not picked up by H3
-  either — closing the gap a configured-path comparison alone would miss.
-  Every other reload-eligible field — routing, rate limits, headers, and the
-  rest of the "reloadable or rebuilt in place" row — still reloads normally.
-- The OpenSSL terminator's own independent file-content watcher
-  (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`) is disabled for this same
-  composition (`TlsTerminator.setIdentityReloadEnabled(false)`, applied once
-  at startup after HTTP/3 bootstrap is confirmed), so it cannot unilaterally
-  rebuild TCP's certificate or SNI set outside a coordinated restart either.
-  CRL/OCSP/ACME scheduling is unaffected.
-
-A general-profile build serving TCP only (no HTTP/3, or HTTP/3 without a
-resolvable TLS identity) is unaffected by any of this; it keeps the existing
-"config publishes, live OpenSSL context stays on the old identity, and the
-independent file watcher tracks the configured path's own content" behavior
-described above.
+TLS *topology* is still startup-owned in every profile: the credential
+store/provider is created only when cert/key paths exist at startup, so
+`hotReloadConfig` rejects any reload that would turn TLS on for a process
+that started plaintext, or off for one that started with TLS — "enabling or
+disabling native TLS requires restart".
 
 ## Active Connections
 

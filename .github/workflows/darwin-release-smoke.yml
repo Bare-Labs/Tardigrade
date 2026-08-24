@@ -53,7 +53,7 @@ jobs:
         run: zig version
 
       - name: Build native release binary
-        run: zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=0.0.0-ci-smoke
+        run: zig build -Doptimize=ReleaseFast -Dversion=0.0.0-ci-smoke
 
       - name: Verify macOS binary architecture
         env:
@@ -67,7 +67,7 @@ jobs:
         run: |
           ./scripts/audit-release-binary.sh \
             --binary zig-out/bin/tardi \
-            --profile native \
+            --profile general \
             --output "$RUNNER_TEMP/dependency-inventory-${{ matrix.archive_name }}.json"
 
       - name: Package artifact
@@ -93,7 +93,7 @@ jobs:
 
           version_output="$("$extract_dir/tardi" version)"
           printf '%s\n' "$version_output"
-          printf '%s\n' "$version_output" | grep -F 'tls-profile=native'
+          printf '%s\n' "$version_output" | grep -F 'tls-profile=general'
           printf '%s\n' "$version_output" | grep -F 'tls-backend=native'
 
       - name: Production-shaped smoke from extracted archive

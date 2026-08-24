@@ -1,7 +1,7 @@
 const std = @import("std");
 const tls = @import("tls_core");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
-const tls_termination = @import("tls_backend.zig");
+const tls_termination = @import("tls_termination.zig");
 
 pub const NegotiatedProtocol = tls_termination.NegotiatedProtocol;
 

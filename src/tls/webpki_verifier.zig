@@ -3,7 +3,7 @@
 //! Adapts the pure-Zig PKI chain builder/validator (`src/pki/`) to the
 //! engine's `credentials.PeerVerifier` contract, for a TLS client that must
 //! authenticate a server certificate chain against a trust-anchor set —
-//! today the native upstream HTTPS client (`http/tls_termination_stub.zig`),
+//! today the native upstream HTTPS client (`http/tls_termination.zig`),
 //! and any future native TLS client role — rather than a fixed pin or
 //! insecure passthrough (both already covered by `credentials.FixedVerifier`
 //! via `Trust.insecure_no_verification` / `.pinned_certificate`).
