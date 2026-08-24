@@ -1,9 +1,8 @@
 # Tardigrade Homebrew Formula
 
 This directory contains the preparatory Homebrew formula source and renderer.
-Do not copy `packaging/homebrew/tardigrade.rb` into `Bare-Systems/homebrew-tap`
-until a release exists that satisfies the native #634 shipping contract and the
-current archive layout.
+Tardigrade owns formula generation; `Bare-Systems/homebrew-tap` owns the public
+tap documentation.
 
 Release publication flow:
 
@@ -23,7 +22,7 @@ Release publication flow:
    ./scripts/test-homebrew-formula.sh
    ```
 
-4. Copy the formula and tap README into a checkout of
+4. Synchronize the generated formula into a checkout of
    `Bare-Systems/homebrew-tap`:
 
    ```bash
@@ -31,6 +30,10 @@ Release publication flow:
      --tag vX.Y.Z \
      --tap-dir ../homebrew-tap
    ```
+
+   `--tap-dir` updates only `Formula/tardigrade.rb`. It does not rewrite the
+   tap-owned `README.md`; tap documentation should change only when public
+   support policy or install instructions change.
 
 The renderer only emits platform/architecture branches whose archive names are
 present in the release's checksum manifest and asset list. The current public
