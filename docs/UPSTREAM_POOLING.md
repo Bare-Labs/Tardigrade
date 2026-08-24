@@ -41,7 +41,7 @@ In scope (Phases 1 / 1b / 1c / 2 / 3):
   unix upstreams under the same idle/lifetime/active-cap policy and metrics
   as TCP.
 - For TLS the pooled entry owns the native upstream `UpstreamTlsConn`
-  (`src/http/tls_termination.zig`, #634/#649), so the handshake is
+  (`src/http/upstream_tls.zig`, #634/#649), so the handshake is
   amortized across requests; the key is scheme-prefixed (`http:`/`https:`).
 - Per-origin idle pool with idle-timeout, max-lifetime, and max-idle-per-host
   caps; idle reaper on the maintenance tick.

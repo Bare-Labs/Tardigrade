@@ -162,13 +162,13 @@ test "pinned listener policy validates selected protocol and fallback" {
     try std.testing.expectError(error.NoApplicationProtocol, selectNegotiatedProtocol(null, .{ .http1_enabled = false, .allow_http1_without_alpn = true }));
 }
 
-test "shared runtime dispatch accepts OpenSSL-shaped and EncryptedStream connection shapes" {
+test "shared runtime dispatch accepts generic and EncryptedStream connection shapes" {
     var runtime = TestRuntime{};
-    var openssl_conn = TestOpenSslConn{ .fd = 11 };
-    try std.testing.expectEqual(TestOutcome.park, try dispatchToRuntime(&runtime, &openssl_conn, .http1_1, TestRuntime));
+    var generic_conn = TestGenericConn{ .fd = 11 };
+    try std.testing.expectEqual(TestOutcome.park, try dispatchToRuntime(&runtime, &generic_conn, .http1_1, TestRuntime));
     try std.testing.expectEqual(@as(usize, 1), runtime.http1_calls);
     try std.testing.expectEqual(@as(std.posix.fd_t, 11), runtime.last_fd);
-    try std.testing.expectEqualStrings("h", openssl_conn.written[0..openssl_conn.written_len]);
+    try std.testing.expectEqualStrings("h", generic_conn.written[0..generic_conn.written_len]);
 
     var fake_stream = TestEncryptedStream{ .readiness_state = .{ .can_write_plaintext = true } };
     var pure_zig_conn = encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(fake_stream.stream(), 22);
@@ -180,22 +180,22 @@ test "shared runtime dispatch accepts OpenSSL-shaped and EncryptedStream connect
 
 const TestOutcome = enum { serve_again, park, close };
 
-const TestOpenSslConn = struct {
+const TestGenericConn = struct {
     fd: std.posix.fd_t,
     pending_plaintext: usize = 0,
     written: [8]u8 = undefined,
     written_len: usize = 0,
 
-    pub fn pending(self: *const TestOpenSslConn) usize {
+    pub fn pending(self: *const TestGenericConn) usize {
         return self.pending_plaintext;
     }
 
-    pub fn rawFd(self: *const TestOpenSslConn) std.posix.fd_t {
+    pub fn rawFd(self: *const TestGenericConn) std.posix.fd_t {
         return self.fd;
     }
 
     pub const Writer = struct {
-        conn: *TestOpenSslConn,
+        conn: *TestGenericConn,
 
         pub fn writeByte(self: Writer, byte: u8) !void {
             self.conn.written[self.conn.written_len] = byte;
@@ -203,7 +203,7 @@ const TestOpenSslConn = struct {
         }
     };
 
-    pub fn writer(self: *TestOpenSslConn) Writer {
+    pub fn writer(self: *TestGenericConn) Writer {
         return .{ .conn = self };
     }
 };

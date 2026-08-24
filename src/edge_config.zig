@@ -194,7 +194,7 @@ pub const EdgeConfig = struct {
     tls_cipher_suites: []const u8,
     /// The one exact DNS host name served by the fixed appliance TLS identity
     /// (#392). Required (and strictly validated) in the appliance TLS profile;
-    /// unused by the general OpenSSL terminator.
+    /// not used by the general profile.
     tls_server_name: []const u8,
     tls_sni_certs: []TlsSniCert,
     tls_session_cache_enabled: bool,
@@ -203,9 +203,9 @@ pub const EdgeConfig = struct {
     tls_session_tickets_enabled: bool,
     /// #488: native (pure-Zig) TLS/QUIC resumption runtime configuration.
     /// Deliberately distinct from the `tls_session_*`/`tls_session_tickets_*`
-    /// fields above, which remain OpenSSL-facing only — native settings
-    /// affect only the native TLS-over-TCP and QUIC/H3 engines and must
-    /// never be conflated with the OpenSSL terminator's own session config.
+    /// fields above, which are retired legacy knobs rejected by native builds.
+    /// These settings configure the native TLS-over-TCP and QUIC/H3 engines and
+    /// remain separate from those unsupported compatibility fields.
     /// One of "disabled" (default), "stateful", "stateless", "hybrid"; see
     /// `nativeResumptionMode`.
     tls_native_resumption_mode: []const u8,

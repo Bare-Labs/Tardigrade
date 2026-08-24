@@ -358,7 +358,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     // (`edge_config.EarlyDataReplayMode.disabled` is the safe default) *and*
     // a native PSK/early-data path can actually exist (below, once
     // `native_tls_provider`/`h3_credential_provider` are known), so plain
-    // HTTP, OpenSSL-only, resumption-disabled, or replay-mode-disabled
+    // HTTP, no-native-TLS-path, resumption-disabled, or replay-mode-disabled
     // deployments never pay the configured-entry reservation or gain a new
     // startup-failure path for a security feature they haven't enabled.
     // Declared (but not yet constructed) here, ahead of every borrower
@@ -1586,14 +1586,13 @@ fn initNativeEarlyDataReplayStore(
 /// constructing the process-scoped replay store at all — evaluated only once
 /// the operator has also opted into `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local`
 /// (see the call site). Native resumption being enabled is necessary but not
-/// sufficient — a native (non-OpenSSL) TLS backend that could ever accept
+/// sufficient — a native TLS path that could ever accept
 /// early data must also be configured: native TCP (`native_tls_provider`)
 /// or, when HTTP/3 is enabled, native QUIC/H3 (`h3_credential_provider`).
-/// The OpenSSL terminator owns its own independent session cache and never
-/// consults this seam at all, so plain HTTP, OpenSSL-only, or
-/// resumption-disabled deployments must never gain the configured-entry
-/// allocation or a new startup-failure path for a security feature they
-/// cannot use.
+/// Plain HTTP or configurations without a native TLS/QUIC credential path do
+/// not consult this seam, so those and resumption-disabled deployments must
+/// never gain the configured-entry allocation or a new startup-failure path
+/// for a security feature they cannot use.
 fn nativeEarlyDataReplayStoreNeeded(
     native_resumption_runtime_enabled: bool,
     native_tls_provider_present: bool,
@@ -1609,7 +1608,7 @@ fn nativeEarlyDataReplayStoreNeeded(
 /// alone only answers "could a native PSK/early-data path exist here." The
 /// safe `disabled` default (and any mode other than `process_local`) must
 /// never construct a store, even when a native path exists, so plain HTTP,
-/// OpenSSL-only, resumption-disabled, or explicitly opted-out deployments
+/// no-native-TLS-path, resumption-disabled, or explicitly opted-out deployments
 /// never pay the configured-entry reservation or gain a new
 /// startup-failure path for a feature they haven't enabled.
 fn nativeEarlyDataReplayStoreEnabled(
@@ -6024,8 +6023,8 @@ test "#368 Slice 2: nativeEarlyDataReplayStoreNeeded is false for every configur
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, false, false, false));
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, true, false, false));
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, false, true, true));
-    // OpenSSL-only TCP with HTTP/3 disabled: native resumption enabled, but
-    // neither a native TCP provider nor an eligible H3 path exists.
+    // No native TCP credential provider and HTTP/3 disabled: resumption may be
+    // enabled in config, but no native PSK/early-data path can exist.
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(true, false, false, false));
     // HTTP/3 enabled but no native H3 credential provider actually bootstrapped
     // (e.g. TLS files missing), and no native TCP provider either.

@@ -17,10 +17,11 @@
 //!
 //! Built on `http2_frame.zig` (frame codec) and `hpack.zig` (literal encoder +
 //! stateful decoder). `exchange` is generic over the transport: it requires
-//! `read([]u8) !usize`, `writeAll([]const u8) !void`, and `pending() usize`
-//! (`SSL_pending`, so poll-bounded reads do not miss data already buffered in
-//! OpenSSL). Reads are bounded with `poll(2)` so a hung origin cannot block a
-//! worker indefinitely (the #196 guarantee).
+//! `read([]u8) !usize`, `writeAll([]const u8) !void`, and `pending() usize`.
+//! `pending()` reports already-decrypted plaintext buffered by the transport,
+//! so poll-bounded reads do not miss bytes already available above the socket.
+//! Reads are bounded with `poll(2)` so a hung origin cannot block a worker
+//! indefinitely (the #196 guarantee).
 
 const std = @import("std");
 const compat = @import("zig_compat");
