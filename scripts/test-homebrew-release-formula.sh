@@ -83,7 +83,7 @@ test -x "$installed"
 "$installed" version
 "$REPO_ROOT/scripts/audit-release-binary.sh" \
     --binary "$installed" \
-    --profile native \
+    --profile general \
     --output "$TMPDIR/dependency-inventory.json"
 
 cat > "$TMPDIR/tardigrade.conf" <<EOF

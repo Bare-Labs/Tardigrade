@@ -108,7 +108,7 @@ test -e "$alias_path"
 
 "$REPO_ROOT/scripts/audit-release-binary.sh" \
     --binary "$installed" \
-    --profile native \
+    --profile general \
     --output "$TMPDIR/dependency-inventory.json"
 
 mkdir -p "$TMPDIR/site"

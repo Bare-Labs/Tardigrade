@@ -9439,19 +9439,30 @@ test "rotation.persistent.quic_credential_reload_atomicity" {
     try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"quic\"", "outcome=\"incompatible\"" }) orelse 0);
 }
 
-// #629: real-process companion to the gateway_shutdown.zig unit tests'
+// #629/#649: real-process companion to the gateway_shutdown.zig unit tests'
 // rejection coverage. Those prove the whole reload is rejected when
 // `TLS_CERT_PATH`/`TLS_KEY_PATH`/SNI *configuration* changes; this proves
-// the two remaining review-required cases the unit tests cannot reach on
-// their own (a from-scratch `hotReloadConfig` call that proceeds to success
-// hangs in a bare `zig test` context for reasons unrelated to #629 -- see
-// that file's comments): (1) an unrelated, ordinarily-reloadable field still
-// takes effect when both TLS surfaces are live and their shared configured
-// path is unchanged, and (2) an invalid same-path credential-file
-// replacement cannot partially publish to either surface -- because
-// `mixed_credential_owners` being true means `hotReloadConfig` never even
-// attempts to read the native H3 credential files here, not merely that a
-// read failed and was discarded.
+// the review-required case the unit tests cannot reach on their own (a
+// from-scratch `hotReloadConfig` call that proceeds to success hangs in a
+// bare `zig test` context for reasons unrelated to this -- see that file's
+// comments): an invalid same-path credential-file replacement rejects the
+// *entire* reload, including an unrelated, ordinarily-reloadable field
+// bundled into the same SIGHUP, rather than silently publishing the
+// unrelated change while ignoring the bad credential bytes.
+//
+// Before #649 this composition had two independent credential owners (an
+// OpenSSL `TlsTerminator` for stable TCP, a separate `NativeCredentialStore`
+// for native HTTP/3), and `mixed_credential_owners` being true meant
+// `hotReloadConfig` never even attempted to read the native H3 credential
+// files on a same-path reload, so invalid bytes there were silently inert
+// and the rest of the reload still applied. #649 retired that composition:
+// TCP and HTTP/3 now share the one `NativeCredentialStore`, so every reload
+// with TLS files configured re-reads and re-parses them
+// (`prepareReloadFromFiles`) before anything commits; invalid same-path
+// bytes now fail that parse and reject the whole reload atomically, the
+// same way `native TLS credential reload failed` already fails a reload for
+// files at a *changed* path (`gateway_shutdown.zig`) -- there is no longer
+// a code path that reads a credential file and then discards the result.
 //
 // Named under the `rotation.` prefix (not a bare `hotReloadConfig ...` name)
 // so `zig build test-integration-resumption-interop` -- the required
@@ -9463,7 +9474,7 @@ test "rotation.persistent.quic_credential_reload_atomicity" {
 // credential is unchanged, since `gtlsclient` doesn't expose the negotiated
 // leaf certificate directly (see that test's own doc comment) -- a direct
 // external proof H3 never picked up the invalid same-path replacement, not
-// an inference from the accepted reload alone.
+// an inference from the rejected reload alone.
 test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -9472,11 +9483,11 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     defer allocator.free(client_path);
 
     // Both stable TCP and native HTTP/3 are constructed from this exact
-    // same configured path (matching `edge_gateway.run()`'s production
-    // wiring), so they start on the same identity by construction and this
-    // is a genuine mixed OpenSSL-TCP/native-HTTP3 composition. A throwaway
-    // generated identity, not a checked-in fixture, since this test
-    // overwrites the file content in place below.
+    // same configured path, through the one shared `NativeCredentialStore`
+    // (matching `edge_gateway.run()`'s production wiring), so they start on
+    // the same identity by construction. A throwaway generated identity,
+    // not a checked-in fixture, since this test overwrites the file content
+    // in place below.
     var cred_a = try generateAlternateServerCert(allocator, quic_interop_server_name);
     defer cred_a.deinit();
 
@@ -9583,16 +9594,19 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     tardigrade.sendSignal(std.posix.SIG.HUP);
     compat.sleepNs(300 * std.time.ns_per_ms);
 
-    // 3: the reload as a whole succeeded -- the credential portion was
-    // never touched at all (skipped by `mixed_credential_owners`), not
-    // merely attempted and rejected -- and the unrelated field took effect.
+    // 3: the reload as a whole is rejected -- the invalid same-path
+    // credential bytes fail `prepareReloadFromFiles`, and that failure
+    // rejects the entire SIGHUP atomically, so the bundled unrelated field
+    // change never takes effect either (#649: single shared credential
+    // owner, no partial-apply path left).
     var status = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/tardigrade/reload/status", .insecure = true });
     defer status.deinit();
-    try assertContains(status.body, "\"ok\":true");
+    try assertContains(status.body, "\"ok\":false");
+    try assertContains(status.body, "native TLS credential reload failed");
 
     var second_response = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/dynamic/test", .insecure = true });
     defer second_response.deinit();
-    try assertContains(second_response.body, "second-location");
+    try assertContains(second_response.body, "first-location");
 
     // 4: TCP is still serving identity A over a real handshake.
     const subject_after = try opensslPresentedSubject(allocator, tardigrade.port, quic_interop_server_name);

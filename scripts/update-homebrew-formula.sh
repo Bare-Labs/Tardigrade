@@ -261,7 +261,7 @@ EOF
   test do
     output = shell_output("#{bin}/tardi version")
     assert_match version.to_s, output
-    assert_match "tls-profile=native", output
+    assert_match "tls-profile=general", output
     assert_match "tls-backend=native", output
     assert_equal (bin/"tardi").realpath, (bin/"tardigrade").realpath
   end
