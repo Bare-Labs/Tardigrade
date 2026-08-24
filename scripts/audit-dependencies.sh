@@ -151,7 +151,15 @@ resolve_build_sources() {
 
 is_nonproduction_file() {
     case "$1" in
-    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
+    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh) return 0 ;;
+    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+is_nonproduction_zig_file() {
+    case "$1" in
+    .git/* | .zig-cache/* | zig-out/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
     scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
@@ -216,7 +224,7 @@ is_allowed_nonproduction_build_statement() {
     local stmt="$1"
     case "$stmt" in
     *evp_oracle* | *crypto_openssl_diff* | *pki_openssl_diff* | *tls_interop* | *h3_interop*) return 0 ;;
-    *'tests/'*'_interop'* | *'tests/interop'* | *'tests/support/'*) return 0 ;;
+    *'tests/'*'_interop'* | *'tests/interop'*) return 0 ;;
     *) return 1 ;;
     esac
 }
@@ -237,14 +245,14 @@ allowed_system_library() {
 
 scan_source_ffi() {
     [ -d "$REPO_ROOT" ] || return 0
-    local zigfile rel import_lines headers include_line include_header
+    local zigfile rel import_lines include_lines include_line include_header
     while IFS= read -r zigfile; do
         rel="$(relpath "$zigfile")"
-        is_nonproduction_file "$rel" && continue
+        is_nonproduction_zig_file "$rel" && continue
         import_lines="$(stripped "$zigfile" | grep -nE '@cImport[[:space:]]*\(' || true)"
         [ -z "$import_lines" ] && continue
-        headers="$(stripped "$zigfile" | grep -nE '@cInclude\("[^"]+"\)' || true)"
-        if [ -z "$headers" ]; then
+        include_lines="$(stripped "$zigfile" | grep -nE '@cInclude[[:space:]]*\(' || true)"
+        if [ -z "$include_lines" ]; then
             while IFS= read -r include_line; do
                 [ -z "$include_line" ] && continue
                 fail "production @cImport without reviewable @cInclude header list in $rel:$include_line"
@@ -253,12 +261,15 @@ scan_source_ffi() {
         fi
         while IFS= read -r include_line; do
             [ -z "$include_line" ] && continue
-            include_header="$(printf '%s\n' "$include_line" | sed -nE 's/^[0-9]+:.*@cInclude\("([^"]+)"\).*/\1/p')"
-            [ -n "$include_header" ] || continue
+            include_header="$(printf '%s\n' "$include_line" | sed -nE 's/^[0-9]+:.*@cInclude[[:space:]]*\([[:space:]]*"([^"]+)"[[:space:]]*\).*/\1/p')"
+            if [ -z "$include_header" ]; then
+                fail "production @cInclude uses unresolved non-literal header expression in $rel:$include_line"
+                continue
+            fi
             if ! allowed_c_header "$include_header"; then
                 fail "foreign/product C header imported from production source $rel:$include_line"
             fi
-        done <<<"$headers"
+        done <<<"$include_lines"
     done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
@@ -267,7 +278,7 @@ scan_runtime_loading() {
     local zigfile rel matches line
     while IFS= read -r zigfile; do
         rel="$(relpath "$zigfile")"
-        is_nonproduction_file "$rel" && continue
+        is_nonproduction_zig_file "$rel" && continue
         if matches="$(stripped "$zigfile" | grep -niE 'DynLib|DynamicLibrary|dlopen|LoadLibrary[A-Za-z]*' 2>/dev/null)"; then
             while IFS= read -r line; do
                 [ -z "$line" ] && continue
@@ -277,10 +288,21 @@ scan_runtime_loading() {
     done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
+validate_build_imports() {
+    local file="$1" imports line
+    if imports="$(stripped "$REPO_ROOT/$file" | grep -nE '@import[[:space:]]*\(' | grep -vE '@import[[:space:]]*\([[:space:]]*"[^"]+"' || true)"; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            fail "production build helper import uses unresolved non-literal expression in $file:$line"
+        done <<<"$imports"
+    fi
+}
+
 scan_build_graph() {
     local file rel stmt lib token srcfile
     while IFS= read -r file; do
         [ -f "$REPO_ROOT/$file" ] || continue
+        validate_build_imports "$file"
         while IFS= read -r stmt; do
             case "$stmt" in
             *linkSystemLibrary*'('*)
@@ -326,7 +348,7 @@ scan_build_graph() {
 approved_manifest_dependency() {
     local name="$1" path="$2" url="$3" hash="$4"
     case "$name:$path:$url:$hash" in
-    pure_zig:vendor/pure_zig::reviewed-pure-zig-fixture) return 0 ;;
+    pure_zig:vendor/pure_zig::) return 0 ;;
     *) return 1 ;;
     esac
 }
@@ -351,33 +373,51 @@ scan_manifest_dependencies() {
         }
     ')"
     while IFS= read -r dep; do
-        name="$(printf '%s\n' "$dep" | sed -nE 's/^[[:space:]]*\.([A-Za-z0-9_]+)[[:space:]]*=.*/\1/p')"
+        name="$(printf '%s\n' "$dep" | sed -nE 's/^[[:space:]]*\.([A-Za-z0-9_]+)[[:space:]]*=.*/\1/p; s/^[[:space:]]*\.@"([^"]+)"[[:space:]]*=.*/\1/p')"
         [ -n "$name" ] || continue
         path="$(printf '%s\n' "$deps" | awk -v dep="$name" '
-            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" { capture=1 }
+            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" || index($0, ".@\"" dep "\"") > 0 { capture=1 }
             capture && /\.path[[:space:]]*=/ { line=$0; sub(/.*\.path[[:space:]]*=[[:space:]]*"/, "", line); sub(/".*/, "", line); print line; exit }
             capture && /^[[:space:]]*\},?/ { capture=0 }
         ')"
         url="$(printf '%s\n' "$deps" | awk -v dep="$name" '
-            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" { capture=1 }
+            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" || index($0, ".@\"" dep "\"") > 0 { capture=1 }
             capture && /\.url[[:space:]]*=/ { line=$0; sub(/.*\.url[[:space:]]*=[[:space:]]*"/, "", line); sub(/".*/, "", line); print line; exit }
             capture && /^[[:space:]]*\},?/ { capture=0 }
         ')"
         hash="$(printf '%s\n' "$deps" | awk -v dep="$name" '
-            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" { capture=1 }
+            $0 ~ "^[[:space:]]*\\." dep "[[:space:]]*=" || index($0, ".@\"" dep "\"") > 0 { capture=1 }
             capture && /\.hash[[:space:]]*=/ { line=$0; sub(/.*\.hash[[:space:]]*=[[:space:]]*"/, "", line); sub(/".*/, "", line); print line; exit }
             capture && /^[[:space:]]*\},?/ { capture=0 }
         ')"
         if ! approved_manifest_dependency "$name" "$path" "$url" "$hash"; then
             fail "production manifest dependency .$name is not in the reviewed pure-Zig dependency allowlist"
         fi
-    done < <(printf '%s\n' "$deps" | grep -E '^[[:space:]]*\.[A-Za-z0-9_]+[[:space:]]*=' || true)
+    done < <(printf '%s\n' "$deps" | grep -E '^[[:space:]]*\.([A-Za-z0-9_]+|@"[^"]+")[[:space:]]*=' || true)
+}
+
+is_allowed_metadata_dependency_statement() {
+    local stmt="$1"
+    stmt="$(printf '%s\n' "$stmt" | tr -s '[:space:]' ' ')"
+    if printf '%s\n' "$stmt" | grep -qiE "$(forbidden_dependency_pattern)"; then
+        return 1
+    fi
+    case "$stmt" in
+    *'apt-get install -y --no-install-recommends ca-certificates curl xz-utils '* | *'apt-get install -y --no-install-recommends         ca-certificates curl xz-utils '*) return 0 ;;
+    *'apt-get install -y --no-install-recommends ca-certificates '*) return 0 ;;
+    *'sudo apt-get install -y rpm'*) return 0 ;;
+    *'depends_on :linux'*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+metadata_dependency_statement_pattern() {
+    printf '%s\n' 'apt(-get)? install|apk add|brew install|depends_on|Depends:|Requires:|cargo|go get|pip install'
 }
 
 scan_metadata() {
     local -a scan_files=()
-    local f rel matches line pattern helper_pattern
-    pattern="$(forbidden_dependency_pattern)"
+    local f rel matches line helper_pattern
     helper_pattern="$(explicit_nonproduction_helper_pattern)"
     [ -f "$REPO_ROOT/.github/workflows/release.yml" ] && scan_files+=("$REPO_ROOT/.github/workflows/release.yml")
     while IFS= read -r f; do scan_files+=("$f"); done < <(find "$REPO_ROOT/packaging" -type f 2>/dev/null | sort)
@@ -405,10 +445,12 @@ scan_metadata() {
                 done <<<"$matches"
             fi
         fi
-        if matches="$(logical_shell_statements <(stripped "$f") | grep -niE "(^|[[:space:][:punct:]])(apt(-get)? install|apk add|brew install|depends_on|Depends:|Requires:|RUN .*install|cargo|go get|pip install).*($pattern)" 2>/dev/null)"; then
+        if matches="$(logical_shell_statements <(stripped "$f") | grep -niE "$(metadata_dependency_statement_pattern)" 2>/dev/null)"; then
             while IFS= read -r line; do
                 [ -z "$line" ] && continue
-                fail "production package/container metadata introduces foreign implementation dependency in $rel: $line"
+                if ! is_allowed_metadata_dependency_statement "$line"; then
+                    fail "production package/container metadata contains unreviewed dependency declaration in $rel: $line"
+                fi
             done <<<"$matches"
         fi
         if matches="$(logical_shell_statements <(stripped "$f") | grep -niE 'LD_PRELOAD|DYLD_INSERT_LIBRARIES|[A-Za-z0-9_./@-]+\.(so|dylib|dll)([^A-Za-z0-9_]|$)|\.framework(/|:|$)' 2>/dev/null)"; then
@@ -500,6 +542,26 @@ pub fn build(b: *std.Build) void {
 }
 EOF
         ;;
+    fail-build-helper-computed-import)
+        mkdir -p "$root/build"
+        printf 'foreign object placeholder\n' >"$root/foreign.o"
+        cat >"$root/build/product.zig" <<'EOF'
+const std = @import("std");
+pub fn configure(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    exe.addObjectFile(b.path("foreign.o"));
+}
+EOF
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+const helper_path = "build/product.zig";
+const product = @import(helper_path);
+pub fn build(b: *std.Build) void {
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    product.configure(b, exe);
+    b.installArtifact(exe);
+}
+EOF
+        ;;
     fail-test-looking-production-target)
         printf 'foreign object placeholder\n' >"$root/foreign.o"
         cat >"$root/build.zig" <<'EOF'
@@ -509,6 +571,34 @@ pub fn build(b: *std.Build) void {
     benchmark_tardi.addObjectFile(b.path("foreign.o"));
     b.installArtifact(benchmark_tardi);
 }
+EOF
+        ;;
+    fail-tests-support-object-reached)
+        mkdir -p "$root/tests/support"
+        printf 'foreign object placeholder\n' >"$root/tests/support/foreign.o"
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    exe.addObjectFile(b.path("tests/support/foreign.o"));
+    b.installArtifact(exe);
+}
+EOF
+        ;;
+    fail-tests-support-runtime-loading)
+        mkdir -p "$root/tests/support"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so"); }\n' >"$root/tests/support/product.zig"
+        ;;
+    fail-cinclude-computed)
+        cat >"$root/src/main.zig" <<'EOF'
+const foreign_header = "foreigncodec/api.h";
+const os = @cImport({
+    @cInclude("unistd.h");
+});
+const foreign = @cImport({
+    @cInclude(foreign_header);
+});
+pub fn main() void { _ = os; _ = foreign; }
 EOF
         ;;
     fail-translate-c)
@@ -591,6 +681,25 @@ EOF
         printf 'pub fn ok() void {}\n' >"$root/vendor/fastcodec/root.zig"
         printf 'int codec(void) { return 1; }\n' >"$root/vendor/fastcodec/codec.c"
         ;;
+    fail-quoted-dependency-key-c)
+        mkdir -p "$root/vendor/fastcodec"
+        cat >"$root/build.zig.zon" <<'EOF'
+.{
+    .dependencies = .{
+        .@"fast-codec" = .{ .path = "vendor/fastcodec" },
+    },
+}
+EOF
+        cat >"$root/vendor/fastcodec/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const lib = b.addStaticLibrary(.{ .name = "fastcodec", .root_source_file = b.path("root.zig") });
+    lib.addCSourceFile(.{ .file = b.path("codec.c") });
+}
+EOF
+        printf 'pub fn ok() void {}\n' >"$root/vendor/fastcodec/root.zig"
+        printf 'int codec(void) { return 1; }\n' >"$root/vendor/fastcodec/codec.c"
+        ;;
     fail-compose-preload)
         cat >"$root/compose.yaml" <<'EOF'
 services:
@@ -600,6 +709,13 @@ services:
       LD_PRELOAD: /plugins/ForeignCodec.so
     volumes:
       - ./ForeignCodec.so:/plugins/ForeignCodec.so:ro
+EOF
+        ;;
+    fail-unknown-package)
+        printf 'Package: tardigrade\nDepends: libforeigncodec1\n' >"$root/packaging/control"
+        cat >"$root/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends foreigncodec-runtime
 EOF
         ;;
     fail-dlopen)
@@ -623,7 +739,7 @@ EOF
         cat >"$root/build.zig.zon" <<'EOF'
 .{
     .dependencies = .{
-        .pure_zig = .{ .path = "vendor/pure_zig", .hash = "reviewed-pure-zig-fixture" },
+        .pure_zig = .{ .path = "vendor/pure_zig" },
     },
 }
 EOF
@@ -636,7 +752,7 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-test-looking-production-target fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-compose-preload fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-test-looking-production-target fail-tests-support-object-reached fail-tests-support-runtime-loading fail-cinclude-computed fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-compose-preload fail-unknown-package fail-dlopen; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2

@@ -220,15 +220,16 @@ $ tardi version
 
 Runs before anything is compiled and fails if:
 
-1. Production `src/**/*.zig` uses `@cImport` for anything outside the narrow
-   OS/platform header allowlist.
+1. Production-scoped Zig source across the repository uses `@cImport` for
+   anything outside the narrow OS/platform header allowlist.
 2. Production source uses runtime dynamic loading (`std.DynLib`, `dlopen`,
    `LoadLibrary`, etc.) that could hide a foreign implementation fallback.
 3. Production build-graph sources link a non-allowlisted system library or
    compile vendored C/C++/Objective-C/object code into a production target.
-4. Production package/container/release metadata introduces a foreign product
-   implementation dependency such as OpenSSL/libssl/libcrypto/ngtcp2/nghttp3/
-   quiche/GnuTLS/rustls/Brotli C libraries and similar peers.
+4. Production package/container/release metadata contains an unreviewed
+   dependency declaration. Ordinary OS/build substrate such as CA bundles is
+   explicitly allowlisted; newly named product implementation dependencies
+   fail closed until reviewed.
 
 The script also defines the production/non-production split mechanically.
 Explicitly non-production paths include `tests/`, `scripts/interop/`,
@@ -238,10 +239,12 @@ every `scripts/test-*` helper by prefix: adding a new nominally test-named
 helper that installs a foreign implementation is a production-scope failure
 unless it is reviewed into the explicit non-production allowlist. The
 `--self-test` fixture mode proves representative failures and passes: foreign
-production `@cImport`, multiline/indirect system-library linkage, vendored C,
-runtime loading, multiline package/container installs, production paths
-reaching nominal test helpers, and package dependencies fail; OS-substrate
-`@cImport`, pure-Zig packages, interop peers, and prose mentions pass.
+production `@cImport`, computed C includes, multiline/indirect system-library
+linkage, computed build-helper imports, vendored C/object inputs, runtime
+loading, multiline package/container installs, production paths reaching
+nominal test helpers, quoted ZON dependency keys, and unknown package
+dependencies fail; OS-substrate `@cImport`, reviewed pure-Zig packages,
+interop peers, and prose mentions pass.
 
 ### Binary linkage audit — `scripts/audit-release-binary.sh`
 
