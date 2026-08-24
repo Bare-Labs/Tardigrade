@@ -80,6 +80,7 @@ jobs:
           fi
           ruby -c "$tmpdir/tardigrade.rb"
           ruby -c packaging/homebrew/tardigrade.rb
+          ./scripts/test-homebrew-tap-sync.sh
 
   # ── TLS dependency audit ──────────────────────────────────────────────────────
   # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3

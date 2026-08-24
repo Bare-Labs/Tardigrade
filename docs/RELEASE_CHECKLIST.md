@@ -46,10 +46,11 @@ Use this checklist before tagging and distributing a Tardigrade release.
       no forbidden foreign TLS/crypto/QUIC/H3 dependency
 - [ ] Verify published DEB/RPM metadata does not declare OpenSSL/libssl/libcrypto
       as a Tardigrade runtime dependency
-- [ ] Copy the rendered Homebrew formula and README into
-      `Bare-Systems/homebrew-tap` with `--tap-dir`, review the tap diff, and
-      publish it only after the referenced release assets are visible and the
-      install smoke passes
+- [ ] Copy the rendered Homebrew formula into `Bare-Systems/homebrew-tap` with
+      `--tap-dir`, review the tap diff, and publish it only after the
+      referenced release assets are visible and the install smoke passes.
+      `homebrew-tap/README.md` is tap-owned; update it only when public
+      support policy or install instructions change.
 - [ ] Verify both Darwin archives have matching SPDX SBOMs and
       `dependency-inventory-*.json` artifacts, and verify archive provenance
       with `gh attestation verify <archive> --repo Bare-Systems/Tardigrade`

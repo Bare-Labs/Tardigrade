@@ -289,13 +289,18 @@ ruby -c packaging/homebrew/tardigrade.rb
 `tardigrade-checksums.txt`, and verifies every emitted formula archive is
 present in the same release before writing URLs and SHA-256 values.
 
-Copy the formula and tap README into a tap checkout:
+Synchronize the generated formula into a tap checkout:
 
 ```bash
 ./scripts/update-homebrew-formula.sh \
   --tag vX.Y.Z \
   --tap-dir ../homebrew-tap
 ```
+
+`--tap-dir` updates only `Bare-Systems/homebrew-tap/Formula/tardigrade.rb`.
+The tap repository owns its public `README.md`; it is not rewritten during
+normal Tardigrade version bumps. Change the tap documentation only when the
+public support policy or install instructions actually change.
 
 Run a host-native Homebrew install smoke against a local release-shaped archive
 after building a native release binary:

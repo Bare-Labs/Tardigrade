@@ -165,6 +165,14 @@ validate_native_inventory() {
     fi
 }
 
+sync_tap_formula() {
+    formula="$1"
+    tap_dir="$2"
+
+    mkdir -p "$tap_dir/Formula"
+    install -m 0644 "$formula" "$tap_dir/Formula/tardigrade.rb"
+}
+
 emit_branch() {
     arch_dsl="$1"
     asset="$2"
@@ -265,9 +273,7 @@ ruby -c "$formula_tmp" >/dev/null
 install -m 0644 "$formula_tmp" "$FORMULA_PATH"
 
 if [ -n "$TAP_DIR" ]; then
-    mkdir -p "$TAP_DIR/Formula"
-    install -m 0644 "$formula_tmp" "$TAP_DIR/Formula/tardigrade.rb"
-    install -m 0644 "$REPO_ROOT/packaging/homebrew/tap-README.md" "$TAP_DIR/README.md"
+    sync_tap_formula "$formula_tmp" "$TAP_DIR"
 fi
 
 printf 'updated %s from %s\n' "$FORMULA_PATH" "$manifest"
