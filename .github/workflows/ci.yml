@@ -105,6 +105,9 @@ jobs:
       - name: Source audit regression fixtures
         run: ./scripts/audit-dependencies.sh --self-test
 
+      - name: Binary audit regression fixtures
+        run: ./scripts/audit-release-binary.sh --self-test
+
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
 

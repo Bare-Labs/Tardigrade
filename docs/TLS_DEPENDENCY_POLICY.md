@@ -232,19 +232,27 @@ Runs before anything is compiled and fails if:
 
 The script also defines the production/non-production split mechanically.
 Explicitly non-production paths include `tests/`, `scripts/interop/`,
-`scripts/test-*`, benchmarks, and checked-in testdata fixture generators. The
+benchmarks, checked-in testdata fixture generators, and a narrow set of named
+package/install smoke-test scripts. The audit deliberately does not exempt
+every `scripts/test-*` helper by prefix: adding a new nominally test-named
+helper that installs a foreign implementation is a production-scope failure
+unless it is reviewed into the explicit non-production allowlist. The
 `--self-test` fixture mode proves representative failures and passes: foreign
-production `@cImport`, system-library linkage, vendored C, runtime loading,
-and package dependencies fail; OS-substrate `@cImport`, pure-Zig packages,
-interop peers, and prose mentions pass.
+production `@cImport`, multiline/indirect system-library linkage, vendored C,
+runtime loading, multiline package/container installs, production paths
+reaching nominal test helpers, and package dependencies fail; OS-substrate
+`@cImport`, pure-Zig packages, interop peers, and prose mentions pass.
 
 ### Binary linkage audit — `scripts/audit-release-binary.sh`
 
-Inspects a produced binary's dynamic dependencies (`ldd` on Linux, `otool -L`
-on macOS) and emits a machine-readable JSON inventory. It fails if:
+Inspects a produced binary's dynamic dependencies (`readelf`/`objdump` on
+Linux, `otool -L` on macOS) and emits a machine-readable JSON inventory. It
+fails if:
 
-- an artifact of either profile links OpenSSL or any forbidden foreign
-  library; or
+- an artifact of either profile has a dynamic dependency outside the narrow
+  per-platform OS/runtime substrate allowlist (`libSystem.B.dylib` on Darwin;
+  libc/loader/thread/math/dl/rt/resolver/compiler-unwind substrate on Linux);
+  or
 - an artifact does not self-report the native TLS path; or
 - an artifact's self-reported `tls-profile` disagrees with the profile it
   was built and audited as.
@@ -254,10 +262,14 @@ self-reported backend, full dependency list, and any violations.
 
 ### CI
 
-The `TLS dependency audit` job in `.github/workflows/ci.yml` runs the source
-audit, builds both profiles, and runs the binary audit against each,
-uploading the inventories as artifacts. It is a required check: CI fails if any
-forbidden implementation is configured, imported, or linked in either profile.
+The `Production dependency audit (Linux)` job in `.github/workflows/ci.yml`
+runs the source audit, source-audit fixtures, binary-audit fixtures, builds
+both profiles, and runs the binary audit against each, uploading the inventories
+as artifacts. `Production binary audit (macOS)` builds and audits the Darwin
+general-profile artifact so platform-specific dynamic dependencies are checked
+in PR CI too. These are required checks: CI fails if any forbidden
+implementation is configured, imported, packaged, dynamically loaded, or linked
+in a production path.
 
 ### Release
 

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# TLS/crypto binary linkage audit and dependency inventory (#379, epic #327,
-# cutover #634, retirement #649).
+# Production binary linkage audit and dependency inventory (#379, epic #327,
+# cutover #634, retirement #649, #651).
 #
 # Inspects a produced tardi binary's dynamic dependencies and emits a
 # machine-readable inventory. Every supported profile (`general` and
-# `appliance`) is native-only: this fails if the binary links OpenSSL,
-# libcrypto, or any other foreign TLS/crypto/QUIC/H3/certificate library, and
-# confirms the binary self-reports the native TLS path.
+# `appliance`) is native-only: this fails if the binary links any unexplained
+# dynamic dependency outside the narrow per-platform OS/runtime substrate
+# allowlist, and confirms the binary self-reports the native TLS path.
 #
 # Usage:
 #   audit-release-binary.sh --binary PATH --profile {general|appliance} \
 #       [--output inventory.json]
+#   audit-release-binary.sh --self-test
 #
 # Exit code 0 means the audit passed. A forbidden linkage, or a profile that
 # disagrees with the binary's self-report, exits 1.
@@ -20,10 +21,12 @@ set -euo pipefail
 BINARY=""
 PROFILE=""
 OUTPUT=""
+SELF_TEST=false
 
 usage() {
     cat <<'EOF'
 Usage: audit-release-binary.sh --binary PATH --profile {general|appliance} [--output FILE]
+       audit-release-binary.sh --self-test
 EOF
 }
 
@@ -41,6 +44,10 @@ while [ "$#" -gt 0 ]; do
         OUTPUT="$2"
         shift 2
         ;;
+    --self-test)
+        SELF_TEST=true
+        shift
+        ;;
     -h | --help)
         usage
         exit 0
@@ -52,6 +59,62 @@ while [ "$#" -gt 0 ]; do
         ;;
     esac
 done
+
+allowed_dynamic_dependency() {
+    local host_os="$1" dep="$2"
+    case "$host_os" in
+    Darwin)
+        case "$dep" in
+        libSystem.B.dylib) return 0 ;;
+        *) return 1 ;;
+        esac
+        ;;
+    Linux)
+        case "$dep" in
+        libc.so.* | ld-linux*.so.* | ld64.so.* | libpthread.so.* | libm.so.* | libdl.so.* | librt.so.* | libresolv.so.* | libgcc_s.so.* | libunwind.so.*) return 0 ;;
+        *) return 1 ;;
+        esac
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+}
+
+evaluate_dependency_list() {
+    local host_os="$1" deps_in="$2" dep
+    while IFS= read -r dep; do
+        [ -z "$dep" ] && continue
+        if ! allowed_dynamic_dependency "$host_os" "$dep"; then
+            printf '%s\n' "$dep"
+        fi
+    done <<<"$deps_in"
+}
+
+run_self_test() {
+    local unknown
+    unknown="$(evaluate_dependency_list Darwin $'libSystem.B.dylib\nlibforeigncodec.dylib')"
+    if [ "$unknown" != "libforeigncodec.dylib" ]; then
+        echo "self-test failed: Darwin unknown dependency was not rejected" >&2
+        return 1
+    fi
+    unknown="$(evaluate_dependency_list Linux $'libc.so.6\nlibforeigncodec.so.1')"
+    if [ "$unknown" != "libforeigncodec.so.1" ]; then
+        echo "self-test failed: Linux unknown dependency was not rejected" >&2
+        return 1
+    fi
+    unknown="$(evaluate_dependency_list Linux $'libc.so.6\nlibpthread.so.0')"
+    if [ -n "$unknown" ]; then
+        echo "self-test failed: Linux OS substrate dependency was rejected: $unknown" >&2
+        return 1
+    fi
+    echo "binary audit self-test passed"
+}
+
+if [ "$SELF_TEST" = true ]; then
+    run_self_test
+    exit $?
+fi
 
 if [ -z "$BINARY" ] || [ -z "$PROFILE" ]; then
     usage
@@ -68,11 +131,6 @@ general | appliance) ;;
     exit 2
     ;;
 esac
-
-# Foreign TLS/crypto/QUIC/H3/certificate libraries that must never appear in a
-# Tardigrade link graph. openssl/crypto are handled separately below, but are
-# forbidden identically: every supported profile is native-only.
-FORBIDDEN_LIB_PATTERNS='ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libtls|libressl|botan|s2n'
 
 # ── Collect dynamic dependencies across platforms ────────────────────────────
 #
@@ -136,7 +194,7 @@ if printf '%s\n' "$dep_names" | grep -qiE 'libssl|libcrypto'; then
     links_openssl=true
 fi
 
-forbidden_hits="$(printf '%s\n' "$dep_names" | grep -iE "$FORBIDDEN_LIB_PATTERNS" || true)"
+unallowed_deps="$(evaluate_dependency_list "$os" "$dep_names")"
 
 # ── Binary self-report (the version line records the built-in profile) ───────
 # Both the profile and the backend are parsed and checked: the requested
@@ -155,11 +213,11 @@ reported_profile="$(printf '%s' "$self_report" | sed -nE 's/.*tls-profile=([a-zA
 status="pass"
 declare -a violations=()
 
-if [ -n "$forbidden_hits" ]; then
+if [ -n "$unallowed_deps" ]; then
     while IFS= read -r hit; do
         [ -z "$hit" ] && continue
-        violations+=("forbidden foreign TLS/crypto/QUIC library linked: $hit")
-    done <<<"$forbidden_hits"
+        violations+=("unallowed dynamic dependency outside OS/runtime substrate: $hit")
+    done <<<"$unallowed_deps"
 fi
 
 # The artifact must actually be the profile it is being audited as, regardless

@@ -130,7 +130,15 @@ resolve_build_sources() {
         dir="$(dirname "$f")"
         while IFS= read -r imp; do
             [ -z "$imp" ] && continue
-            target="$(cd "$REPO_ROOT/$dir" && cd "$(dirname "$imp")" 2>/dev/null && pwd -P || true)"
+            if target="$(
+                cd "$REPO_ROOT/$dir" &&
+                    cd "$(dirname "$imp")" 2>/dev/null &&
+                    pwd -P
+            )"; then
+                :
+            else
+                target=""
+            fi
             [ -n "$target" ] || continue
             target="$(relpath "$target/$(basename "$imp")")"
             case "$target" in
@@ -143,13 +151,63 @@ resolve_build_sources() {
 
 is_nonproduction_file() {
     case "$1" in
-    tests/* | scripts/interop/* | scripts/test-* | benchmarks/* | src/*/testdata/*) return 0 ;;
+    tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
+    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
 }
 
-is_test_build_line() {
-    printf '%s\n' "$1" | grep -qiE 'test|interop|differential|oracle|fuzz|benchmark|evp_'
+forbidden_dependency_pattern() {
+    printf '%s\n' 'openssl|libssl|libcrypto|ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libressl|rustls|s2n|botan|brotli|libbrotli|libbrotlienc'
+}
+
+logical_zig_statements() {
+    awk '
+    {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        if (line == "") next
+        stmt = stmt " " line
+        if (line ~ /;[ \t]*$/ || line ~ /\{[ \t]*$/ || line ~ /\}[ \t]*$/) {
+            print stmt
+            stmt = ""
+        }
+    }
+    END { if (stmt != "") print stmt }
+    ' "$1"
+}
+
+logical_shell_statements() {
+    awk '
+    {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        if (line == "") next
+        if (line ~ /\\[ \t]*$/) {
+            sub(/\\[ \t]*$/, "", line)
+            stmt = stmt " " line
+            next
+        }
+        stmt = stmt " " line
+        print stmt
+        stmt = ""
+    }
+    END { if (stmt != "") print stmt }
+    ' "$1"
+}
+
+resolve_build_string() {
+    local file="$1" token="$2"
+    stripped "$file" | sed -nE "s/^[[:space:]]*(const|var)[[:space:]]+${token}[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\2/p" | tail -n 1
+}
+
+is_allowed_nonproduction_build_statement() {
+    local stmt="$1"
+    case "$stmt" in
+    *evp_oracle* | *crypto_openssl_diff* | *pki_openssl_diff* | *interop* | *differential* | *fuzz* | *benchmark*) return 0 ;;
+    *'tests/'*) return 0 ;;
+    *) return 1 ;;
+    esac
 }
 
 allowed_c_header() {
@@ -209,29 +267,42 @@ scan_runtime_loading() {
 }
 
 scan_build_graph() {
-    local file rel line lib srcfile
+    local file rel stmt lib token srcfile
     while IFS= read -r file; do
         [ -f "$REPO_ROOT/$file" ] || continue
-        while IFS= read -r line; do
-            case "$line" in
-            *linkSystemLibrary*\"*\"*)
-                lib="$(printf '%s\n' "$line" | sed -nE 's/.*linkSystemLibrary[^(]*\([^"]*"([^"]+)".*/\1/p')"
-                [ -z "$lib" ] && continue
-                if ! allowed_system_library "$lib" && ! is_test_build_line "$line"; then
-                    fail "production foreign system library link in $file: $line"
+        while IFS= read -r stmt; do
+            case "$stmt" in
+            *linkSystemLibrary*'('*)
+                case "$stmt" in
+                " fn linkSystemLibrary("* | *"compile.root_module.linkSystemLibrary(name"*) continue ;;
+                esac
+                if is_allowed_nonproduction_build_statement "$stmt"; then
+                    continue
+                fi
+                lib="$(printf '%s\n' "$stmt" | sed -nE 's/.*linkSystemLibrary[^(]*\([^"]*"([^"]+)".*/\1/p')"
+                if [ -z "$lib" ]; then
+                    token="$(printf '%s\n' "$stmt" | sed -nE 's/.*linkSystemLibrary[^(]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+                    if [ -n "$token" ] && [ "$token" != "name" ]; then
+                        lib="$(resolve_build_string "$REPO_ROOT/$file" "$token")"
+                    fi
+                fi
+                if [ -z "$lib" ]; then
+                    fail "production system library link uses unresolved library expression in $file: $stmt"
+                elif ! allowed_system_library "$lib"; then
+                    fail "production foreign system library link in $file: $stmt"
                 fi
                 ;;
             *addCSourceFiles* | *addCSourceFile* | *addObjectFile*)
-                if ! is_test_build_line "$line"; then
-                    fail "production vendored foreign source/object compilation in $file: $line"
+                if ! is_allowed_nonproduction_build_statement "$stmt"; then
+                    fail "production vendored foreign source/object compilation in $file: $stmt"
                 fi
                 ;;
             esac
-        done < <(stripped "$REPO_ROOT/$file")
+        done < <(logical_zig_statements <(stripped "$REPO_ROOT/$file"))
     done < <(resolve_build_sources)
 
     if [ -f "$REPO_ROOT/build.zig.zon" ]; then
-        if stripped "$REPO_ROOT/build.zig.zon" | grep -niE '\.(url|path)[[:space:]]*=' | grep -qEi 'openssl|libssl|libcrypto|ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libressl|rustls|s2n|botan|\.c(pp)?($|[?#"])'; then
+        if stripped "$REPO_ROOT/build.zig.zon" | grep -niE '\.(url|path)[[:space:]]*=' | grep -qEi "$(forbidden_dependency_pattern)|\.c(pp)?($|[?#\"])"; then
             fail "production manifest dependency appears to introduce a foreign runtime implementation in build.zig.zon"
         fi
     fi
@@ -247,7 +318,8 @@ scan_build_graph() {
 
 scan_metadata() {
     local -a scan_files=()
-    local f rel matches line
+    local f rel matches line pattern
+    pattern="$(forbidden_dependency_pattern)"
     [ -f "$REPO_ROOT/.github/workflows/release.yml" ] && scan_files+=("$REPO_ROOT/.github/workflows/release.yml")
     while IFS= read -r f; do scan_files+=("$f"); done < <(find "$REPO_ROOT/packaging" -type f 2>/dev/null | sort)
     while IFS= read -r f; do
@@ -266,12 +338,10 @@ scan_metadata() {
         case "$rel" in
         *.md) continue ;;
         esac
-        if matches="$(stripped "$f" | grep -niE '(^|[[:space:][:punct:]])(apt(-get)? install|apk add|brew install|depends_on|Depends:|Requires:|RUN .*install|cargo|go get|pip install).*(openssl|libssl|libcrypto|ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libressl|rustls|s2n|botan)' 2>/dev/null)"; then
+        if matches="$(logical_shell_statements <(stripped "$f") | grep -niE "(^|[[:space:][:punct:]])(apt(-get)? install|apk add|brew install|depends_on|Depends:|Requires:|RUN .*install|cargo|go get|pip install).*($pattern)" 2>/dev/null)"; then
             while IFS= read -r line; do
                 [ -z "$line" ] && continue
-                if ! is_test_build_line "$line"; then
-                    fail "production package/container metadata introduces foreign implementation dependency in $rel: $line"
-                fi
+                fail "production package/container metadata introduces foreign implementation dependency in $rel: $line"
             done <<<"$matches"
         fi
     done
@@ -320,11 +390,66 @@ pub fn build(b: *std.Build) void {
 }
 EOF
         ;;
+    fail-link-multiline)
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    exe.root_module.linkSystemLibrary(
+        "foreignssl",
+        .{},
+    );
+}
+EOF
+        ;;
+    fail-link-indirect)
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const product_lib = "foreignssl";
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    exe.root_module.linkSystemLibrary(product_lib, .{});
+}
+EOF
+        ;;
     fail-csource)
         printf 'int foreign_impl(void) { return 1; }\n' >"$root/src/foreign_impl.c"
         ;;
+    fail-build-csource-multiline)
+        printf 'int foreign_impl(void) { return 1; }\n' >"$root/foreign_impl.c"
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    exe.addCSourceFile(.{
+        .file = b.path("foreign_impl.c"),
+    });
+}
+EOF
+        ;;
     fail-package)
         printf 'Package: tardigrade\nDepends: libssl3\n' >"$root/packaging/control"
+        ;;
+    fail-docker-multiline)
+        cat >"$root/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3
+EOF
+        ;;
+    fail-test-helper-reached)
+        cat >"$root/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN ./scripts/test-install-runtime.sh
+EOF
+        cat >"$root/scripts/test-install-runtime.sh" <<'EOF'
+#!/usr/bin/env bash
+apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libssl3
+EOF
+        chmod +x "$root/scripts/test-install-runtime.sh"
         ;;
     fail-dlopen)
         printf 'const std = @import("std");\npub fn main() void { _ = std.DynLib.open("libssl.so"); }\n' >"$root/src/main.zig"
@@ -360,7 +485,7 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-csource fail-package fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-package fail-docker-multiline fail-test-helper-reached fail-dlopen; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2
