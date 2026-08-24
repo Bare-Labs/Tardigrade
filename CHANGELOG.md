@@ -4,6 +4,8 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-24
+
 ### Added
 - **Production dependency boundary enforcement (#651)** — production source,
   build, package, container, and binary audits now enforce the project-wide
