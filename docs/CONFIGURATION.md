@@ -330,9 +330,11 @@ signatures made with Ed25519, ECDSA P-256/SHA-256, or RSA-PSS/SHA-256 only
 classic RSA PKCS#1 v1.5 or another unsupported algorithm fails verification
 even with a correct CA bundle and hostname (see `docs/TROUBLESHOOTING.md`).
 Independently, `appliance`/`native` also caps each peer certificate entry at
-2048 DER bytes and the whole handshake message at 8 KiB; a certificate or
-chain exceeding either bound fails even when its signature algorithm is
-otherwise supported. `general` has neither restriction.
+8 KiB DER bytes and the whole handshake message at 16 KiB (#646) — generous
+enough for ordinary public WebPKI certificates/chains, including a leaf with
+a large SAN set; a certificate or chain genuinely outside those norms fails
+even when its signature algorithm is otherwise supported. `general` has
+neither restriction.
 
 ### Health Checks And Circuit Breaking
 

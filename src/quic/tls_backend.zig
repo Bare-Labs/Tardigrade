@@ -974,8 +974,22 @@ fn fuzzTransportParameterRoundTrip(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "QUIC TLS backend does not embed maximum ticket storage" {
-    try std.testing.expect(@sizeOf(Tls13Backend) < 128 * 1024);
-    try std.testing.expect(@sizeOf(Tls13Backend) < tls_core.tls13_transport.max_new_session_ticket_message_len);
+    // #646: this profile's `Tls13Backend` runs meaningfully larger than the
+    // shared engine's own budget test (`tls13_backend.zig`'s sibling test)
+    // asserts, because this build also links the crypto-provider
+    // configuration the QUIC/H3 test suite exercises. The ceiling here grew
+    // alongside `max_message_len`/`max_certificate_len` for the same reason
+    // — see that constant's doc comment — with headroom kept comparable to
+    // what existed before this change.
+    try std.testing.expect(@sizeOf(Tls13Backend) < 160 * 1024);
+    // The precise "does not embed maximum ticket storage" claim: a
+    // post-handshake message only reassembles inline up to
+    // `post_handshake_inline_capacity` (sized to `KeyUpdate`'s fixed frame,
+    // not to a ticket's) — everything larger, including every real ticket,
+    // is heap-allocated instead. Comparing the *whole* backend's size
+    // against the ticket bound directly stopped being meaningful once
+    // `max_message_len` grew close to it (see the sibling assertion above).
+    try std.testing.expect(shared.post_handshake_inline_capacity < tls_core.tls13_transport.max_new_session_ticket_message_len);
 }
 
 test "QUIC adapter teardown wipes private scratch, parameters, and shared engine ownership" {

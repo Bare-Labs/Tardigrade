@@ -107,11 +107,44 @@ const max_digest_len = crypto_provider_pkg.max_digest_len;
 /// connection's own digest length can also be SHA-384's 48 bytes.
 pub const hash_len = 32;
 /// Largest framed handshake message we accept during the main handshake.
-pub const max_message_len = 8 * 1024;
+///
+/// #646: raised from 8 KiB to 16 KiB so an ordinary public WebPKI
+/// Certificate message — a leaf plus one or two intermediates, each within
+/// `max_certificate_len` — fits without the *aggregate* message bound
+/// rejecting an otherwise-valid chain the per-entry bound alone would have
+/// accepted. This is still a deliberate resource-limit ceiling, not an
+/// attempt to admit an arbitrarily large flight: raising it grows every
+/// per-connection buffer sized to it (the two handshake reassemblers, the
+/// HelloRetryRequest ClientHello1 capture, and the transcript's
+/// pre-family-selection buffer — kept in sync via
+/// `transcript.max_pending_len`, see the `comptime` check below), which is
+/// why `max_certificate_len` and this bound were evaluated together rather
+/// than raised independently (see the caller-facing size caveat this
+/// closes in `docs/TLS_DEPENDENCY_POLICY.md`).
+pub const max_message_len = 16 * 1024;
 /// Largest framed post-handshake NewSessionTicket message: a 65535-byte opaque
 /// ticket identity plus its handshake header and small fixed/vector fields.
 pub const max_new_session_ticket_message_len = tls13_transport.max_new_session_ticket_message_len;
+/// `PostHandshakeInput`'s inline (non-heap) reassembly capacity — see its
+/// doc comment. Exported only so callers (this module's and
+/// `quic/tls_backend.zig`'s "does not embed maximum ticket storage" tests)
+/// can assert directly that a post-handshake message this size or smaller
+/// never triggers a heap allocation, without duplicating the constant.
+pub const post_handshake_inline_capacity = PostHandshakeInput.inline_capacity;
 const handshake_header_len = 4;
+
+// `transcript.zig` cannot import this module (this module already imports
+// `transcript.zig`, and the reverse would be circular), so
+// `tls_transcript.max_pending_len` duplicates `max_message_len +
+// handshake_header_len` as a literal rather than referencing it directly —
+// see that constant's doc comment. This assertion is what keeps the
+// duplicate from silently drifting the next time either bound changes.
+comptime {
+    if (tls_transcript.max_pending_len != max_message_len + handshake_header_len) {
+        @compileError("transcript.max_pending_len must track tls13_backend.max_message_len + handshake_header_len");
+    }
+}
+
 var empty_observer_dummy: u8 = 0;
 
 const PostHandshakeInput = struct {
@@ -247,7 +280,17 @@ const PostHandshakeInput = struct {
 fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
     return a.ptr == b.ptr and a.vtable == b.vtable;
 }
-pub const max_certificate_len = 2048;
+/// Largest single peer `CertificateEntry` (raw DER) the engine admits before
+/// the verifier ever sees it.
+///
+/// #646: raised from 2 KiB to 8 KiB — a real WebPKI leaf certificate with a
+/// large SAN set (dozens to low hundreds of names) routinely exceeds 2 KiB
+/// while carrying no unsupported field; 8 KiB has generous headroom above
+/// that norm without admitting an unbounded entry. This does not bound the
+/// number of DER bytes a full chain may occupy — `max_message_len` (the
+/// whole Certificate message) and `max_peer_chain_bytes` (this engine's
+/// reassembled-chain storage) do, independently.
+pub const max_certificate_len = 8 * 1024;
 /// The Certificate handshake message's fixed framing overhead, counted in the
 /// flight-size preflight so a chain cannot pass validation and then overflow the
 /// writer once the message header is added: 1-byte msg_type + 3-byte length +
@@ -622,7 +665,15 @@ pub const ClientAuthMode = enum { disabled, optional, required };
 /// reassembles and surfaces to a `PeerVerifier` as immutable views. A chain
 /// exceeding either bound fails closed (peer-attributed) rather than being
 /// truncated, so a verifier never sees a partial chain.
-pub const max_peer_chain_bytes = 16 * 1024;
+///
+/// Tied to `max_message_len` rather than given its own literal (#646): the
+/// entries this buffer accumulates all arrive within one Certificate
+/// message, whose own framing already bounds their combined raw-DER
+/// contribution to less than `max_message_len`. A cap smaller than
+/// `max_message_len` would just be a second, redundant rejection point for
+/// chains the message-level bound already admits; a cap larger than it
+/// could never actually be reached.
+pub const max_peer_chain_bytes = max_message_len;
 pub const max_peer_chain_entries = credentials.max_chain_entries;
 /// Largest set of peer-offered signature schemes captured for selection.
 /// Generous versus real ClientHellos (~a dozen); a larger offer fails closed
@@ -6358,15 +6409,34 @@ const TestFailingKeyShareProvider = struct {
 const test_crypto_provider_seed: u64 = 0x71357_490;
 
 test "TLS-owned backend does not embed maximum ticket storage" {
-    // #564: the budget grew from 64 KiB to accommodate exactly one framed
-    // handshake message's worth of transcript pre-selection buffering
-    // (`transcript.max_pending_len`) — see that constant's doc comment for
-    // why a client cannot hash its own ClientHello until the negotiated
-    // suite (learned only from the server's response) is known. This is
-    // still nowhere near `max_new_session_ticket_message_len`, checked
-    // below, so ticket storage itself remains unaffected.
-    try std.testing.expect(@sizeOf(Tls13Backend) < 96 * 1024);
-    try std.testing.expect(@sizeOf(Tls13Backend) + EventSink.max_bytes < max_new_session_ticket_message_len);
+    // #564: the budget grew from 64 KiB to 96 KiB to accommodate exactly
+    // one framed handshake message's worth of transcript pre-selection
+    // buffering (`transcript.max_pending_len`) — see that constant's doc
+    // comment for why a client cannot hash its own ClientHello until the
+    // negotiated suite (learned only from the server's response) is known.
+    //
+    // #646: the budget grew again, to 128 KiB, when `max_message_len` and
+    // `max_certificate_len` were raised to admit ordinary public WebPKI
+    // certificate chains. Every buffer sized to `max_message_len` — both
+    // handshake reassemblers, the HelloRetryRequest ClientHello1 capture,
+    // and (via `transcript.max_pending_len`) the transcript's own
+    // pre-selection buffer — grew with it, so this is a real cost of that
+    // fix, not incidental drift.
+    //
+    // `max_message_len` (16 KiB) is now close enough to
+    // `max_new_session_ticket_message_len` (~128 KiB) that comparing the
+    // *whole* backend's footprint against it stopped being a meaningful
+    // regression guard for "ticket storage is not embedded inline" — it
+    // would start failing on ordinary `max_message_len` growth that has
+    // nothing to do with tickets. The precise claim instead: a post-handshake
+    // message only reassembles inline (`PostHandshakeInput.inline_buf`) up
+    // to `inline_capacity`, sized to `KeyUpdate`'s fixed 5-byte frame, not to
+    // a ticket's; anything larger — every real ticket — is heap-allocated by
+    // `setPostHandshakeAllocator`'s allocator instead (see
+    // `PostHandshakeInput.append`).
+    try std.testing.expect(@sizeOf(Tls13Backend) < 128 * 1024);
+    try std.testing.expectEqual(key_update.message_len, post_handshake_inline_capacity);
+    try std.testing.expect(post_handshake_inline_capacity < max_new_session_ticket_message_len);
 }
 
 test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
@@ -6470,8 +6540,14 @@ test "transport profile validation fails before lifecycle or transcript advance"
         backend.deinit();
     }
 
-    var names_storage: [40][255]u8 = undefined;
-    var names: [40][]const u8 = undefined;
+    // #646: each entry contributes at most 256 bytes (1-byte length + up to
+    // 255 protocol-name bytes) to `alpn_total`, so this count must clear
+    // `max_message_len` (now 16 KiB) with room to spare — 72 entries sum to
+    // 18432 bytes, comfortably past the 16378-byte threshold below which
+    // `onClientHello`'s ALPN-size check (`alpn_total + 6 > max_message_len`)
+    // would not fire.
+    var names_storage: [72][255]u8 = undefined;
+    var names: [72][]const u8 = undefined;
     for (&names_storage, 0..) |*name, i| {
         @memset(name[0..], 'a');
         name[0] = @intCast(i);
@@ -6492,16 +6568,21 @@ test "transport profile validation fails before lifecycle or transcript advance"
     defer too_large_sink.deinit();
     try std.testing.expectError(error.InvalidTransportProfile, too_large_backend.backend().start(.client, {}, &too_large_sink));
 
-    var near_storage: [32][255]u8 = undefined;
-    var near_names: [32][]const u8 = undefined;
-    for (near_storage[0..31], 0..) |*name, i| {
+    // #646: 63 full-255-byte entries plus one 199-byte entry sum to an ALPN
+    // protocol-name-list total (16328 bytes) that stays under the
+    // ALPN-specific `alpn_total + 6 > max_message_len` pre-check (16384) —
+    // this case is meant to exercise the *general* ClientHello size check
+    // instead, once the rest of the message's fixed overhead is added.
+    var near_storage: [64][255]u8 = undefined;
+    var near_names: [64][]const u8 = undefined;
+    for (near_storage[0..63], 0..) |*name, i| {
         @memset(name[0..], 'a');
         name[0] = @intCast('A' + i);
         near_names[i] = name[0..];
     }
-    @memset(near_storage[31][0..], 'b');
-    near_storage[31][0] = 'z';
-    near_names[31] = near_storage[31][0..139];
+    @memset(near_storage[63][0..], 'b');
+    near_storage[63][0] = 'z';
+    near_names[63] = near_storage[63][0..199];
     var near_policy = tls_policy.Policy.recordDefault();
     var near_alpns: [near_names.len]tls_algorithms.ProtocolName = undefined;
     for (near_names, 0..) |name, i| near_alpns[i] = .{ .bytes = name };
