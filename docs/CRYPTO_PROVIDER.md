@@ -113,14 +113,14 @@ data, not prose:
   runtime calls `CryptoProvider` today, not that it could if wired up — see
   `profile.zig`'s integration-status tests, which pin the rows this holds for.
 - **Product enablement** — `Row.enabled_product_profiles`, a named
-  `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose`): which
+  `EnumSet(ProductProfile)` (`.appliance`, `.general`): which
   product actually selects this capability. This is authored per row, not
   derived from `pure_zig_status`/`openssl_status` — primitive support does not
   imply product selectability. Both profiles are pure-Zig native and share the
   same in-process `CryptoProvider` seam (#649 retired the OpenSSL production
-  TLS backend `.general_purpose` used to name); they differ only in product
-  policy — `.native_appliance` is the strict Bare Systems single-identity
-  policy, `.general_purpose` the multi-identity general-purpose policy.
+  TLS backend `.general` used to name); they differ only in product
+  policy — `.appliance` is the strict Bare Systems single-identity
+  policy, `.general` the multi-identity general-purpose policy.
 
 ## Supported profile matrix
 
@@ -160,8 +160,8 @@ floor and each affected row must be updated together.
 
 Protocol configuration must not hand-write provider-derived TLS capabilities.
 Use `tls.crypto_profile.fromProfile(product, provider.capabilities())`, naming
-the caller's `crypto.profile.ProductProfile` explicitly (`.native_appliance`
-for the appliance policy, `.general_purpose` for the general-purpose policy —
+the caller's `crypto.profile.ProductProfile` explicitly (`.appliance`
+for the appliance policy, `.general` for the general-purpose policy —
 both pure-Zig in-process), then pass the returned `asPolicyCapabilities()`
 slice set to `tls.Policy`. This is the TLS-policy adapter for the
 provider-backed native TLS path: it intersects an actual `CryptoProvider`

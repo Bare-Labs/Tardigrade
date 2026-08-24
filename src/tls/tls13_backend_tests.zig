@@ -8082,7 +8082,7 @@ test "no compatible signature algorithm fails with handshake_failure attribution
 test "provider signature capability withdrawal prevents ECDSA credential selection before flight" {
     var caps = crypto.pure_zig.Provider.capabilities();
     caps.signatures.remove(.ecdsa_secp256r1_sha256);
-    const tls_caps = tls_core.crypto_profile.fromProfile(.native_appliance, caps);
+    const tls_caps = tls_core.crypto_profile.fromProfile(.appliance, caps);
     try std.testing.expectEqual(@as(usize, 1), tls_caps.signature_schemes_len);
     try std.testing.expectEqual(tls_core.policy.SignatureScheme.ed25519, tls_caps.signature_schemes[0]);
 
