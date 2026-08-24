@@ -2253,7 +2253,7 @@ fn sendRequestWithTimeout(allocator: std.mem.Allocator, port: u16, spec: Request
     var stream = try openRequestStream(allocator, port, spec);
     defer stream.close();
     try setStreamTimeouts(&stream, timeout_ms);
-    return readHttpResponse(allocator, stream);
+    return readHttpResponseWithTimeout(allocator, stream, @intCast(timeout_ms));
 }
 
 fn sendRawRequest(allocator: std.mem.Allocator, port: u16, raw_request: []const u8) !HttpResponse {
@@ -2324,6 +2324,10 @@ fn setStreamTimeouts(stream: *compat.NetStream, timeout_ms: u64) !void {
 }
 
 fn readHttpResponse(allocator: std.mem.Allocator, stream: compat.NetStream) !HttpResponse {
+    return readHttpResponseWithTimeout(allocator, stream, 5_000);
+}
+
+fn readHttpResponseWithTimeout(allocator: std.mem.Allocator, stream: compat.NetStream, timeout_ms: i32) !HttpResponse {
     var raw_buf = std.array_list.Managed(u8).init(allocator);
     errdefer raw_buf.deinit();
     var tmp: [4096]u8 = undefined;
@@ -2334,7 +2338,7 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: compat.NetStream) !Htt
         if (target_len) |needed| {
             if (raw_buf.items.len >= needed) break;
         }
-        const n = readSocketWithPoll(stream.handle, &tmp, 5_000) catch |err| switch (err) {
+        const n = readSocketWithPoll(stream.handle, &tmp, timeout_ms) catch |err| switch (err) {
             error.ConnectionResetByPeer => {
                 if (raw_buf.items.len > 0) break;
                 return err;
