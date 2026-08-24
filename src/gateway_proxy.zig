@@ -17,7 +17,7 @@ const gpt = @import("gateway_proxy_target.zig");
 const gconn = @import("gateway_connection.zig");
 const proxy_buffer_account = http.proxy_buffer_account;
 
-fn upstreamAlpnPolicy(protocol: edge_config.UpstreamProtocol) http.tls_termination.UpstreamAlpnPolicy {
+fn upstreamAlpnPolicy(protocol: edge_config.UpstreamProtocol) http.upstream_tls.UpstreamAlpnPolicy {
     return switch (protocol) {
         .http1 => .require_http1,
         .h2, .h2c => .require_h2,
@@ -503,7 +503,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     host: []const u8,
     port: u16,
     /// When non-null, wrap the TCP stream in TLS before exchanging the request.
-    tls_options: ?http.tls_termination.UpstreamTlsOptions,
+    tls_options: ?http.upstream_tls.UpstreamTlsOptions,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -564,7 +564,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
             try setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms);
         }
         if (tls_options) |opts| {
-            var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(fd, host, opts);
+            var tls_conn = try http.upstream_tls.UpstreamTlsConn.connect(fd, host, opts);
             defer tls_conn.deinit();
             const resp = try exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
             if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
@@ -609,12 +609,12 @@ pub fn executeBoundedBufferedTcpHttpRequest(
             p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start_ms);
             if (is_tls) {
                 if (connect_timeout_ms > 0) setSocketTimeoutMs(new_fd, connect_timeout_ms, connect_timeout_ms) catch {};
-                const tls_ptr = p.allocator.create(http.tls_termination.UpstreamTlsConn) catch {
+                const tls_ptr = p.allocator.create(http.upstream_tls.UpstreamTlsConn) catch {
                     _ = std.c.close(new_fd);
                     p.releaseSlot(key);
                     return error.OutOfMemory;
                 };
-                tls_ptr.* = http.tls_termination.UpstreamTlsConn.connect(new_fd, host, tls_options.?) catch |err| {
+                tls_ptr.* = http.upstream_tls.UpstreamTlsConn.connect(new_fd, host, tls_options.?) catch |err| {
                     p.allocator.destroy(tls_ptr);
                     _ = std.c.close(new_fd);
                     p.releaseSlot(key);
@@ -665,7 +665,7 @@ fn executeBufferedH2OrH1Fresh(
     allocator: std.mem.Allocator,
     host: []const u8,
     port: u16,
-    opts: http.tls_termination.UpstreamTlsOptions,
+    opts: http.upstream_tls.UpstreamTlsOptions,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -680,7 +680,7 @@ fn executeBufferedH2OrH1Fresh(
     defer _ = std.c.close(fd);
     if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
 
-    var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(fd, host, opts);
+    var tls_conn = try http.upstream_tls.UpstreamTlsConn.connect(fd, host, opts);
     defer tls_conn.deinit();
 
     if (tls_conn.negotiatedProtocol() == .http2) {
@@ -741,7 +741,7 @@ fn executeBufferedViaH2Pool(
     h2_pool: *http.upstream_h2.H2ConnPool,
     host: []const u8,
     port: u16,
-    opts: ?http.tls_termination.UpstreamTlsOptions,
+    opts: ?http.upstream_tls.UpstreamTlsOptions,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -966,7 +966,7 @@ fn streamViaH2Pool(
     h1_pool: ?*http.upstream_pool.UpstreamPool,
     host: []const u8,
     port: u16,
-    opts: ?http.tls_termination.UpstreamTlsOptions,
+    opts: ?http.upstream_tls.UpstreamTlsOptions,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -1948,7 +1948,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
     const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
     const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
-    const tls_options: ?http.tls_termination.UpstreamTlsOptions = if (is_https) .{
+    const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) .{
         .skip_verify = !cfg.upstream_tls_verify,
         .ca_bundle_path = cfg.upstream_tls_ca_bundle,
         .sni_override = cfg.upstream_tls_server_name,
@@ -2606,7 +2606,7 @@ pub fn executeStreamingHttpProxyRequest(
     const is_https = unix_socket_path == null and std.ascii.eqlIgnoreCase(uri.scheme, "https");
     const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
     const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
-    const tls_options: ?http.tls_termination.UpstreamTlsOptions = if (is_https) .{
+    const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) .{
         .skip_verify = !cfg.upstream_tls_verify,
         .ca_bundle_path = cfg.upstream_tls_ca_bundle,
         .sni_override = cfg.upstream_tls_server_name,
@@ -2665,7 +2665,7 @@ pub fn executeStreamingHttpProxyRequest(
     const stream_h2 = unix_socket_path == null and h2_requested_for_streaming;
     if (stream_h2) {
         if (h2_pool) |hp| {
-            const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
+            const h2_opts: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) tls_options.? else null;
             return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global, downstream_committed);
         }
         if (streaming_body != null) {
@@ -2738,12 +2738,12 @@ pub fn executeStreamingHttpProxyRequest(
             if (tls_options) |opts| {
                 if (connect_timeout_ms > 0) setSocketTimeoutMs(new_fd, connect_timeout_ms, connect_timeout_ms) catch {};
                 const owner = if (active_pool) |p| p.allocator else allocator;
-                const tls_ptr = owner.create(http.tls_termination.UpstreamTlsConn) catch {
+                const tls_ptr = owner.create(http.upstream_tls.UpstreamTlsConn) catch {
                     _ = std.c.close(new_fd);
                     if (active_pool) |p| p.releaseSlot(key);
                     return error.OutOfMemory;
                 };
-                tls_ptr.* = http.tls_termination.UpstreamTlsConn.connect(new_fd, host, opts) catch |err| {
+                tls_ptr.* = http.upstream_tls.UpstreamTlsConn.connect(new_fd, host, opts) catch |err| {
                     owner.destroy(tls_ptr);
                     _ = std.c.close(new_fd);
                     if (active_pool) |p| p.releaseSlot(key);

@@ -54,10 +54,10 @@ pub const negotiated_dispatch = @import("http/negotiated_dispatch.zig");
 pub const native_tls_connection = @import("http/native_tls_connection.zig");
 pub const downstream_connection = @import("http/downstream_connection.zig");
 pub const upstream_pool = @import("http/upstream_pool.zig");
-/// Native TLS termination surface, identical across every `-Dtls-profile`
-/// (#379, #649): no `@cImport("openssl/...")` and no foreign TLS/crypto
-/// linkage in any shipping build.
-pub const tls_termination = @import("http/tls_termination.zig");
+/// Native upstream HTTPS/TLS client surface, identical across every
+/// `-Dtls-profile` (#379, #649): no `@cImport("openssl/...")` and no foreign
+/// TLS/crypto linkage in any shipping build.
+pub const upstream_tls = @import("http/upstream_tls.zig");
 /// Native ACME client surface, identical across every `-Dtls-profile`
 /// (#379, #649): no OpenSSL linkage in any shipping build.
 pub const acme_client = @import("http/acme_client.zig");

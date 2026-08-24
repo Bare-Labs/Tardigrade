@@ -558,11 +558,13 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 // #649: retired "#368 Slice 3: hotReloadConfig rejects a combined
 // replay+protocol-policy reload atomically..." — it drove a real
-// `http.tls_termination.TlsTerminator.init()` to prove ordering against the
-// OpenSSL terminator specifically; that terminator, and the downstream
-// `TlsTerminator`/`TlsConnection` type pair entirely, no longer exist in
-// any shipping build. `earlyDataReplayConfigChanged` above still covers
-// the ordering-independent comparator logic in every profile.
+// `TlsTerminator.init()` (then in `http/tls_termination.zig`, since renamed
+// to `http/upstream_tls.zig` and holding only the native upstream client) to
+// prove ordering against the OpenSSL terminator specifically; that
+// terminator, and the downstream `TlsTerminator`/`TlsConnection` type pair
+// entirely, no longer exist in any shipping build.
+// `earlyDataReplayConfigChanged` above still covers the ordering-independent
+// comparator logic in every profile.
 
 test "applianceCredentialConfigChanged detects credential-affecting fields" {
     const allocator = std.testing.allocator;

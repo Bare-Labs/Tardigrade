@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const compat = @import("zig_compat");
-const tls_termination = @import("tls_termination.zig");
+const upstream_tls = @import("upstream_tls.zig");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 pub const Config = struct {
@@ -67,7 +67,7 @@ pub fn currentWorkerId() u64 {
 /// that last parked it (set on `release`, read on `acquire`).
 pub const PooledConn = struct {
     stream: compat.NetStream,
-    tls: ?*tls_termination.UpstreamTlsConn = null,
+    tls: ?*upstream_tls.UpstreamTlsConn = null,
     created_ms: u64,
     last_used_ms: u64,
     released_by: u64 = 0,

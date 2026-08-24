@@ -29,35 +29,33 @@
 //! OpenSSL adapter's implementation, later a permanently-inert stub kept
 //! only so old call sites compiled), but #649 removed that model
 //! entirely — there is no downstream-terminator surface left here to keep
-//! call sites compiling against.
+//! call sites compiling against. This module is named for what it is now
+//! (the upstream TLS client), not for migration history; `negotiated_dispatch.zig`
+//! is the neutral home for `NegotiatedProtocol` since both this client and
+//! the downstream native listener need it.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const tls_core = @import("tls_core");
 const encrypted_stream = tls_core.encrypted_stream;
+const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
+/// The error surface actually reachable through this native client's API —
+/// no OpenSSL-adapter-only failure modes (init/cipher/CRL/OCSP config,
+/// cert/key mismatch) that this implementation never returns.
 pub const TlsError = error{
     OutOfMemory,
-    OpenSslInitFailed,
     ContextInitFailed,
     CertificateLoadFailed,
     PrivateKeyLoadFailed,
-    CertificateKeyMismatch,
-    ProtocolConfigFailed,
-    CipherConfigFailed,
     VerifyConfigFailed,
-    CrlLoadFailed,
-    OcspLoadFailed,
     HandshakeFailed,
     NoApplicationProtocol,
     TlsReadFailed,
     TlsWriteFailed,
 };
 
-pub const NegotiatedProtocol = enum {
-    http1_1,
-    http2,
-};
+pub const NegotiatedProtocol = negotiated_dispatch.NegotiatedProtocol;
 
 pub const UpstreamTlsOptions = struct {
     skip_verify: bool = false,

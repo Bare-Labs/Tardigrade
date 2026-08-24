@@ -2996,7 +2996,7 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     // yet. Every check after the gate concerns behavior of an active local
     // identity and is inert without one.
     if (cfg.tls_acme_enabled) {
-        logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (the ACME client is OpenSSL-adapter-only until its native implementation lands, #634)", .{});
+        logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (ACME issuance/renewal is not implemented by native Tardigrade and #649 retired the only production build that ever supported it, #634)", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
 
@@ -4247,7 +4247,7 @@ test "native-TLS build defaults never trip the native or appliance validation ga
     try validateApplianceTlsProfile(&cfg);
 }
 
-test "native-TLS builds reject OpenSSL-adapter-only TLS settings one at a time" {
+test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
     const allocator = std.testing.allocator;
 
     const cert_path = "tests/fixtures/tls/native_ed25519.crt";

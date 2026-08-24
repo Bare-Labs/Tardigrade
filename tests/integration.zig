@@ -15150,7 +15150,7 @@ test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
 // engine is TLS 1.3-only in every profile; `TARDIGRADE_TLS_MIN_VERSION`/
 // `_MAX_VERSION` set to anything but "1.3" is now rejected at config
 // validation time (`edge_config.zig`'s `validateNativeTlsBuildConfig`,
-// covered by "native-TLS builds reject OpenSSL-adapter-only TLS settings
+// covered by "native-TLS builds reject legacy OpenSSL-only TLS settings
 // one at a time").
 
 test "location rewrite action falls through to try_files (#201)" {

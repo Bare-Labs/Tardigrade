@@ -51,16 +51,16 @@ exposes OpenSSL-backed types.
 - `src/crypto/pure_zig.zig` — the concrete in-process `CryptoProvider` used by
   the native TLS/QUIC path; it is built on `std.crypto` and advertises exactly
   those provider capabilities.
-- `src/http/tls_termination.zig` — the native upstream HTTPS/TLS client
+- `src/http/upstream_tls.zig` — the native upstream HTTPS/TLS client
   (`UpstreamTlsConn`, #634) used for upstream proxying in every profile; no
   `@cImport`, OpenSSL type, or C linkage. Downstream TLS termination is served
   by `src/http/native_tls_connection.zig`, not this file. #649 retired this
   file's former OpenSSL downstream-terminator implementation and deleted
   `src/http/tls_backend.zig`, the selector layer that used to choose between
-  it and the native stub; the downstream `TlsTerminator`/`TlsConnection`
-  types that remain in this file are now permanently inert (fail closed with
-  `error.ContextInitFailed`), kept only so shared option-struct field shapes
-  compile identically across profiles.
+  it and the native stub; a later cleanup pass removed the resulting inert
+  downstream `TlsTerminator`/`TlsConnection` scaffolding entirely, so this
+  file now holds only the real upstream client (and was renamed from
+  `tls_termination.zig` to match).
 - `src/crypto/root.zig` — the package aggregator.
 - `docs/CRYPTO_PROVIDER_AUDIT.md` — the current native TLS/QUIC/PKI/resumption
   direct-crypto ownership audit and exception list.
@@ -143,9 +143,9 @@ floor and each affected row must be updated together.
 | AES-128-GCM | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
 | AES-256-GCM | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
 | ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
-| QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance only |
-| QUIC AES-256 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance only |
-| QUIC ChaCha20 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance only |
+| QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance, general-purpose |
+| QUIC AES-256 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance, general-purpose |
+| QUIC ChaCha20 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance, general-purpose |
 | X25519 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.not_integrated` | native appliance, general-purpose |
 | secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.not_integrated`; PKI: `.not_integrated` | general-purpose only |
 | Ed25519 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; PKI: `.live` | native appliance, general-purpose |

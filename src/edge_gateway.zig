@@ -1447,7 +1447,7 @@ fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedCo
 fn dispatchNegotiatedHttp(
     ctx: *WorkerContext,
     conn: anytype,
-    negotiated: http.tls_termination.NegotiatedProtocol,
+    negotiated: http.negotiated_dispatch.NegotiatedProtocol,
     session: *ConnectionSession,
     cfg: *const edge_config.EdgeConfig,
     connection_ip: []const u8,
