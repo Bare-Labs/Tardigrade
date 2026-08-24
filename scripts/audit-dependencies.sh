@@ -26,14 +26,14 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SELF_TEST=false
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
     --root)
-        REPO_ROOT="$(cd "$2" && pwd)"
+        REPO_ROOT="$(cd "$2" && pwd -P)"
         shift 2
         ;;
     --self-test)
@@ -159,7 +159,7 @@ is_nonproduction_file() {
 
 is_nonproduction_zig_file() {
     case "$1" in
-    .git/* | .zig-cache/* | zig-out/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
+    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
     scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
@@ -223,8 +223,8 @@ resolve_build_string() {
 is_allowed_nonproduction_build_statement() {
     local stmt="$1"
     case "$stmt" in
-    *evp_oracle* | *crypto_openssl_diff* | *pki_openssl_diff* | *tls_interop* | *h3_interop*) return 0 ;;
-    *'tests/'*'_interop'* | *'tests/interop'*) return 0 ;;
+    *'evp_oracle_mod.addCSourceFile'*'tests/evp_oracle.c'*) return 0 ;;
+    *'linkSystemLibrary(evp_oracle, "crypto"'*) return 0 ;;
     *) return 1 ;;
     esac
 }
@@ -285,6 +285,43 @@ scan_runtime_loading() {
                 fail "production runtime dynamic loading boundary in $rel: $line"
             done <<<"$matches"
         fi
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
+}
+
+resolve_relative_import() {
+    local from_rel="$1" import_path="$2" from_dir target_dir
+    from_dir="$(dirname "$from_rel")"
+    if target_dir="$(
+        cd "$REPO_ROOT/$from_dir" &&
+            cd "$(dirname "$import_path")" 2>/dev/null &&
+            pwd -P
+    )"; then
+        :
+    else
+        return 1
+    fi
+    relpath "$target_dir/$(basename "$import_path")"
+}
+
+scan_nonproduction_zig_imports() {
+    [ -d "$REPO_ROOT" ] || return 0
+    local zigfile rel import_line import_path target
+    while IFS= read -r zigfile; do
+        rel="$(relpath "$zigfile")"
+        is_nonproduction_zig_file "$rel" && continue
+        while IFS= read -r import_line; do
+            [ -z "$import_line" ] && continue
+            import_path="$(printf '%s\n' "$import_line" | sed -nE 's/^[0-9]+:.*@import[[:space:]]*\([[:space:]]*"([^"]+\.zig)"[[:space:]]*\).*/\1/p')"
+            [ -n "$import_path" ] || continue
+            target="$(resolve_relative_import "$rel" "$import_path" || true)"
+            [ -n "$target" ] || continue
+            case "$target" in
+            ../* | /*) continue ;;
+            esac
+            if is_nonproduction_zig_file "$target"; then
+                fail "production Zig source imports non-production source root $target from $rel:$import_line"
+            fi
+        done < <(stripped "$zigfile" | grep -nE '@import[[:space:]]*\([[:space:]]*"[^"]+\.zig"' || true)
     done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
@@ -398,17 +435,32 @@ scan_manifest_dependencies() {
 
 is_allowed_metadata_dependency_statement() {
     local stmt="$1"
+    local deps token seen_package=false
     stmt="$(printf '%s\n' "$stmt" | tr -s '[:space:]' ' ')"
     if printf '%s\n' "$stmt" | grep -qiE "$(forbidden_dependency_pattern)"; then
         return 1
     fi
-    case "$stmt" in
-    *'apt-get install -y --no-install-recommends ca-certificates curl xz-utils '* | *'apt-get install -y --no-install-recommends         ca-certificates curl xz-utils '*) return 0 ;;
-    *'apt-get install -y --no-install-recommends ca-certificates '*) return 0 ;;
-    *'sudo apt-get install -y rpm'*) return 0 ;;
-    *'depends_on :linux'*) return 0 ;;
-    *) return 1 ;;
-    esac
+    if [[ "$stmt" == *"apt-get install"* || "$stmt" == *"apt install"* ]]; then
+        deps="$(printf '%s\n' "$stmt" | sed -E 's/.*apt(-get)? install //')"
+        for token in $deps; do
+            case "$token" in
+            '&&' | ';' | '|' | '||') break ;;
+            -*) continue ;;
+            ca-certificates | curl | xz-utils | rpm)
+                seen_package=true
+                ;;
+            *)
+                return 1
+                ;;
+            esac
+        done
+        [ "$seen_package" = true ]
+        return $?
+    fi
+    if [[ "$stmt" == *"depends_on :linux"* ]]; then
+        return 0
+    fi
+    return 1
 }
 
 metadata_dependency_statement_pattern() {
@@ -465,6 +517,7 @@ scan_metadata() {
 run_audit() {
     cd "$REPO_ROOT"
     failures=0
+    scan_nonproduction_zig_imports
     scan_source_ffi
     scan_runtime_loading
     scan_build_graph
@@ -585,9 +638,36 @@ pub fn build(b: *std.Build) void {
 }
 EOF
         ;;
-    fail-tests-support-runtime-loading)
-        mkdir -p "$root/tests/support"
-        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so"); }\n' >"$root/tests/support/product.zig"
+    fail-evp-oracle-name-production-object)
+        printf 'foreign object placeholder\n' >"$root/foreign.o"
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const evp_oracle_tardi = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    evp_oracle_tardi.addObjectFile(b.path("foreign.o"));
+    b.installArtifact(evp_oracle_tardi);
+}
+EOF
+        ;;
+    fail-tests-interop-object-reached)
+        mkdir -p "$root/tests/interop"
+        printf 'foreign object placeholder\n' >"$root/tests/interop/foreign.o"
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    exe.addObjectFile(b.path("tests/interop/foreign.o"));
+    b.installArtifact(exe);
+}
+EOF
+        ;;
+    fail-nonproduction-source-imported)
+        mkdir -p "$root/benchmarks"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product = @import("../benchmarks/product.zig");
+pub fn main() void { product.load(); }
+EOF
         ;;
     fail-cinclude-computed)
         cat >"$root/src/main.zig" <<'EOF'
@@ -718,6 +798,22 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends foreigncodec-runtime
 EOF
         ;;
+    fail-unknown-package-after-ca)
+        cat >"$root/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates foreigncodec-runtime
+EOF
+        ;;
+    fail-unknown-package-after-rpm)
+        cat >"$root/.github/workflows/release.yml" <<'EOF'
+jobs:
+  release:
+    steps:
+      - run: sudo apt-get install -y rpm foreigncodec-runtime
+EOF
+        ;;
     fail-dlopen)
         printf 'const std = @import("std");\npub fn main() void { _ = std.DynLib.open("libssl.so"); }\n' >"$root/src/main.zig"
         ;;
@@ -733,6 +829,10 @@ EOF
         printf 'openssl version\n' >"$root/scripts/interop/run.sh"
         chmod +x "$root/scripts/interop/run.sh"
         printf 'Package docs mention libssl in prose only.\n' >"$root/packaging/README.md"
+        ;;
+    pass-isolated-nonproduction-zig)
+        mkdir -p "$root/scripts/interop"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/scripts/interop/product.zig"
         ;;
     pass-pure-zig)
         mkdir -p "$root/vendor/pure_zig"
@@ -752,14 +852,14 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-test-looking-production-target fail-tests-support-object-reached fail-tests-support-runtime-loading fail-cinclude-computed fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-compose-preload fail-unknown-package fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-cinclude-computed fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-dlopen; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2
             return 1
         fi
     done
-    for kind in pass-platform pass-test-peer pass-pure-zig; do
+    for kind in pass-platform pass-test-peer pass-isolated-nonproduction-zig pass-pure-zig; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if ! "$0" --root "$tmp/$kind" >/dev/null; then
             rc=$?
