@@ -151,7 +151,7 @@ resolve_build_sources() {
 
 is_nonproduction_file() {
     case "$1" in
-    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh) return 0 ;;
+    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh | scripts/profile.sh) return 0 ;;
     scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
@@ -173,7 +173,7 @@ is_explicit_nonproduction_helper() {
 }
 
 explicit_nonproduction_helper_pattern() {
-    printf '%s\n' 'scripts/test-deb-package\.sh|scripts/test-rpm-package\.sh|scripts/test-homebrew-formula\.sh|scripts/test-homebrew-release-formula\.sh|scripts/test-homebrew-tap-sync\.sh|scripts/test-install\.sh|scripts/test-docker-image\.sh|scripts/test-launchd-service\.sh'
+    printf '%s\n' 'scripts/test-deb-package\.sh|scripts/test-rpm-package\.sh|scripts/test-homebrew-formula\.sh|scripts/test-homebrew-release-formula\.sh|scripts/test-homebrew-tap-sync\.sh|scripts/test-install\.sh|scripts/test-docker-image\.sh|scripts/test-launchd-service\.sh|scripts/interop/[A-Za-z0-9_./@-]+|scripts/remote-bench\.sh|scripts/profile\.sh|benchmarks/[A-Za-z0-9_./@-]+|\./\.github/workflows/[A-Za-z0-9_.@/-]+\.ya?ml'
 }
 
 forbidden_dependency_pattern() {
@@ -188,6 +188,22 @@ logical_zig_statements() {
         if (line == "") next
         stmt = stmt " " line
         if (line ~ /;[ \t]*$/ || line ~ /\{[ \t]*$/ || line ~ /\}[ \t]*$/) {
+            print stmt
+            stmt = ""
+        }
+    }
+    END { if (stmt != "") print stmt }
+    ' "$1"
+}
+
+logical_zig_calls() {
+    awk '
+    {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        if (line == "") next
+        stmt = stmt " " line
+        if (line ~ /;[ \t]*$/) {
             print stmt
             stmt = ""
         }
@@ -325,6 +341,82 @@ scan_nonproduction_zig_imports() {
     done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
+scan_build_production_graph() {
+    local file stmt module root exe name root_mod root_path parent child installed
+    local -A module_roots=() executable_roots=() executable_root_paths=() executable_names=() installed_executables=() edges=() foreign_calls=() reachable=()
+    while IFS= read -r file; do
+        [ -f "$REPO_ROOT/$file" ] || continue
+        while IFS= read -r stmt; do
+            [ -z "$stmt" ] && continue
+            module="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*(const|var)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*createModule[[:space:]]*\(.*/\2/p')"
+            if [ -n "$module" ]; then
+                module_roots[$module]="${module_roots[$module]:-}"
+                root="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
+                [ -z "$root" ] || module_roots[$module]="$root"
+            fi
+            exe="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*(const|var)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*addExecutable[[:space:]]*\(.*/\2/p')"
+            if [ -n "$exe" ]; then
+                name="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p')"
+                root_mod="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_module[[:space:]]*=[[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+                root_path="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
+                executable_names[$exe]="$name"
+                executable_roots[$exe]="$root_mod"
+                executable_root_paths[$exe]="$root_path"
+            fi
+            installed="$(printf '%s\n' "$stmt" | sed -nE 's/.*installArtifact[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+            [ -z "$installed" ] || installed_executables[$installed]=1
+            parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.addImport[[:space:]]*\(.*/\1/p')"
+            child="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.addImport[[:space:]]*\([^,]+,[[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+            if [ -n "$parent" ] && [ -n "$child" ]; then
+                edges[$parent]="${edges[$parent]:-} $child"
+            fi
+            parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.(addCSourceFiles|addCSourceFile|addObjectFile|addAssemblyFile)[[:space:]]*\(.*/\1/p')"
+            if [ -n "$parent" ]; then
+                foreign_calls[$parent]="${foreign_calls[$parent]:-}${foreign_calls[$parent]:+$'\n'}$file: $stmt"
+            fi
+        done < <(logical_zig_calls <(stripped "$REPO_ROOT/$file"))
+    done < <(resolve_build_sources)
+
+    for exe in "${!executable_names[@]}"; do
+        [ "${executable_names[$exe]}" = "tardi" ] || continue
+        [ -n "${installed_executables[$exe]:-}" ] || continue
+        root_mod="${executable_roots[$exe]:-}"
+        root_path="${executable_root_paths[$exe]:-}"
+        if [ -n "$root_mod" ]; then
+            reachable[$root_mod]=1
+            edges[$root_mod]="${edges[$root_mod]:-} ${edges[$exe]:-}"
+        elif [ -n "$root_path" ] && is_nonproduction_zig_file "$root_path"; then
+            fail "installed tardi executable is rooted in non-production source $root_path"
+        fi
+    done
+
+    local changed rel line
+    changed=true
+    while [ "$changed" = true ]; do
+        changed=false
+        for parent in "${!reachable[@]}"; do
+            for child in ${edges[$parent]:-}; do
+                [ -n "$child" ] || continue
+                if [ -z "${reachable[$child]:-}" ]; then
+                    reachable[$child]=1
+                    changed=true
+                fi
+            done
+        done
+    done
+
+    for module in "${!reachable[@]}"; do
+        rel="${module_roots[$module]:-}"
+        if [ -n "$rel" ] && is_nonproduction_zig_file "$rel"; then
+            fail "installed tardi module graph reaches non-production source root $rel via $module"
+        fi
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            fail "installed tardi module graph reaches foreign source/object/assembly build input through $module in $line"
+        done <<<"${foreign_calls[$module]:-}"
+    done
+}
+
 validate_build_imports() {
     local file="$1" imports line
     if imports="$(stripped "$REPO_ROOT/$file" | grep -nE '@import[[:space:]]*\(' | grep -vE '@import[[:space:]]*\([[:space:]]*"[^"]+"' || true)"; then
@@ -362,7 +454,7 @@ scan_build_graph() {
                     fail "production foreign system library link in $file: $stmt"
                 fi
                 ;;
-            *addCSourceFiles* | *addCSourceFile* | *addObjectFile* | *addTranslateC*)
+            *addCSourceFiles* | *addCSourceFile* | *addObjectFile* | *addAssemblyFile* | *addTranslateC*)
                 if ! is_allowed_nonproduction_build_statement "$stmt"; then
                     fail "production vendored foreign source/object compilation in $file: $stmt"
                 fi
@@ -371,6 +463,7 @@ scan_build_graph() {
         done < <(logical_zig_statements <(stripped "$REPO_ROOT/$file"))
     done < <(resolve_build_sources)
 
+    scan_build_production_graph
     scan_manifest_dependencies
 
     while IFS= read -r srcfile; do
@@ -399,14 +492,25 @@ scan_manifest_dependencies() {
         fail "production manifest dependency appears to introduce a foreign runtime implementation in build.zig.zon"
     fi
     deps="$(printf '%s\n' "$manifest" | awk '
-        /\.dependencies[[:space:]]*=[[:space:]]*\.\{/ { capture=1; depth=1; next }
+        /\.dependencies[[:space:]]*=[[:space:]]*\.\{/ {
+            capture=1
+            depth=1
+            line=$0
+            sub(/.*\.dependencies[[:space:]]*=[[:space:]]*\.\{/, "", line)
+            opens=gsub(/\{/, "{", line)
+            closes=gsub(/\}/, "}", line)
+            if (line != "") print line
+            depth += opens - closes
+            if (depth <= 0) capture=0
+            next
+        }
         capture {
             line=$0
             opens=gsub(/\{/, "{", line)
             closes=gsub(/\}/, "}", line)
-            depth += opens - closes
-            if (depth <= 0) { capture=0; next }
             print
+            depth += opens - closes
+            if (depth <= 0) capture=0
         }
     ')"
     while IFS= read -r dep; do
@@ -437,6 +541,9 @@ is_allowed_metadata_dependency_statement() {
     local stmt="$1"
     local deps token seen_package=false
     stmt="$(printf '%s\n' "$stmt" | tr -s '[:space:]' ' ')"
+    stmt="$(printf '%s\n' "$stmt" | sed -E 's/^[0-9]+:[[:space:]]*//')"
+    stmt="${stmt#"${stmt%%[![:space:]]*}"}"
+    stmt="${stmt%"${stmt##*[![:space:]]}"}"
     if printf '%s\n' "$stmt" | grep -qiE "$(forbidden_dependency_pattern)"; then
         return 1
     fi
@@ -457,7 +564,10 @@ is_allowed_metadata_dependency_statement() {
         [ "$seen_package" = true ]
         return $?
     fi
-    if [[ "$stmt" == *"depends_on :linux"* ]]; then
+    if [[ "$stmt" == "printf '  depends_on :linux\\n\\n'" || "$stmt" == "printf ' depends_on :linux\\n\\n'" ]]; then
+        return 0
+    fi
+    if [[ "$stmt" == "depends_on :linux" ]]; then
         return 0
     fi
     return 1
@@ -669,6 +779,51 @@ const product = @import("../benchmarks/product.zig");
 pub fn main() void { product.load(); }
 EOF
         ;;
+    fail-named-nonproduction-module-import)
+        mkdir -p "$root/benchmarks"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product = @import("product");
+pub fn main() void { product.load(); }
+EOF
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const exe_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
+    const product_mod = b.createModule(.{ .root_source_file = b.path("benchmarks/product.zig"), .target = target, .optimize = optimize });
+    exe_mod.addImport("product", product_mod);
+    const exe = b.addExecutable(.{ .name = "tardi", .root_module = exe_mod });
+    b.installArtifact(exe);
+}
+EOF
+        ;;
+    fail-oracle-module-installed)
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const evp_oracle_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    evp_oracle_mod.addCSourceFile(.{ .file = b.path("tests/evp_oracle.c"), .flags = &.{ "-std=c11" } });
+    const tardi = b.addExecutable(.{ .name = "tardi", .root_module = evp_oracle_mod });
+    b.installArtifact(tardi);
+}
+EOF
+        printf 'int main(void) { return 0; }\n' >"$root/tests/evp_oracle.c"
+        ;;
+    fail-assembly-file)
+        printf '.globl foreign_impl\nforeign_impl:\n  ret\n' >"$root/foreign.s"
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    exe.addAssemblyFile(b.path("foreign.s"));
+    b.installArtifact(exe);
+}
+EOF
+        ;;
     fail-cinclude-computed)
         cat >"$root/src/main.zig" <<'EOF'
 const foreign_header = "foreigncodec/api.h";
@@ -780,6 +935,19 @@ EOF
         printf 'pub fn ok() void {}\n' >"$root/vendor/fastcodec/root.zig"
         printf 'int codec(void) { return 1; }\n' >"$root/vendor/fastcodec/codec.c"
         ;;
+    fail-inline-zon-dependency)
+        mkdir -p "$root/vendor/fastcodec"
+        cat >"$root/build.zig.zon" <<'EOF'
+.{
+    .name = .tardigrade,
+    .version = "0.0.0",
+    .fingerprint = 0x763f21d3055af9f4,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .dependencies = .{ .fastcodec = .{ .path = "vendor/fastcodec" }, },
+}
+EOF
+        ;;
     fail-compose-preload)
         cat >"$root/compose.yaml" <<'EOF'
 services:
@@ -812,6 +980,37 @@ jobs:
   release:
     steps:
       - run: sudo apt-get install -y rpm foreigncodec-runtime
+EOF
+        ;;
+    fail-homebrew-linux-plus-dependency)
+        cat >"$root/packaging/tardigrade.rb" <<'EOF'
+class Tardigrade < Formula
+  depends_on :linux; depends_on "foreigncodec"
+end
+EOF
+        ;;
+    fail-nonproduction-helper-reached-broad)
+        cat >"$root/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN ./scripts/interop/install-foreign-peer.sh
+EOF
+        cat >"$root/scripts/interop/install-foreign-peer.sh" <<'EOF'
+#!/usr/bin/env bash
+apt-get install -y foreigncodec-runtime
+EOF
+        chmod +x "$root/scripts/interop/install-foreign-peer.sh"
+        ;;
+    fail-release-reusable-workflow)
+        cat >"$root/.github/workflows/release.yml" <<'EOF'
+jobs:
+  package:
+    uses: ./.github/workflows/package.yml
+EOF
+        cat >"$root/.github/workflows/package.yml" <<'EOF'
+jobs:
+  package:
+    steps:
+      - run: sudo apt-get install -y foreigncodec-runtime
 EOF
         ;;
     fail-dlopen)
@@ -852,7 +1051,7 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-cinclude-computed fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-named-nonproduction-module-import fail-oracle-module-installed fail-assembly-file fail-cinclude-computed fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-inline-zon-dependency fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-homebrew-linux-plus-dependency fail-nonproduction-helper-reached-broad fail-release-reusable-workflow fail-dlopen; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2
