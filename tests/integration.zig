@@ -15465,31 +15465,72 @@ test "reload while serving short static requests drops no in-flight request (#17
     , .{root_a});
     defer allocator.free(config_a);
 
-    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a });
+    // This test intentionally drives one localhost client as fast as
+    // possible. Rate limiting is a separate concern: leaving the
+    // harness default enabled makes a sufficiently fast runner receive
+    // legitimate 429s and misclassify them as reload request loss.
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_a,
+        .rate_limit_rps = "0",
+    });
     defer tardigrade.stop();
 
     const Hammer = struct {
         port: u16,
         stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        site_a: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        site_b: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         ok: usize = 0,
         fail: usize = 0,
+
         fn run(self: *@This()) void {
             const a = std.heap.page_allocator;
             while (!self.stop_flag.load(.acquire)) {
-                var resp = sendRequest(a, self.port, .{ .method = "GET", .path = "/index.html", .body = null, .headers = &.{} }) catch {
+                var resp = sendRequest(a, self.port, .{
+                    .method = "GET",
+                    .path = "/index.html",
+                    .body = null,
+                    .headers = &.{},
+                }) catch {
                     self.fail += 1;
                     continue;
                 };
                 defer resp.deinit();
-                if (resp.status_code == 200) self.ok += 1 else self.fail += 1;
+
+                if (resp.status_code != 200) {
+                    self.fail += 1;
+                    continue;
+                }
+                if (std.mem.find(u8, resp.body, "site-A") != null) {
+                    self.ok += 1;
+                    _ = self.site_a.fetchAdd(1, .acq_rel);
+                } else if (std.mem.find(u8, resp.body, "site-B") != null) {
+                    self.ok += 1;
+                    _ = self.site_b.fetchAdd(1, .acq_rel);
+                } else {
+                    self.fail += 1;
+                }
             }
         }
     };
     var hammer = Hammer{ .port = tardigrade.port };
     const thread = try std.Thread.spawn(.{}, Hammer.run, .{&hammer});
+    var thread_joined = false;
+    defer {
+        if (!thread_joined) {
+            hammer.stop_flag.store(true, .release);
+            thread.join();
+        }
+    }
 
-    // Let requests flow, reload to root B mid-stream, let more flow.
-    compat.sleepNs(150 * std.time.ns_per_ms);
+    // Synchronize on actual traffic instead of assuming a fixed amount
+    // of wall-clock time is enough for a particular CI runner.
+    var attempts: usize = 0;
+    while (hammer.site_a.load(.acquire) < 10 and attempts < 200) : (attempts += 1) {
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(hammer.site_a.load(.acquire) >= 10);
+
     const config_b = try std.fmt.allocPrint(allocator,
         \\location / {{
         \\    root {s};
@@ -15499,10 +15540,16 @@ test "reload while serving short static requests drops no in-flight request (#17
     defer allocator.free(config_b);
     try tardigrade.rewriteConfig(config_b);
     tardigrade.sendSignal(std.posix.SIG.HUP);
-    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    attempts = 0;
+    while (hammer.site_b.load(.acquire) < 10 and attempts < 200) : (attempts += 1) {
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(hammer.site_b.load(.acquire) >= 10);
 
     hammer.stop_flag.store(true, .release);
     thread.join();
+    thread_joined = true;
 
     // The core guarantee: every request served across the reload succeeded.
     try std.testing.expect(hammer.ok > 0);
