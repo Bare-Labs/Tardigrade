@@ -944,17 +944,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pki_mod.addImport("crypto", crypto_mod);
-    pki_mod.addAnonymousImport("pki_malformed_der", .{
+    const pki_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/pki/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pki_test_mod.addImport("crypto", crypto_mod);
+    pki_test_mod.addAnonymousImport("pki_malformed_der", .{
         .root_source_file = b.path("tests/vectors/pki/malformed-truncated.der"),
     });
-    // Shared between the PKI unit tests and the differential harness; a single
-    // module instance because one source file may only belong to one module.
+    // Shared between the PKI unit tests and the differential harness. Keep it
+    // off pki_mod, which is reachable from the installed tardi graph.
     const pki_reduced_corpus_mod = b.createModule(.{
         .root_source_file = b.path("tests/vectors/pki/reduced/manifest.zig"),
         .target = target,
         .optimize = optimize,
     });
-    pki_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
+    pki_test_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
     // The appliance credential loader (#392) reuses the PKI PEM/X.509
     // machinery; pki does not import tls_core, so this stays acyclic.
     tls_core_mod.addImport("pki", pki_mod);
@@ -966,7 +972,7 @@ pub fn build(b: *std.Build) void {
     // they need the same "pki" module wired directly.
     session_cache_mod.addImport("pki", pki_mod);
     session_cache_persistence_mod.addImport("pki", pki_mod);
-    const pki_tests = b.addTest(.{ .root_module = pki_mod });
+    const pki_tests = b.addTest(.{ .root_module = pki_test_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
     pki_step.dependOn(&run_pki_tests.step);

@@ -40,8 +40,10 @@ pub const CompressionConfig = struct {
     enabled: bool = true,
     /// Minimum body size to compress.
     min_size: usize = DEFAULT_MIN_SIZE,
-    /// Enable Brotli compression when library is available at runtime.
-    brotli_enabled: bool = true,
+    /// Reserved for a future native Brotli implementation. Runtime dynamic
+    /// loading of libbrotlienc is forbidden by the production dependency
+    /// boundary, so this flag does not enable Brotli today.
+    brotli_enabled: bool = false,
     /// Brotli quality [0..11].
     brotli_quality: u32 = 5,
     /// Compression level.
@@ -108,69 +110,6 @@ fn isLikelyGzip(body: []const u8) bool {
     return body.len >= 2 and body[0] == 0x1f and body[1] == 0x8b;
 }
 
-const BrotliEncoderMode = enum(c_int) {
-    generic = 0,
-    text = 1,
-    font = 2,
-};
-
-const BrotliEncoderCompressFn = *const fn (
-    quality: c_int,
-    lgwin: c_int,
-    mode: BrotliEncoderMode,
-    input_size: usize,
-    input_buffer: [*]const u8,
-    encoded_size: *usize,
-    encoded_buffer: [*]u8,
-) callconv(.c) c_int;
-
-const BrotliEncoderMaxCompressedSizeFn = *const fn (input_size: usize) callconv(.c) usize;
-
-fn tryCompressBrotli(allocator: std.mem.Allocator, body: []const u8, quality: u32) ?[]u8 {
-    const candidates: []const []const u8 = switch (@import("builtin").os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => &[_][]const u8{ "libbrotlienc.dylib", "/opt/homebrew/lib/libbrotlienc.dylib" },
-        .linux => &[_][]const u8{ "libbrotlienc.so.1", "libbrotlienc.so" },
-        else => &[_][]const u8{},
-    };
-
-    var lib_opt: ?std.DynLib = null;
-    for (candidates) |name| {
-        lib_opt = std.DynLib.open(name) catch null;
-        if (lib_opt != null) break;
-    }
-    var lib = lib_opt orelse return null;
-    defer lib.close();
-
-    const max_fn = lib.lookup(BrotliEncoderMaxCompressedSizeFn, "BrotliEncoderMaxCompressedSize") orelse return null;
-    const compress_fn = lib.lookup(BrotliEncoderCompressFn, "BrotliEncoderCompress") orelse return null;
-
-    const max_size = max_fn(body.len);
-    if (max_size == 0) return null;
-    var out = allocator.alloc(u8, max_size) catch return null;
-    defer if (out.len > 0) allocator.free(out);
-
-    var encoded_size = max_size;
-    const ok = compress_fn(
-        @intCast(@min(quality, 11)),
-        22,
-        .generic,
-        body.len,
-        body.ptr,
-        &encoded_size,
-        out.ptr,
-    );
-    if (ok == 0 or encoded_size >= body.len or encoded_size == 0) return null;
-
-    if (encoded_size == max_size) {
-        const owned = out;
-        out = &[_]u8{};
-        return owned;
-    }
-    const final = allocator.alloc(u8, encoded_size) catch return null;
-    @memcpy(final, out[0..encoded_size]);
-    return final;
-}
-
 /// Compress a response body with gzip if beneficial.
 ///
 /// Returns the compressed body or null if compression was skipped.
@@ -189,7 +128,9 @@ pub fn compressResponse(
     if (body.len < config.min_size) return .{ .body = null, .compressed = false };
 
     // Check client support / preferred encoding
-    const preferred = pickEncoding(accept_encoding, config.brotli_enabled) orelse return .{ .body = null, .compressed = false };
+    _ = config.brotli_enabled;
+    _ = config.brotli_quality;
+    const preferred = pickEncoding(accept_encoding, false) orelse return .{ .body = null, .compressed = false };
 
     // Check MIME type
     const mime = content_type orelse return .{ .body = null, .compressed = false };
@@ -199,13 +140,6 @@ pub fn compressResponse(
     if (preferred == .gzip and isLikelyGzip(body)) {
         const dup = allocator.dupe(u8, body) catch return .{ .body = null, .compressed = false };
         return .{ .body = dup, .compressed = true, .encoding = .gzip };
-    }
-
-    // Prefer Brotli when requested and runtime encoder is available.
-    if (preferred == .br) {
-        if (tryCompressBrotli(allocator, body, config.brotli_quality)) |compressed| {
-            return .{ .body = compressed, .compressed = true, .encoding = .br };
-        }
     }
 
     // Perform gzip compression using the new flate API
@@ -248,11 +182,13 @@ pub fn compressResponse(
 
 // Tests
 
-test "pickEncoding prefers br over gzip when both available" {
+test "pickEncoding ignores br when Brotli is unavailable" {
     try std.testing.expectEqual(Encoding.br, pickEncoding("gzip, br", true).?);
     try std.testing.expectEqual(Encoding.gzip, pickEncoding("gzip, br", false).?);
     try std.testing.expectEqual(Encoding.gzip, pickEncoding("gzip;q=0.8, br;q=0.2", true).?);
     try std.testing.expectEqual(Encoding.br, pickEncoding("gzip;q=0, br;q=0.5", true).?);
+    try std.testing.expectEqual(Encoding.gzip, pickEncoding("gzip;q=0.8, br;q=1.0", false).?);
+    try std.testing.expect(pickEncoding("br", false) == null);
     try std.testing.expect(pickEncoding("identity", true) == null);
     try std.testing.expect(pickEncoding(null, true) == null);
 }

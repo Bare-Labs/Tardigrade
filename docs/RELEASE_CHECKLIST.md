@@ -43,10 +43,10 @@ Use this checklist before tagging and distributing a Tardigrade release.
       assets
 - [ ] Verify every published archive's `dependency-inventory-*.json` reports
       `profile=general` (or `appliance`), `reported_backend=native`,
-      `links_openssl=false`, and no forbidden foreign TLS/crypto/QUIC/H3
-      dependency
-- [ ] Verify published DEB/RPM metadata does not declare OpenSSL/libssl/libcrypto
-      as a Tardigrade runtime dependency
+      `links_openssl=false`, `status=pass`, and no dynamic dependency outside
+      the documented OS/runtime substrate allowlist
+- [ ] Verify published DEB/RPM/container metadata does not declare or install a
+      foreign product implementation dependency for Tardigrade runtime behavior
 - [ ] Copy the rendered Homebrew formula into `Bare-Systems/homebrew-tap` with
       `--tap-dir`, review the tap diff, and publish it only after the
       referenced release assets are visible and the install smoke passes.

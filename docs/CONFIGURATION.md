@@ -570,8 +570,8 @@ These public environment fields are consumed by CLI paths rather than
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_COMPRESSION_ENABLED` | bool | `true` | Enables response compression. | `TARDIGRADE_COMPRESSION_ENABLED=true` |
 | `TARDIGRADE_COMPRESSION_MIN_SIZE` | bytes | `256` | Minimum body size to compress. | `TARDIGRADE_COMPRESSION_MIN_SIZE=1024` |
-| `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` | bool | `true` | Enables Brotli compression. | `TARDIGRADE_COMPRESSION_BROTLI_ENABLED=true` |
-| `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` | u32 | `5` | Must be 0-11. | `TARDIGRADE_COMPRESSION_BROTLI_QUALITY=6` |
+| `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` | bool | `false` | Reserved for a future native Brotli implementation; accepted today but does not load `libbrotlienc` or enable Brotli output. | `TARDIGRADE_COMPRESSION_BROTLI_ENABLED=false` |
+| `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` | u32 | `5` | Reserved Brotli quality value; must be 0-11. | `TARDIGRADE_COMPRESSION_BROTLI_QUALITY=6` |
 | `TARDIGRADE_IDEMPOTENCY_TTL` | u32 seconds | `300` | Idempotency cache TTL; `0` disables. | `TARDIGRADE_IDEMPOTENCY_TTL=600` |
 | `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` | u32 seconds | `0` | Proxy response cache TTL; `0` disables. | `TARDIGRADE_PROXY_CACHE_TTL_SECONDS=60` |
 | `TARDIGRADE_PROXY_CACHE_PATH` | path | `""` | Disk-backed/tiered cache path. | `TARDIGRADE_PROXY_CACHE_PATH=/var/cache/tardigrade/proxy` |

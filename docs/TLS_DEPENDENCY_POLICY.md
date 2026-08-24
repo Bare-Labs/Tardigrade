@@ -1,34 +1,48 @@
-# TLS/crypto dependency policy (#379, epic #327, #634, retirement #649)
+# Production dependency policy (#379, epic #327, #634, retirement #649, #651)
 
-This note records Tardigrade's external-library policy for TLS, crypto, QUIC,
-HTTP/3, and certificate handling, and how that policy is enforced in source,
-build configuration, CI, and release artifacts. It began as the deliverable
-of research story **327-J** and a required v0.5 release gate for the Bare
-Systems appliance (#391); the canonical architecture owner was **#634**, an
-umbrella epic. **#649 completed the central build/source cutover #634
-called for**: every supported production build is native-only, and the
-OpenSSL production backend no longer exists in any shipping configuration.
-#634 remains open for the surfaces #649 explicitly did not cover:
-distribution/packaging cleanup, Homebrew (#466), and final published-release
-proof.
+This note records Tardigrade's production implementation dependency policy and
+how that policy is enforced in source, build configuration, CI, package/
+container metadata, and release artifacts. It began as the TLS/crypto/QUIC/
+HTTP/3 dependency policy from research story **327-J** and the Bare Systems
+appliance release gate (#391), then #651 broadened it into the project-wide
+#634 rule:
+
+> Every implementation dependency reachable from shipping/supported production
+> `tardi` must be Zig code, Zig stdlib, a reviewed pure-Zig package, or normal
+> OS/kernel/platform substrate. Foreign-language implementations may exist only
+> in explicit test, interop, differential, fuzz, or benchmark scopes.
+
+**#649 completed the central TLS build/source cutover #634 called for**: every
+supported production TLS build is native-only, and the OpenSSL production
+backend no longer exists in any shipping configuration. #651 extends that same
+mechanical boundary to the rest of the production build, packaging, and
+container surfaces.
 
 ## The architecture
 
-**The native Zig TLS/crypto/PKI/QUIC/HTTP implementation is the only
-implementation that ships to users:**
+**The native Zig production implementation is the only implementation that
+ships to users:**
 
 - Every distributed `tardi` artifact — release archives, packages,
-  containers, Homebrew, installer paths — is built on the native
-  implementation, with no OpenSSL or other foreign TLS/crypto/QUIC/H3
-  library linked, configured, or reachable through a hidden runtime
-  fallback.
-- External implementations (OpenSSL, GnuTLS, independent QUIC stacks, …)
-  remain valuable as **test, interoperability, differential-validation, and
-  benchmark infrastructure** — always outside the shipping link/runtime
-  graph, never reachable from it.
+  containers, Homebrew, installer paths — is built from Zig production code,
+  Zig stdlib, reviewed pure-Zig dependencies, and narrow OS/platform ABI
+  substrate, with no OpenSSL or other foreign product implementation linked,
+  compiled, configured, packaged, or reachable through hidden runtime loading.
+- External implementations (OpenSSL, GnuTLS, independent QUIC stacks, Brotli C
+  libraries, and similar peers) remain valuable as **test, interoperability,
+  differential-validation, fuzz, and benchmark infrastructure** — always
+  outside the shipping link/runtime graph, never reachable from it.
 - Appliance vs. general-purpose differences are **product policy** expressed
   on the same native implementation (cipher/identity/lifecycle policy), not
   a choice of implementation backend.
+- Normal OS/kernel/platform ABI facilities remain allowed: libc/libSystem as
+  platform substrate, sockets, filesystem/process/thread primitives,
+  poll/epoll/kqueue/io_uring, POSIX regex, and similar OS interfaces. These
+  allowlists are intentionally narrow and reviewed in
+  `scripts/audit-dependencies.sh`.
+- Pure-Zig dependencies are allowed when reviewed; `build.zig.zon` is not a
+  no-dependencies zone. The audit focuses on implementation language and FFI
+  boundaries rather than rejecting third-party Zig packages by default.
 
 A policy that is only written down drifts. This one is enforced by the build
 graph and by CI, and every release artifact makes its selected profile and
@@ -202,27 +216,46 @@ $ tardi version
 
 ## Enforcement
 
-### Source and configuration audit — `scripts/audit-dependencies.sh`
+### Source/build/package audit — `scripts/audit-dependencies.sh`
 
 Runs before anything is compiled and fails if:
 
-1. A forbidden TLS/crypto/QUIC/H3 dependency name (ngtcp2, nghttp3, quiche,
-   BoringSSL, mbedTLS, wolfSSL, GnuTLS, LibreSSL, rustls, s2n-tls, botan, …) is
-   **configured** in `build.zig`, `build.zig.zon`, workflows, scripts,
-   Dockerfiles, or packaging metadata. Comments are stripped before matching so
-   the policy can be documented in prose; only real configuration fails.
-2. An OpenSSL `@cInclude` appears anywhere under `src/` at all — there is no
-   longer an approved adapter boundary to allowlist.
-3. Any `@cImport` appears in a native implementation path (`src/tls`,
-   `src/pki`, `src/quic`, `src/crypto`, `src/http3`).
+1. Production-scoped Zig source across the repository uses `@cImport` for
+   anything outside the narrow OS/platform header allowlist.
+2. Production source uses runtime dynamic loading (`std.DynLib`, `dlopen`,
+   `LoadLibrary`, etc.) that could hide a foreign implementation fallback.
+3. Production build-graph sources link a non-allowlisted system library or
+   compile vendored C/C++/Objective-C/object code into a production target.
+4. Production package/container/release metadata contains an unreviewed
+   dependency declaration. Ordinary OS/build substrate such as CA bundles is
+   explicitly allowlisted; newly named product implementation dependencies
+   fail closed until reviewed.
+
+The script also defines the production/non-production split mechanically.
+Explicitly non-production paths include `tests/`, `scripts/interop/`,
+benchmarks, checked-in testdata fixture generators, and a narrow set of named
+package/install smoke-test scripts. The audit deliberately does not exempt
+every `scripts/test-*` helper by prefix: adding a new nominally test-named
+helper that installs a foreign implementation is a production-scope failure
+unless it is reviewed into the explicit non-production allowlist. The
+`--self-test` fixture mode proves representative failures and passes: foreign
+production `@cImport`, computed C includes, multiline/indirect system-library
+linkage, computed build-helper imports, vendored C/object inputs, runtime
+loading, multiline package/container installs, production paths reaching
+nominal test helpers, quoted ZON dependency keys, and unknown package
+dependencies fail; OS-substrate `@cImport`, reviewed pure-Zig packages,
+interop peers, and prose mentions pass.
 
 ### Binary linkage audit — `scripts/audit-release-binary.sh`
 
-Inspects a produced binary's dynamic dependencies (`ldd` on Linux, `otool -L`
-on macOS) and emits a machine-readable JSON inventory. It fails if:
+Inspects a produced binary's dynamic dependencies (`readelf`/`objdump` on
+Linux, `otool -L` on macOS) and emits a machine-readable JSON inventory. It
+fails if:
 
-- an artifact of either profile links OpenSSL or any forbidden foreign
-  library; or
+- an artifact of either profile has a dynamic dependency outside the narrow
+  per-platform OS/runtime substrate allowlist (`libSystem.B.dylib` on Darwin;
+  libc/loader/thread/math/dl/rt/resolver/compiler-unwind substrate on Linux);
+  or
 - an artifact does not self-report the native TLS path; or
 - an artifact's self-reported `tls-profile` disagrees with the profile it
   was built and audited as.
@@ -237,10 +270,14 @@ caller-supplied backend flag.
 
 ### CI
 
-The `TLS dependency audit` job in `.github/workflows/ci.yml` runs the source
-audit, builds both profiles, and runs the binary audit against each,
-uploading the inventories as artifacts. It is a required check: CI fails if any
-forbidden implementation is configured, imported, or linked in either profile.
+The `Production dependency audit (Linux)` job in `.github/workflows/ci.yml`
+runs the source audit, source-audit fixtures, binary-audit fixtures, builds
+both profiles, and runs the binary audit against each, uploading the inventories
+as artifacts. `Production binary audit (macOS)` builds and audits the Darwin
+general-profile artifact so platform-specific dynamic dependencies are checked
+in PR CI too. These are required checks: CI fails if any forbidden
+implementation is configured, imported, packaged, dynamically loaded, or linked
+in a production path.
 
 ### Release
 

@@ -1251,7 +1251,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const comp_min_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_MIN_SIZE", "256") catch unreachable;
     defer allocator.free(comp_min_str);
     const compression_min_size = std.fmt.parseInt(usize, comp_min_str, 10) catch 256;
-    const comp_br_enabled_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_BROTLI_ENABLED", "true") catch unreachable;
+    const comp_br_enabled_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_BROTLI_ENABLED", "false") catch unreachable;
     defer allocator.free(comp_br_enabled_str);
     const compression_brotli_enabled = std.mem.eql(u8, comp_br_enabled_str, "true") or std.mem.eql(u8, comp_br_enabled_str, "1");
     const comp_br_quality_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_BROTLI_QUALITY", "5") catch unreachable;

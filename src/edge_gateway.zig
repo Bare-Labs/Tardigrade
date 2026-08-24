@@ -665,10 +665,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
     if (cfg.compression_enabled) {
-        state.logger.info(null, "Response compression enabled (min size: {d} bytes, brotli={}, br_quality={d})", .{
+        state.logger.info(null, "Response compression enabled (min size: {d} bytes, gzip=true, brotli_native=false)", .{
             cfg.compression_min_size,
-            cfg.compression_brotli_enabled,
-            cfg.compression_brotli_quality,
         });
     }
     if (cfg.upstream_gunzip_enabled) {

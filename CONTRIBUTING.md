@@ -120,8 +120,8 @@ filter, e.g. `zig build test-integration -- --test-filter "failure: client abort
 | `-Doptimize=ReleaseFast` | `Debug` | Production-speed build |
 | `-Doptimize=ReleaseSafe` | `Debug` | Release with safety checks |
 | `-Dstatic-executable=true` | `false` | Fully static binary |
-| `-Dprefer-static-system-libs=true` | `false` | Prefer static OpenSSL/crypto |
-| `-Drequire-static-system-libs=true` | `false` | Fail if static libs are unavailable |
+| `-Dprefer-static-system-libs=true` | `false` | Prefer static linkage for test-only system-library oracle helpers |
+| `-Drequire-static-system-libs=true` | `false` | Fail if those requested static test-helper libraries are unavailable |
 | `-Dversion=x.y.z` | `dev` | Embed a version string in the binary |
 
 ## Common workflows
@@ -133,7 +133,7 @@ zig build run
 # Release build
 zig build -Doptimize=ReleaseFast
 
-# Static binary (Linux, requires static OpenSSL)
+# Static production binary (Linux; no OpenSSL dependency)
 zig build -Dstatic-executable=true -Drequire-static-system-libs=true
 
 # Run a specific test by name filter
