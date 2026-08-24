@@ -25,7 +25,7 @@ protocol code, so that:
 
 The architecture is now a single production path: native TLS/QUIC uses the
 in-process pure-Zig `CryptoProvider` seam for keyed cryptographic work in both
-build profiles. #649 retired the general-purpose OpenSSL TLS backend that
+build profiles. #649 retired the general-purpose TLS backend that
 `-Dtls-profile=general` previously linked (`src/http/tls_backend.zig` and the
 OpenSSL implementations of `tls_termination.zig`/`acme_client.zig` were
 deleted); out-of-process OpenSSL remains valid only as an interoperability and
@@ -102,10 +102,10 @@ data, not prose:
 
 - **Primitive/provider support** — `pure_zig_status` and `openssl_status`: can a
   backend do this at all inside the `CryptoProvider` model. `openssl_status`
-  predates #649: it never described an in-process OpenSSL `CryptoProvider`
-  (none has ever existed), and after #649 retired the general-purpose OpenSSL
-  TLS backend it used to describe, the field is vestigial — no shipping build
-  consults it.
+  never described an in-process OpenSSL `CryptoProvider` (none has ever
+  existed); it tracks primitive/algorithm support an out-of-process OpenSSL
+  peer has, for differential-testing purposes, independent of what any
+  shipping product profile enables.
 - **Protocol integration** — `Row.integrations`, a `(Consumer,
   IntegrationStatus)` list: whether each named native consumer's *live* runtime
   actually calls the provider for it today. This is per consumer because it
@@ -113,24 +113,22 @@ data, not prose:
   runtime calls `CryptoProvider` today, not that it could if wired up — see
   `profile.zig`'s integration-status tests, which pin the rows this holds for.
 - **Product enablement** — `Row.enabled_product_profiles`, a named
-  `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose_openssl`):
-  which product actually selects this capability. This is authored per row, not
+  `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose`): which
+  product actually selects this capability. This is authored per row, not
   derived from `pure_zig_status`/`openssl_status` — primitive support does not
-  imply product selectability. `.general_purpose_openssl` predates #649's
-  retirement of the general-purpose OpenSSL TLS backend it was written to
-  describe; `src/crypto/profile.zig` has not been updated since, so the matrix
-  still carries the enum value and rows that reference it, but no shipping
-  binary can reach a capability through it any more — only `.native_appliance`
-  corresponds to a real, linkable backend today.
+  imply product selectability. Both profiles are pure-Zig native and share the
+  same in-process `CryptoProvider` seam (#649 retired the OpenSSL production
+  TLS backend `.general_purpose` used to name); they differ only in product
+  policy — `.native_appliance` is the strict Bare Systems single-identity
+  policy, `.general_purpose` the multi-identity general-purpose policy.
 
 ## Supported profile matrix
 
 The source of truth is `src/crypto/profile.zig`, not prose in this document. The
 matrix below summarizes the checked-in profile for review. The column labeled
 "OpenSSL `CryptoProvider` status" is about the in-process provider model only,
-which has never existed; the "Product profiles" column's `general-purpose
-OpenSSL` entries are likewise a pre-#649 holdover — no shipping build links an
-OpenSSL TLS backend any more (see "Product enablement" above).
+which has never existed and is unrelated to whether either product profile
+enables a capability.
 
 The Zig compatibility floor for this matrix is `0.16.0`; when the project moves
 to a newer compiler or starts carrying compatibility shims for crypto APIs, the
@@ -138,39 +136,37 @@ floor and each affected row must be updated together.
 
 | Capability | Pure-Zig status | Pure-Zig implementation | OpenSSL `CryptoProvider` status | Consumers | Product profiles |
 | --- | --- | --- | --- | --- | --- |
-| SHA-256 | supported | `std.crypto` | provider deferred | TLS handshake: `.not_provider_routed`; QUIC TLS bridge: `.not_provider_routed` | native appliance, general-purpose OpenSSL |
-| SHA-384 | supported | `std.crypto` | provider deferred | TLS handshake: `.not_provider_routed` | native appliance, general-purpose OpenSSL |
-| HKDF-SHA256 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose OpenSSL |
-| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS handshake: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose OpenSSL |
-| AES-128-GCM | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose OpenSSL |
-| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose OpenSSL |
-| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose OpenSSL |
+| SHA-256 | supported | `std.crypto` | provider deferred | TLS handshake: `.not_provider_routed`; QUIC TLS bridge: `.not_provider_routed` | native appliance, general-purpose |
+| SHA-384 | supported | `std.crypto` | provider deferred | TLS handshake: `.not_provider_routed` | native appliance, general-purpose |
+| HKDF-SHA256 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
+| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS handshake: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
+| AES-128-GCM | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
+| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
+| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS record: `.live`; QUIC packet protection: `.live` | native appliance, general-purpose |
 | QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance only |
 | QUIC AES-256 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance only |
 | QUIC ChaCha20 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection: `.live` | native appliance only |
-| X25519 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.not_integrated` | native appliance, general-purpose OpenSSL |
-| secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.not_integrated`; PKI: `.not_integrated` | general-purpose OpenSSL only |
-| Ed25519 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; PKI: `.live` | native appliance, general-purpose OpenSSL |
-| ECDSA-P256-SHA256 | supported | `std.crypto` signing/verification | provider deferred | TLS handshake: `.live`; PKI: `.live` | native appliance, general-purpose OpenSSL |
-| RSA-PSS-RSAE-SHA256 | supported | project code | provider deferred | TLS handshake: `.live`; PKI: `.live` | general-purpose OpenSSL only |
-| DER/X.509 parser helpers | provider deferred | project code | provider deferred | PKI: `.not_provider_routed` | native appliance, general-purpose OpenSSL |
+| X25519 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.not_integrated` | native appliance, general-purpose |
+| secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; QUIC TLS bridge: `.not_integrated`; PKI: `.not_integrated` | general-purpose only |
+| Ed25519 | supported | `std.crypto` | provider deferred | TLS handshake: `.live`; PKI: `.live` | native appliance, general-purpose |
+| ECDSA-P256-SHA256 | supported | `std.crypto` signing/verification | provider deferred | TLS handshake: `.live`; PKI: `.live` | native appliance, general-purpose |
+| RSA-PSS-RSAE-SHA256 | supported | project code | provider deferred | TLS handshake: `.live`; PKI: `.live` | general-purpose only |
+| DER/X.509 parser helpers | provider deferred | project code | provider deferred | PKI: `.not_provider_routed` | native appliance, general-purpose |
 | Certificate chain builder | provider deferred | unavailable | provider deferred | PKI: `.not_integrated` | neither |
 | WebPKI validation | provider deferred | unavailable | provider deferred | PKI: `.not_integrated` | neither |
-| Injected random bytes | supported | project code | provider deferred | TLS handshake: `.live`; QUIC packet protection: `.not_integrated`; resumption: `.not_integrated` | native appliance, general-purpose OpenSSL |
-| Secure zero | supported | project code | supported | TLS handshake: `.not_provider_routed`; TLS record: `.not_provider_routed`; QUIC packet protection: `.not_provider_routed`; PKI: `.not_provider_routed`; resumption: `.not_provider_routed` | native appliance, general-purpose OpenSSL |
-| Constant-time compare | supported | project code | supported | TLS handshake: `.not_provider_routed`; TLS record: `.not_provider_routed`; PKI: `.not_provider_routed` | native appliance, general-purpose OpenSSL |
+| Injected random bytes | supported | project code | provider deferred | TLS handshake: `.live`; QUIC packet protection: `.not_integrated`; resumption: `.not_integrated` | native appliance, general-purpose |
+| Secure zero | supported | project code | supported | TLS handshake: `.not_provider_routed`; TLS record: `.not_provider_routed`; QUIC packet protection: `.not_provider_routed`; PKI: `.not_provider_routed`; resumption: `.not_provider_routed` | native appliance, general-purpose |
+| Constant-time compare | supported | project code | supported | TLS handshake: `.not_provider_routed`; TLS record: `.not_provider_routed`; PKI: `.not_provider_routed` | native appliance, general-purpose |
 
 Protocol configuration must not hand-write provider-derived TLS capabilities.
 Use `tls.crypto_profile.fromProfile(product, provider.capabilities())`, naming
 the caller's `crypto.profile.ProductProfile` explicitly (`.native_appliance`
-for the pure-Zig in-process path), then pass the returned
-`asPolicyCapabilities()` slice set to `tls.Policy`. `.general_purpose_openssl`
-is the same pre-#649 holdover described above: still a valid enum value,
-still exercised by `crypto_profile.zig`'s own tests, but named by no
-production call site. This is the TLS-policy adapter for a provider-backed/
-native TLS path: it intersects an actual `CryptoProvider` capability set with
-the selected product-profile policy. When a call site must accept
-hand-written TLS capability lists, it should preflight them with
+for the appliance policy, `.general_purpose` for the general-purpose policy —
+both pure-Zig in-process), then pass the returned `asPolicyCapabilities()`
+slice set to `tls.Policy`. This is the TLS-policy adapter for the
+provider-backed native TLS path: it intersects an actual `CryptoProvider`
+capability set with the selected product-profile policy. When a call site
+must accept hand-written TLS capability lists, it should preflight them with
 `tls.crypto_profile.validateAgainstProvider` before handshake execution.
 
 The native appliance profile remains the deliberately narrow in-process
@@ -301,10 +297,10 @@ contract calls internally.
   where required; protocol-specific breadth remains owned by the relevant
   protocol epics.
 - *The native pure-Zig path implements and consumes `CryptoProvider`; the
-  general-purpose OpenSSL backend remains behind its separate TLS adapter/backend*
+  general-purpose backend remains behind its separate TLS adapter/backend*
   — the original #370 criterion, satisfied for as long as that second backend
   existed: the two paths shared no requirement to implement the same provider
-  vtable. #649 has since retired the general-purpose OpenSSL backend entirely,
+  vtable. #649 has since retired the general-purpose backend entirely,
   so the native pure-Zig path is now the only one; no OpenSSL type crosses
   into the native/provider architecture.
 - *Capability negotiation is explicit and cannot select unsupported algorithms*

@@ -141,7 +141,7 @@ pub fn supportsSignatureScheme(caps: provider.Capabilities, scheme: policy_mod.S
 
 test "TLS policy capabilities are derived from provider support" {
     const caps = profile.capabilities(.pure_zig);
-    const tls_caps = fromProfile(.general_purpose_openssl, caps);
+    const tls_caps = fromProfile(.general_purpose, caps);
     try std.testing.expectEqual(@as(usize, 3), tls_caps.cipher_suites_len);
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_128_gcm_sha256, tls_caps.cipher_suites[0]);
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_256_gcm_sha384, tls_caps.cipher_suites[1]);
@@ -174,7 +174,7 @@ test "native appliance profile selects only what the live engine negotiates" {
 
 test "hand-written TLS policy capabilities are rejected when provider cannot support them" {
     const caps = profile.capabilities(.pure_zig);
-    const derived = fromProfile(.general_purpose_openssl, caps);
+    const derived = fromProfile(.general_purpose, caps);
     try validateAgainstProvider(caps, derived.asPolicyCapabilities());
 
     // A hand-authored policy naming a group absent from the provider's
@@ -205,7 +205,7 @@ test "adding the RSA PKCS#1 v1.5 provider primitive does not advertise it for TL
 
     try std.testing.expect(!supportsSignatureScheme(caps, .rsa_pkcs1_sha256));
 
-    const general = fromProfile(.general_purpose_openssl, caps);
+    const general = fromProfile(.general_purpose, caps);
     for (general.signature_schemes[0..general.signature_schemes_len]) |scheme| {
         try std.testing.expect(scheme != .rsa_pkcs1_sha256);
     }
