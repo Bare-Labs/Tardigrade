@@ -116,6 +116,13 @@ relpath() {
     esac
 }
 
+zig_import_paths() {
+    stripped "$1" |
+        tr '\n' ' ' |
+        grep -oE '@import[[:space:]]*\([[:space:]]*"[^"]+\.zig"[[:space:]]*\)' |
+        sed -E 's/.*@import[[:space:]]*\([[:space:]]*"([^"]+)"[[:space:]]*\).*/\1/' || true
+}
+
 resolve_build_sources() {
     local -a queue=("build.zig")
     local -A seen=()
@@ -145,7 +152,7 @@ resolve_build_sources() {
             ../* | /*) continue ;;
             esac
             queue+=("$target")
-        done < <(grep -oE '@import\("[^"]+\.zig"\)' "$REPO_ROOT/$f" 2>/dev/null | sed -E 's/.*@import\("([^"]+)"\).*/\1/')
+        done < <(zig_import_paths "$REPO_ROOT/$f")
     done
 }
 
@@ -259,6 +266,13 @@ allowed_system_library() {
     esac
 }
 
+is_reviewed_generated_build_module() {
+    case "$1" in
+    build_options) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
 scan_source_ffi() {
     [ -d "$REPO_ROOT" ] || return 0
     local zigfile rel content normalized include_exprs include_expr include_header
@@ -321,13 +335,11 @@ resolve_relative_import() {
 
 scan_nonproduction_zig_imports() {
     [ -d "$REPO_ROOT" ] || return 0
-    local zigfile rel import_line import_path target
+    local zigfile rel import_path target
     while IFS= read -r zigfile; do
         rel="$(relpath "$zigfile")"
         is_nonproduction_zig_file "$rel" && continue
-        while IFS= read -r import_line; do
-            [ -z "$import_line" ] && continue
-            import_path="$(printf '%s\n' "$import_line" | sed -nE 's/^[0-9]+:.*@import[[:space:]]*\([[:space:]]*"([^"]+\.zig)"[[:space:]]*\).*/\1/p')"
+        while IFS= read -r import_path; do
             [ -n "$import_path" ] || continue
             target="$(resolve_relative_import "$rel" "$import_path" || true)"
             [ -n "$target" ] || continue
@@ -335,24 +347,41 @@ scan_nonproduction_zig_imports() {
             ../* | /*) continue ;;
             esac
             if is_nonproduction_zig_file "$target"; then
-                fail "production Zig source imports non-production source root $target from $rel:$import_line"
+                fail "production Zig source imports non-production source root $target from $rel"
             fi
-        done < <(stripped "$zigfile" | grep -nE '@import[[:space:]]*\([[:space:]]*"[^"]+\.zig"' || true)
+        done < <(zig_import_paths "$zigfile")
     done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
 scan_build_production_graph() {
-    local file stmt module root exe name root_mod root_path parent child installed target lib anon
+    local file stmt module root exe name root_mod root_path parent child installed target lib anon alias_name alias_value token
     local anon_index=0
-    local -A module_roots=() executable_roots=() executable_root_paths=() executable_names=() installed_executables=() edges=() foreign_calls=() system_link_calls=() reachable=()
+    local -A aliases=() module_roots=() executable_roots=() executable_root_paths=() executable_names=() installed_executables=() edges=() foreign_calls=() system_link_calls=() reachable=()
+    graph_resolve_alias() {
+        local value="$1" guard=0
+        while [ -n "${aliases[$value]:-}" ] && [ "$guard" -lt 20 ]; do
+            value="${aliases[$value]}"
+            guard=$((guard + 1))
+        done
+        printf '%s\n' "$value"
+    }
     while IFS= read -r file; do
         [ -f "$REPO_ROOT/$file" ] || continue
         while IFS= read -r stmt; do
             [ -z "$stmt" ] && continue
+            alias_name="$(printf '%s\n' "$stmt" | sed -nE 's/.*(const|var)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;.*/\2/p')"
+            alias_value="$(printf '%s\n' "$stmt" | sed -nE 's/.*(const|var)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;.*/\3/p')"
+            if [ -n "$alias_name" ] && [ -n "$alias_value" ]; then
+                aliases[$alias_name]="$(graph_resolve_alias "$alias_value")"
+            fi
             module="$(printf '%s\n' "$stmt" | sed -nE 's/.*(const|var)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*createModule[[:space:]]*\(.*/\2/p')"
             if [ -n "$module" ]; then
                 module_roots[$module]="${module_roots[$module]:-}"
                 root="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
+                if [ -z "$root" ]; then
+                    token="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+                    [ -z "$token" ] || root="$(resolve_build_string "$REPO_ROOT/$file" "$token")"
+                fi
                 [ -z "$root" ] || module_roots[$module]="$root"
             fi
             module="$(printf '%s\n' "$stmt" | sed -nE 's/.*(const|var)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*b\.(addObject|addLibrary|addStaticLibrary|addSharedLibrary)[[:space:]]*\(.*/\2/p')"
@@ -360,6 +389,11 @@ scan_build_production_graph() {
                 module_roots[$module]="${module_roots[$module]:-}"
                 root_mod="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_module[[:space:]]*=[[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
                 root_path="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
+                if [ -z "$root_path" ]; then
+                    token="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+                    [ -z "$token" ] || root_path="$(resolve_build_string "$REPO_ROOT/$file" "$token")"
+                fi
+                [ -z "$root_mod" ] || root_mod="$(graph_resolve_alias "$root_mod")"
                 [ -z "$root_path" ] || module_roots[$module]="$root_path"
                 [ -z "$root_mod" ] || edges[$module]="${edges[$module]:-} $root_mod"
             fi
@@ -368,23 +402,41 @@ scan_build_production_graph() {
                 name="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p')"
                 root_mod="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_module[[:space:]]*=[[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
                 root_path="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
+                if [ -z "$root_path" ]; then
+                    token="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+                    [ -z "$token" ] || root_path="$(resolve_build_string "$REPO_ROOT/$file" "$token")"
+                fi
+                [ -z "$root_mod" ] || root_mod="$(graph_resolve_alias "$root_mod")"
                 executable_names[$exe]="$name"
                 executable_roots[$exe]="$root_mod"
                 executable_root_paths[$exe]="$root_path"
             fi
             installed="$(printf '%s\n' "$stmt" | sed -nE 's/.*installArtifact[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+            if [ -z "$installed" ]; then
+                installed="$(printf '%s\n' "$stmt" | sed -nE 's/.*addInstallArtifact[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+            fi
             if [[ "$stmt" == *"installArtifact"* && -z "$installed" ]]; then
                 fail "build installArtifact uses unresolved artifact expression in $file: $stmt"
+            fi
+            if [[ "$stmt" == *"addInstallArtifact"* && -z "$installed" ]]; then
+                fail "build addInstallArtifact uses unresolved artifact expression in $file: $stmt"
             fi
             [ -z "$installed" ] || installed_executables[$installed]=1
             parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.addImport[[:space:]]*\(.*/\1/p')"
             child="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.addImport[[:space:]]*\([^,]+,[[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
             if [ -n "$parent" ] && [ -n "$child" ]; then
+                parent="$(graph_resolve_alias "$parent")"
+                child="$(graph_resolve_alias "$child")"
                 edges[$parent]="${edges[$parent]:-} $child"
             fi
             parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.addAnonymousImport[[:space:]]*\(.*/\1/p')"
             root="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.addAnonymousImport[[:space:]]*\(.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*"([^"]+)".*/\1/p')"
+            if [ -z "$root" ]; then
+                token="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.addAnonymousImport[[:space:]]*\(.*\.root_source_file[[:space:]]*=[[:space:]]*b\.path[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\1/p')"
+                [ -z "$token" ] || root="$(resolve_build_string "$REPO_ROOT/$file" "$token")"
+            fi
             if [ -n "$parent" ]; then
+                parent="$(graph_resolve_alias "$parent")"
                 if [ -z "$root" ]; then
                     fail "build addAnonymousImport uses unresolved root source in $file: $stmt"
                 else
@@ -397,22 +449,30 @@ scan_build_production_graph() {
             parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.(addObject|linkLibrary)[[:space:]]*\(.*/\1/p')"
             child="$(printf '%s\n' "$stmt" | sed -nE 's/.*\.(addObject|linkLibrary)[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*).*/\2/p')"
             if [ -n "$parent" ] && [ -n "$child" ]; then
+                parent="$(graph_resolve_alias "$parent")"
+                child="$(graph_resolve_alias "$child")"
                 edges[$parent]="${edges[$parent]:-} $child"
             fi
             parent="$(printf '%s\n' "$stmt" | sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)(\.root_module)?\.(addCSourceFiles|addCSourceFile|addObjectFile|addAssemblyFile)[[:space:]]*\(.*/\1/p')"
             if [ -n "$parent" ]; then
+                parent="$(graph_resolve_alias "$parent")"
                 foreign_calls[$parent]="${foreign_calls[$parent]:-}${foreign_calls[$parent]:+$'\n'}$file: $stmt"
             fi
             target="$(printf '%s\n' "$stmt" | sed -nE 's/.*linkSystemLibrary[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*),[[:space:]]*"([^"]+)".*/\1/p')"
             lib="$(printf '%s\n' "$stmt" | sed -nE 's/.*linkSystemLibrary[[:space:]]*\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*),[[:space:]]*"([^"]+)".*/\2/p')"
             if [ -n "$target" ] && [ -n "$lib" ]; then
+                target="$(graph_resolve_alias "$target")"
                 system_link_calls[$target]="${system_link_calls[$target]:-}${system_link_calls[$target]:+$'\n'}$lib $file: $stmt"
             fi
         done < <(logical_zig_calls <(stripped "$REPO_ROOT/$file"))
     done < <(resolve_build_sources)
 
-    for exe in "${!executable_names[@]}"; do
-        [ -n "${installed_executables[$exe]:-}" ] || continue
+    for installed in "${!installed_executables[@]}"; do
+        exe="$(graph_resolve_alias "$installed")"
+        if [ -z "${executable_names[$exe]:-}" ]; then
+            fail "installed artifact $installed does not resolve to a known compile step"
+            continue
+        fi
         if [ -z "${executable_names[$exe]}" ]; then
             fail "installed executable uses unresolved name expression in build graph for $exe"
             continue
@@ -450,6 +510,9 @@ scan_build_production_graph() {
         if [ -n "$rel" ] && is_nonproduction_zig_file "$rel"; then
             fail "installed tardi module graph reaches non-production source root $rel via $module"
         fi
+        if [ -z "$rel" ] && [ -z "${edges[$module]:-}" ] && [ -z "${executable_names[$module]:-}" ] && ! is_reviewed_generated_build_module "$module"; then
+            fail "installed tardi module graph reaches unresolved module/root $module"
+        fi
         while IFS= read -r line; do
             [ -z "$line" ] && continue
             fail "installed tardi module graph reaches foreign source/object/assembly build input through $module in $line"
@@ -466,10 +529,10 @@ scan_build_production_graph() {
 
 validate_build_imports() {
     local file="$1" imports line
-    if imports="$(stripped "$REPO_ROOT/$file" | grep -nE '@import[[:space:]]*\(' | grep -vE '@import[[:space:]]*\([[:space:]]*"[^"]+"' || true)"; then
+    if imports="$(stripped "$REPO_ROOT/$file" | tr '\n' ' ' | grep -oE '@import[[:space:]]*\([[:space:]]*[^)]*\)' | grep -vE '@import[[:space:]]*\([[:space:]]*"[^"]+"' || true)"; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
-            fail "production build helper import uses unresolved non-literal expression in $file:$line"
+            fail "production build helper import uses unresolved non-literal expression in $file: $line"
         done <<<"$imports"
     fi
 }
@@ -772,6 +835,26 @@ pub fn build(b: *std.Build) void {
 }
 EOF
         ;;
+    fail-build-helper-split-import)
+        mkdir -p "$root/build"
+        printf 'foreign object placeholder\n' >"$root/foreign.o"
+        cat >"$root/build/product.zig" <<'EOF'
+const std = @import("std");
+pub fn configure(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    exe.addObjectFile(b.path("foreign.o"));
+}
+EOF
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+const product = @import
+("build/product.zig");
+pub fn build(b: *std.Build) void {
+    const exe = b.addExecutable(.{ .name = "tardi", .root_source_file = b.path("src/main.zig") });
+    product.configure(b, exe);
+    b.installArtifact(exe);
+}
+EOF
+        ;;
     fail-test-looking-production-target)
         printf 'foreign object placeholder\n' >"$root/foreign.o"
         cat >"$root/build.zig" <<'EOF'
@@ -823,6 +906,15 @@ EOF
         printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
         cat >"$root/src/main.zig" <<'EOF'
 const product = @import("../benchmarks/product.zig");
+pub fn main() void { product.load(); }
+EOF
+        ;;
+    fail-split-nonproduction-source-imported)
+        mkdir -p "$root/benchmarks"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product = @import
+("../benchmarks/product.zig");
 pub fn main() void { product.load(); }
 EOF
         ;;
@@ -878,6 +970,78 @@ pub fn build(b: *std.Build) void {
     const product_name = "tardi";
     const exe_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{ .name = product_name, .root_module = exe_mod });
+    b.installArtifact(exe);
+}
+EOF
+        ;;
+    fail-install-artifact-alias)
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const evp_oracle_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    evp_oracle_mod.addCSourceFile(.{ .file = b.path("tests/evp_oracle.c"), .flags = &.{ "-std=c11" } });
+    const tardi = b.addExecutable(.{ .name = "tardi", .root_module = evp_oracle_mod });
+    const shipping = tardi;
+    b.installArtifact(shipping);
+}
+EOF
+        printf 'int main(void) { return 0; }\n' >"$root/tests/evp_oracle.c"
+        ;;
+    fail-add-install-artifact)
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const evp_oracle_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    evp_oracle_mod.addCSourceFile(.{ .file = b.path("tests/evp_oracle.c"), .flags = &.{ "-std=c11" } });
+    const tardi = b.addExecutable(.{ .name = "tardi", .root_module = evp_oracle_mod });
+    const install = b.addInstallArtifact(tardi, .{});
+    b.getInstallStep().dependOn(&install.step);
+}
+EOF
+        printf 'int main(void) { return 0; }\n' >"$root/tests/evp_oracle.c"
+        ;;
+    fail-reachable-computed-module-root)
+        mkdir -p "$root/benchmarks"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product = @import("product");
+pub fn main() void { product.load(); }
+EOF
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const product_path = "benchmarks/product.zig";
+    const exe_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
+    const product_mod = b.createModule(.{ .root_source_file = b.path(product_path), .target = target, .optimize = optimize });
+    exe_mod.addImport("product", product_mod);
+    const exe = b.addExecutable(.{ .name = "tardi", .root_module = exe_mod });
+    b.installArtifact(exe);
+}
+EOF
+        ;;
+    fail-reachable-module-alias)
+        mkdir -p "$root/benchmarks"
+        printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product = @import("product");
+pub fn main() void { product.load(); }
+EOF
+        cat >"$root/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const exe_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
+    const product_mod = b.createModule(.{ .root_source_file = b.path("benchmarks/product.zig"), .target = target, .optimize = optimize });
+    const product_alias = product_mod;
+    exe_mod.addImport("product", product_alias);
+    const exe = b.addExecutable(.{ .name = "tardi", .root_module = exe_mod });
     b.installArtifact(exe);
 }
 EOF
@@ -1201,7 +1365,7 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-named-nonproduction-module-import fail-anonymous-nonproduction-module-import fail-computed-tardi-name fail-oracle-module-installed fail-oracle-object-bridged fail-static-library-bridged fail-evp-oracle-name-production-link fail-assembly-file fail-cinclude-computed fail-cimport-split-foreign-header fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-inline-zon-dependency fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-homebrew-linux-plus-dependency fail-nonproduction-helper-reached-broad fail-release-reusable-workflow fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-build-helper-split-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-split-nonproduction-source-imported fail-named-nonproduction-module-import fail-anonymous-nonproduction-module-import fail-computed-tardi-name fail-install-artifact-alias fail-add-install-artifact fail-reachable-computed-module-root fail-reachable-module-alias fail-oracle-module-installed fail-oracle-object-bridged fail-static-library-bridged fail-evp-oracle-name-production-link fail-assembly-file fail-cinclude-computed fail-cimport-split-foreign-header fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-inline-zon-dependency fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-homebrew-linux-plus-dependency fail-nonproduction-helper-reached-broad fail-release-reusable-workflow fail-dlopen; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2
