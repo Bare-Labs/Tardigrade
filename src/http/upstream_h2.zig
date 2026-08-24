@@ -17,16 +17,17 @@
 //!
 //! Built on `http2_frame.zig` (frame codec) and `hpack.zig` (literal encoder +
 //! stateful decoder). `exchange` is generic over the transport: it requires
-//! `read([]u8) !usize`, `writeAll([]const u8) !void`, and `pending() usize`
-//! (`SSL_pending`, so poll-bounded reads do not miss data already buffered in
-//! OpenSSL). Reads are bounded with `poll(2)` so a hung origin cannot block a
-//! worker indefinitely (the #196 guarantee).
+//! `read([]u8) !usize`, `writeAll([]const u8) !void`, and `pending() usize`.
+//! `pending()` reports already-decrypted plaintext buffered by the transport,
+//! so poll-bounded reads do not miss bytes already available above the socket.
+//! Reads are bounded with `poll(2)` so a hung origin cannot block a worker
+//! indefinitely (the #196 guarantee).
 
 const std = @import("std");
 const compat = @import("zig_compat");
 const frame = @import("http2_frame.zig");
 const hpack = @import("hpack.zig");
-const tls_termination = @import("tls_backend.zig");
+const upstream_tls = @import("upstream_tls.zig");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5).
@@ -1604,7 +1605,7 @@ pub fn H2Conn(comptime Transport: type) type {
 /// instantiations — keeps a single pool, lifecycle, and metrics path for both.
 pub const UpstreamH2Transport = union(enum) {
     tls: struct {
-        conn: *tls_termination.UpstreamTlsConn,
+        conn: *upstream_tls.UpstreamTlsConn,
         /// Frees the `UpstreamTlsConn` allocation in `close` (the pool
         /// allocated it before ALPN was known).
         allocator: std.mem.Allocator,
@@ -1728,7 +1729,7 @@ pub fn freeH2OriginSnapshots(allocator: std.mem.Allocator, snaps: []H2OriginSnap
 /// an HTTP/1.1 exchange on and then `close`/free.
 pub const H2AcquireResult = union(enum) {
     h2: *PooledH2Conn,
-    h1: *tls_termination.UpstreamTlsConn,
+    h1: *upstream_tls.UpstreamTlsConn,
 };
 
 /// Per-origin pool of multiplexing h2 connections (#145, PR 2). One connection
@@ -1867,7 +1868,7 @@ pub const H2ConnPool = struct {
         key: []const u8,
         host: []const u8,
         port: u16,
-        tls_options: ?tls_termination.UpstreamTlsOptions,
+        tls_options: ?upstream_tls.UpstreamTlsOptions,
         connect_timeout_ms: u32,
         deadline_ms: u32,
     ) !H2AcquireResult {
@@ -1905,13 +1906,13 @@ pub const H2ConnPool = struct {
             return error.OutOfMemory;
         };
         if (tls_options) |base_opts| {
-            const tls_ptr = self.allocator.create(tls_termination.UpstreamTlsConn) catch {
+            const tls_ptr = self.allocator.create(upstream_tls.UpstreamTlsConn) catch {
                 self.allocator.destroy(transport);
                 _ = std.c.close(fd);
                 return error.OutOfMemory;
             };
             const opts = base_opts;
-            tls_ptr.* = tls_termination.UpstreamTlsConn.connect(fd, host, opts) catch |e| {
+            tls_ptr.* = upstream_tls.UpstreamTlsConn.connect(fd, host, opts) catch |e| {
                 self.allocator.destroy(tls_ptr);
                 self.allocator.destroy(transport);
                 _ = std.c.close(fd);

@@ -640,15 +640,15 @@ certificate validation for every request to that origin. Instead fix the
 origin's certificate, supply the correct CA bundle via
 `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE`, or correct
 `TARDIGRADE_UPSTREAM_TLS_SERVER_NAME` if SNI doesn't match what the origin
-presents. This applies identically on every `-Dtls-profile` build (#634):
-`appliance`/`native` upstream HTTPS goes through the native TLS/PKI stack
-(`src/http/tls_termination_stub.zig`'s `UpstreamTlsConn`), not OpenSSL, but
-the same knobs, the same 502-on-failure mapping, and the same "fix the
-certificate, don't disable verification" guidance apply.
+presents. This applies identically on every `-Dtls-profile` build (#634,
+#649): upstream HTTPS always goes through the native TLS/PKI stack
+(`src/http/tls_termination.zig`'s `UpstreamTlsConn`), never OpenSSL — the
+same knobs, the same 502-on-failure mapping, and the same "fix the
+certificate, don't disable verification" guidance apply everywhere.
 
-**Native-profile-specific cause:** under `-Dtls-profile=native`/`appliance`,
-certificate chain verification authenticates signatures made with Ed25519,
-ECDSA P-256/SHA-256, RSA-PSS/SHA-256, or (as of #645) classic RSA PKCS#1 v1.5
+**Native signature-algorithm coverage:** certificate chain verification
+authenticates signatures made with Ed25519, ECDSA P-256/SHA-256,
+RSA-PSS/SHA-256, or (as of #645) classic RSA PKCS#1 v1.5
 (`sha256WithRSAEncryption`/`sha384WithRSAEncryption`, still common among
 public CAs) — `src/pki/verify.zig`, #343 and #645. RSA PKCS#1 v1.5 support is
 certificate-chain-signature verification only; it does not change what the
@@ -658,9 +658,10 @@ P-256/SHA-256, or RSA-PSS/SHA-256). An origin whose chain is signed with
 another unsupported combination (e.g. ECDSA/SHA-384, or RSA PKCS#1 v1.5/
 SHA-512) still fails closed here even with a correct CA bundle and hostname —
 this is a native signature-algorithm coverage gap, not a misconfiguration,
-and disabling verification is still not the fix. Until the native matrix is
-extended further, such an origin needs `-Dtls-profile=general` (OpenSSL) to
-be proxied with verification enabled.
+and disabling verification is still not the fix. There is no OpenSSL-backed
+profile to fall back to any more (#649 retired it); until the native matrix
+is extended further, such an origin cannot be proxied with verification
+enabled.
 
 Independently of signature support, the native handshake engine also caps
 each peer certificate entry at 8 KiB DER bytes and the whole handshake
@@ -860,37 +861,32 @@ can't complete a TLS handshake).
 
 ### Startup validation failures
 
-`tardi check` and actual server startup validate different things on the
-default build, and conflating them leads to false confidence:
+`tardi check` and actual server startup validate different things, and
+conflating them leads to false confidence:
 
-1. **`tardi check`, general/OpenSSL profile (the default,
-   `-Dtls-profile=general`):** config-shape validation only. It does not
-   parse or cross-check the certificate/key files themselves.
-2. **`tardi run`/service startup, general/OpenSSL profile:** before the
-   gateway begins serving, the certificate chain and private key are
-   actually loaded and checked for a match (`SSL_CTX_use_certificate_chain_file`,
-   `SSL_CTX_use_PrivateKey_file`, `SSL_CTX_check_private_key` in
-   `http/tls_termination.zig`). **Malformed PEM, an unreadable/invalid key,
-   or a cert/key mismatch fail `tardi run`/service startup outright — even
-   though a prior `tardi check` may have printed `configuration valid`.**
-   This is not a "wait for a real handshake" problem; it's a "run the
-   process, not just `check`" problem.
-3. **Validity/trust/hostname, general/OpenSSL profile:** an expired,
-   not-yet-valid, untrusted, or hostname-mismatched certificate is a
-   separate class, normally observed by the *client* during handshake
-   validation, not something that blocks Tardigrade's own startup — see
-   [Runtime handshake failures](#runtime-handshake-failures) below.
+1. **`tardi check`, general profile (the default,
+   `-Dtls-profile=general`):** config-shape validation, including
+   deterministic rejection of the retired OpenSSL-adapter-only settings
+   (TLS 1.2, cipher overrides, downstream mTLS, session cache/tickets,
+   OCSP, CRL, ACME, the credential watcher, PROXY protocol with TLS — see
+   `docs/TLS_DEPENDENCY_POLICY.md#retired-openssl-capability-disposition`).
+   It does not parse or cross-check the certificate/key files themselves.
+2. **`tardi run`/service startup, general profile:** before the gateway
+   begins serving, the certificate/key files are loaded into the native
+   credential store (`src/http/native_tls_connection.zig`). **Malformed
+   PEM, an unreadable/invalid key, or a cert/key mismatch fail `tardi
+   run`/service startup outright — even though a prior `tardi check` may
+   have printed `configuration valid`.** This is not a "wait for a real
+   handshake" problem; it's a "run the process, not just `check`" problem.
+3. **Validity/trust/hostname, general profile:** an expired, not-yet-valid,
+   untrusted, or hostname-mismatched certificate is a separate class,
+   normally observed by the *client* during handshake validation, not
+   something that blocks Tardigrade's own startup — see [Runtime handshake
+   failures](#runtime-handshake-failures) below.
 4. **Appliance TLS profile (`-Dtls-profile=appliance`):** `tardi check`
    additionally runs the appliance credential preflight (PEM parse,
    chain shape, leaf/key match, validity-window checks), so it catches
    the supported material/validity failures earlier, at `check` time.
-5. **Native general-purpose profile (`-Dtls-profile=native`, #634):**
-   `tardi check` is config-shape validation like the general profile, but
-   OpenSSL-adapter-only settings (TLS 1.2, cipher overrides, mTLS, session
-   cache/tickets, OCSP, CRL, ACME, the credential watcher, PROXY protocol
-   with TLS) are rejected deterministically at `check` time. Credential
-   parse/mismatch failures surface when `tardi run` loads the files into
-   the native credential store at startup.
 
 Confirm which profile you're running with `tardi version` (it prints
 `tls-profile=...`) before assuming which of the above applies.
@@ -1488,43 +1484,27 @@ time you reloaded.
   3. **the reload "succeeds" and publishes the new config, but the specific
      live runtime state doesn't change until restart** (bound socket
      host/port, worker thread/queue counts, PID file, upstream-pool policy,
-     session/approval/transcript store paths, and — on the
-     **general/OpenSSL profile** — TLS context inputs including protocol/
-     cipher/session/client-verify/CA/CRL/OCSP/ACME/watcher settings and the
-     configured SNI identity) — this is the easiest case to mistake for
-     "reload is broken", because there's no rejection to see.
+     session/approval/transcript store paths, and the retired
+     OpenSSL-adapter TLS context inputs — protocol/cipher/session/
+     client-verify/CA/CRL/OCSP/ACME/watcher settings, which are also
+     rejected outright by config validation if set to anything but their
+     default) — this is the easiest case to mistake for "reload is
+     broken", because there's no rejection to see.
 
-  For the **stable TCP/OpenSSL path** specifically, TLS credential/config
-  identity is not a generic `SIGHUP`-hot-reloadable surface: appliance
-  credential-configuration changes are rejected outright (bucket 2), and
-  the general/OpenSSL TCP context is startup-owned (bucket 3) — `SIGHUP`
-  only sends it `updateProtocolPolicy(...)`, not a rebuilt certificate
-  context. Separately, that same OpenSSL terminator has its own
-  file-content maintenance watcher that reloads certificate/key *bytes at
-  the already-configured paths* on its own interval, keeping the existing
-  context active if a refresh fails — a distinct mechanism from `SIGHUP`
-  config reload, not something that makes TLS config fields themselves
-  hot-reloadable.
-
-  **On a general-profile build that also serves HTTP/3, TLS identity
-  rotation is entirely restart-owned, not silently split
-  ([#629](https://github.com/Bare-Systems/Tardigrade/issues/629)).** When
-  both a `TlsTerminator` (stable TCP/OpenSSL) and a `NativeCredentialStore`
-  (native H3) exist, `hotReloadConfig()` checks whether the proposed
-  `tls_cert_path`/`tls_key_path`/SNI certificates differ from what is
-  currently published *before* touching either credential owner; if they
-  differ, the whole reload is rejected — same as the appliance bucket-2
-  contract above. When they're unchanged, native H3's credential files are
-  never re-read on that `SIGHUP` either (so a certificate rotated in place
-  at the same configured path isn't picked up), and the OpenSSL terminator's
-  own independent file watcher is disabled for this composition at startup
-  — so neither surface can drift on its own. Native H3 is never allowed to
-  publish a rebuilt identity while stable TCP stays behind on the old one;
-  both surfaces keep serving the previous, coherent identity until a
-  restart. See "TLS Credential Identity" in
+  TLS credential/config identity is not a generic `SIGHUP`-hot-reloadable
+  surface in either profile: appliance credential-configuration changes are
+  rejected outright (bucket 2), and enabling or disabling TLS itself is
+  rejected outright in every profile (also bucket 2) — the native
+  credential owner is startup-fixed. On the general profile, a reload does
+  re-read the configured certificate/key files' *content* and publish a new
+  identity if every other check passes; since one `NativeCredentialStore`
+  serves both stable TCP and HTTP/3 (#649 retired the #629 mixed-owner
+  composition, where a separate OpenSSL terminator served TCP), that single
+  atomic swap keeps both surfaces coherent — there is no longer a case
+  where they could drift from each other. See "TLS Credential Identity" in
   [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md#tls-credential-identity) for the
   full contract, including why the appliance profile's `ApplianceCredentials`
-  owner — despite technically supporting reload methods — is also fully
+  owner — despite technically supporting reload methods — is fully
   startup-owned in practice, since `hotReloadConfig` never calls them.
 - **you edited `tardigrade.env`, not `tardigrade.conf`** — `SIGHUP` reloads
   the *config*; it cannot change the *process environment* of an

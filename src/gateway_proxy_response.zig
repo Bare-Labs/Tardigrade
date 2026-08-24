@@ -349,9 +349,7 @@ pub fn writeBufferedUpstreamResponseHead(
 fn classifyWriterMode(comptime Writer: type, body_empty: bool) http.metrics.ResponseWriteMode {
     _ = body_empty;
     const name = @typeName(Writer);
-    if (std.mem.indexOf(u8, name, "tls_termination.TlsConnection.Writer") != null or
-        std.mem.indexOf(u8, name, "encrypted_stream_connection.EncryptedStreamHttpConnection.Writer") != null)
-    {
+    if (std.mem.indexOf(u8, name, "encrypted_stream_connection.EncryptedStreamHttpConnection.Writer") != null) {
         return .tls_buffered;
     }
     return .fallback;

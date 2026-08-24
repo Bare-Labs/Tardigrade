@@ -310,15 +310,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var config_store = try ReloadableConfigStore.initBorrowed(state_allocator, cfg);
     defer config_store.deinit();
     var http3_runtime: ?http.http3_runtime.Runtime = null;
-    var tls_terminator: ?http.tls_termination.TlsTerminator = null;
     var native_credentials: ?http.native_tls_connection.NativeCredentialStore = null;
     // #488: one process-scoped native resumption runtime, shared by every
-    // native TCP connection and by the QUIC/H3 runtime — never by the
-    // OpenSSL terminator, which owns its own independent session cache
-    // (`tls_terminator`/`tls_session_*` above). Declared and deferred here,
-    // ahead of every borrower below, so its teardown runs last: after
-    // `http3_runtime`, the active/parked connection registries, and every
-    // dynamically accepted native connection have already torn down.
+    // native TCP connection and by the QUIC/H3 runtime. Declared and
+    // deferred here, ahead of every borrower below, so its teardown runs
+    // last: after `http3_runtime`, the active/parked connection registries,
+    // and every dynamically accepted native connection have already torn
+    // down.
     var native_resumption_entropy: tls_core.production_crypto.OsEntropy = .{};
     var native_resumption_provider: tls_core.production_crypto.Provider = undefined;
     var native_resumption_runtime: ?tls_core.resumption_runtime.Runtime = null;
@@ -360,7 +358,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     // (`edge_config.EarlyDataReplayMode.disabled` is the safe default) *and*
     // a native PSK/early-data path can actually exist (below, once
     // `native_tls_provider`/`h3_credential_provider` are known), so plain
-    // HTTP, OpenSSL-only, resumption-disabled, or replay-mode-disabled
+    // HTTP, no-native-TLS-path, resumption-disabled, or replay-mode-disabled
     // deployments never pay the configured-entry reservation or gain a new
     // startup-failure path for a security feature they haven't enabled.
     // Declared (but not yet constructed) here, ahead of every borrower
@@ -380,90 +378,26 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var native_tls_provider: ?tls_core.credentials.CredentialProvider = null;
     var h3_credential_provider: ?tls_core.credentials.CredentialProvider = null;
     if (edge_config.hasTlsFiles(cfg)) {
-        var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
-        defer state_allocator.free(sni_specs);
-        for (cfg.tls_sni_certs, 0..) |sc, i| {
-            sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
-        }
-        if (!build_options.tls_openssl_adapter) {
-            if (edge_config.is_appliance_tls_profile) {
-                // Appliance profile: the strict owner is the only credential
-                // source for both native TCP TLS and HTTP/3. There is no
-                // fallback through the permissive generic identity loader.
-                const owner = &appliance_identity.?;
-                native_tls_provider = owner.provider();
-                h3_credential_provider = owner.provider();
-            } else {
-                var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
-                defer state_allocator.free(native_sni_specs);
-                for (cfg.tls_sni_certs, 0..) |sc, i| {
-                    native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
-                }
-                native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
-                try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
-                native_tls_provider = native_credentials.?.provider();
-                h3_credential_provider = native_credentials.?.provider();
-            }
+        if (edge_config.is_appliance_tls_profile) {
+            // Appliance profile: the strict owner is the only credential
+            // source for both native TCP TLS and HTTP/3. There is no
+            // fallback through the permissive generic identity loader.
+            const owner = &appliance_identity.?;
+            native_tls_provider = owner.provider();
+            h3_credential_provider = owner.provider();
         } else {
-            tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
-                .cert_path = cfg.tls_cert_path,
-                .key_path = cfg.tls_key_path,
-                .min_version = cfg.tls_min_version,
-                .max_version = cfg.tls_max_version,
-                .cipher_list = cfg.tls_cipher_list,
-                .cipher_suites = cfg.tls_cipher_suites,
-                .sni_certs = sni_specs,
-                .session_cache_enabled = cfg.tls_session_cache_enabled,
-                .session_cache_size = cfg.tls_session_cache_size,
-                .session_timeout_seconds = cfg.tls_session_timeout_seconds,
-                .session_tickets_enabled = cfg.tls_session_tickets_enabled,
-                .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
-                .ocsp_response_path = cfg.tls_ocsp_response_path,
-                .ocsp_auto_refresh_enabled = cfg.tls_ocsp_auto_refresh,
-                .ocsp_refresh_interval_ms = cfg.tls_ocsp_refresh_interval_ms,
-                .ocsp_refresh_timeout_ms = cfg.tls_ocsp_refresh_timeout_ms,
-                .client_ca_path = cfg.tls_client_ca_path,
-                .client_verify = cfg.tls_client_verify,
-                .client_verify_depth = cfg.tls_client_verify_depth,
-                .crl_path = cfg.tls_crl_path,
-                .crl_check = cfg.tls_crl_check,
-                .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
-                .acme_enabled = cfg.tls_acme_enabled,
-                .acme_cert_dir = cfg.tls_acme_cert_dir,
-                .acme_auto_issue = cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0,
-                .acme_directory_url = cfg.tls_acme_directory_url,
-                .acme_domains = cfg.tls_acme_domains,
-                .acme_email = cfg.tls_acme_email,
-                .acme_account_key_path = cfg.tls_acme_account_key_path,
-                .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
-                .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
-                .http1_enabled = cfg.http1_enabled,
-                .http2_enabled = cfg.http2_enabled,
-                .http1_alpn_fallback_enabled = cfg.tls_http1_no_alpn_fallback,
-            });
-        }
-    }
-    if (build_options.tls_openssl_adapter and cfg.http3_enabled and edge_config.hasTlsFiles(cfg)) {
-        // The native QUIC stack cannot use the OpenSSL terminator's identity
-        // objects; load the same files through the generic native store so
-        // HTTP/3 shares one provider-based credential architecture in every
-        // profile. Failure leaves QUIC unbootstrapped while TCP serves.
-        var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
-        defer state_allocator.free(native_sni_specs);
-        for (cfg.tls_sni_certs, 0..) |sc, i| {
-            native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
-        }
-        native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
-        if (native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs)) |_| {
+            var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+            defer state_allocator.free(native_sni_specs);
+            for (cfg.tls_sni_certs, 0..) |sc, i| {
+                native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+            }
+            native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
+            try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
+            native_tls_provider = native_credentials.?.provider();
             h3_credential_provider = native_credentials.?.provider();
-        } else |err| {
-            state.logger.warn(null, "http3: TLS identity unusable for QUIC ({s}); QUIC bootstrap will remain incomplete", .{@errorName(err)});
-            native_credentials.?.deinit();
-            native_credentials = null;
         }
     }
     defer if (native_credentials) |*store| store.deinit();
-    defer if (tls_terminator) |*tls| tls.deinit();
     const native_early_data_replay_composition = nativeEarlyDataReplayComposition(
         cfg.tls_native_early_data_replay_mode,
         native_resumption_runtime != null,
@@ -566,22 +500,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
     defer if (http3_runtime) |*runtime| runtime.deinit();
-    if (tls_terminator != null and native_credentials != null and
-        if (http3_runtime) |*runtime| runtime.snapshot().server_bootstrapped else false)
-    {
-        // #629: this is a mixed OpenSSL-TCP/native-HTTP3 composition, and
-        // native H3 is genuinely live (not just "credentials happened to
-        // load" — `server_bootstrapped` is the same signal
-        // `computeReloadedHttp3Advertisement` already uses to decide
-        // whether H3 is actually serving). Native H3's credential store can
-        // be independently hot-reloaded; suppress the OpenSSL terminator's
-        // own independent identity-reload watcher so its certificate/SNI
-        // identity cannot drift away from H3's outside a coordinated
-        // restart. Checked here (after HTTP/3 bootstrap, not right after
-        // credential load) so a QUIC bootstrap failure doesn't lock TCP's
-        // identity into restart-only for a protocol that never came up.
-        tls_terminator.?.setIdentityReloadEnabled(false);
-    }
     // NOTE (#138): defaulting worker_threads to CPU count is correct for a
     // non-blocking event loop, but Tardigrade currently uses a thread-per-
     // connection blocking model where a worker is held for a connection's whole
@@ -601,7 +519,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var worker_ctx = WorkerContext{
         .config_store = &config_store,
         .state = &state,
-        .tls = if (tls_terminator) |*tls| tls else null,
         .native_credentials = if (native_credentials) |*store| store else null,
         .native_tls_provider = native_tls_provider,
         .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
@@ -980,7 +897,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             gshutdown.runActiveHealthChecks(current_cfg, &state, worker_ctx.config_store);
             gshutdown.runDnsDiscoveryRefresh(current_cfg, &state);
             gshutdown.runProxyCacheMaintenance(current_cfg, &state);
-            if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
             // Close keepalive connections idle longer than the keepalive timeout
             // while parked off the worker pool (#138).
             _ = parked.reapIdle(http.event_loop.monotonicMs(), current_cfg.keep_alive_timeout_ms);
@@ -1322,8 +1238,9 @@ fn isBenignDisconnect(err: anyerror) bool {
     };
 }
 
-/// Serve exactly one HTTP/1.1 request on `conn` (a `*TlsConnection` or a
-/// plaintext `NetStream`), then decide what to do with the connection.
+/// Serve exactly one HTTP/1.1 request on `conn` (a plaintext `NetStream` or
+/// a native TLS connection stream), then decide what to do with the
+/// connection.
 fn serveOneRequest(
     ctx: *WorkerContext,
     conn: anytype,
@@ -1380,12 +1297,11 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         return;
     };
 
-    // Ownership of session/fd/TLS transfers to the parked registry on `park`.
+    // Ownership of session/fd transfers to the parked registry on `park`.
     // Until then, this teardown runs on every other exit (set `transferred` to
     // skip it once ownership has moved).
     var transferred = false;
-    var tls_to_park: ?http.tls_termination.TlsConnection = null;
-    defer if (!transferred) closeNewConnection(ctx, client_fd, session, tls_to_park);
+    defer if (!transferred) closeNewConnection(ctx, client_fd, session);
 
     const owned_connection_ip = gconn.clientIpFromFd(ctx.state.allocator, client_fd) catch null;
     var transferred_ip = false;
@@ -1412,76 +1328,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     else
         cfg.keep_alive_timeout_ms;
 
-    if (ctx.tls) |tls| {
-        gconn.setNonBlocking(client_fd, false) catch |err| {
-            ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
-            return;
-        };
-        // Apply the TLS handshake timeout before PROXY protocol parsing and
-        // SSL_accept. Falls back to keep_alive_timeout_ms when not explicitly
-        // configured so the old behavior is preserved for operators that haven't
-        // set the new field.
-        if (handshake_timeout_ms > 0) {
-            gconn.setSocketTimeoutMs(client_fd, handshake_timeout_ms, handshake_timeout_ms) catch |err| {
-                ctx.state.logger.warn(null, "failed to set client handshake timeout: {}", .{err});
-            };
-        }
-
-        // Parse PROXY protocol header from the raw TCP socket before SSL_accept.
-        // The PROXY header is plaintext even on TLS connections and must be
-        // consumed before OpenSSL sees the TLS ClientHello.
-        if (cfg.proxy_protocol_mode != .off and !session.proxy_protocol_checked) {
-            gconn.peekAndConsumeProxyHeaderFromRawFd(
-                client_fd,
-                cfg.proxy_protocol_mode,
-                &session.proxy_client_ip_buf,
-                &session.proxy_client_ip_len,
-            ) catch |err| {
-                ctx.state.logger.warn(null, "proxy protocol parse failed on TLS connection: {}", .{err});
-                return;
-            };
-            session.proxy_protocol_checked = true;
-        }
-        const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
-        var tls_conn = tls.acceptWithPolicy(client_fd, tls_protocol_policy) catch |err| {
-            if (http.tls_termination.lastOpenSslError(ctx.state.allocator)) |openssl_err| {
-                defer ctx.state.allocator.free(openssl_err);
-                ctx.state.logger.warn(null, "tls handshake error: {} ({s})", .{ err, openssl_err });
-            } else {
-                ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
-            }
-            return;
-        };
-        tls_conn.attachBufferMetrics(&ctx.state.metrics, &ctx.state.metrics_mutex);
-        // The TLS object now needs teardown on every exit; record it so the
-        // teardown defer (or a failed park) frees it exactly once.
-        tls_to_park = tls_conn;
-
-        // Handshake complete — switch to request-phase timeouts.
-        // SO_RCVTIMEO covers header/body reads; SO_SNDTIMEO covers response writes.
-        if (header_timeout_ms > 0 or write_timeout_ms > 0) {
-            gconn.setSocketTimeoutMs(client_fd, header_timeout_ms, write_timeout_ms) catch |err| {
-                ctx.state.logger.warn(null, "failed to set post-handshake socket timeout: {}", .{err});
-            };
-        }
-
-        var served: u32 = 0;
-        const negotiated = tls_conn.validatedNegotiatedProtocol() catch |err| {
-            ctx.state.logger.err(null, "negotiated HTTP protocol error: {}", .{err});
-            return;
-        };
-        const dispatch_result = dispatchNegotiatedHttp(ctx, &tls_conn, negotiated, session, cfg, connection_ip, &served) catch |err| {
-            tls_to_park = tls_conn;
-            ctx.state.logger.err(null, "negotiated HTTP dispatch error: {}", .{err});
-            return;
-        };
-        tls_to_park = tls_conn;
-        if (dispatch_result == .park) {
-            transferred = true;
-            parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
-        }
-        return;
-    } else if (ctx.native_tls_provider) |native_provider| {
+    if (ctx.native_tls_provider) |native_provider| {
         if (cfg.proxy_protocol_mode != .off) {
             ctx.state.logger.warn(null, "native TLS path does not support PROXY protocol preface parsing yet", .{});
             return;
@@ -1572,7 +1419,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             .serve_again => {},
             .park => {
                 transferred = true;
-                parkConnection(ctx, client_fd, session, null, served, connection_ip);
+                parkConnection(ctx, client_fd, session, served, connection_ip);
                 return;
             },
             .close => return,
@@ -1582,40 +1429,25 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
 
 fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnection) void {
     var served = pc.served;
-    if (pc.tls) |*tls_conn| {
-        while (true) switch (serveOneRequest(ctx, tls_conn, pc.session, pc.ip(), &served, false)) {
-            .serve_again => {},
-            .park => {
-                pc.served = served;
-                reparkConnection(ctx, pc);
-                return;
-            },
-            .close => {
-                ctx.parked.closeSlot(pc, .peer);
-                return;
-            },
-        };
-    } else {
-        const stream = compat.netStreamFromFd(pc.fd);
-        while (true) switch (serveOneRequest(ctx, stream, pc.session, pc.ip(), &served, false)) {
-            .serve_again => {},
-            .park => {
-                pc.served = served;
-                reparkConnection(ctx, pc);
-                return;
-            },
-            .close => {
-                ctx.parked.closeSlot(pc, .peer);
-                return;
-            },
-        };
-    }
+    const stream = compat.netStreamFromFd(pc.fd);
+    while (true) switch (serveOneRequest(ctx, stream, pc.session, pc.ip(), &served, false)) {
+        .serve_again => {},
+        .park => {
+            pc.served = served;
+            reparkConnection(ctx, pc);
+            return;
+        },
+        .close => {
+            ctx.parked.closeSlot(pc, .peer);
+            return;
+        },
+    };
 }
 
 fn dispatchNegotiatedHttp(
     ctx: *WorkerContext,
     conn: anytype,
-    negotiated: http.tls_termination.NegotiatedProtocol,
+    negotiated: http.negotiated_dispatch.NegotiatedProtocol,
     session: *ConnectionSession,
     cfg: *const edge_config.EdgeConfig,
     connection_ip: []const u8,
@@ -1649,19 +1481,14 @@ const GatewayHttpRuntime = struct {
     }
 };
 
-/// Tear down a connection that was never parked: TLS shutdown, socket close,
-/// pooled-session release, and connection-slot release. Mirrors the registry's
-/// teardown so a connection is accounted identically whichever path closes it.
+/// Tear down a connection that was never parked: socket close, pooled-session
+/// release, and connection-slot release. Mirrors the registry's teardown so a
+/// connection is accounted identically whichever path closes it.
 fn closeNewConnection(
     ctx: *WorkerContext,
     fd: std.posix.fd_t,
     session: *ConnectionSession,
-    tls_conn: ?http.tls_termination.TlsConnection,
 ) void {
-    if (tls_conn) |t| {
-        var tt = t;
-        tt.deinit();
-    }
     _ = std.c.close(fd);
     ctx.session_pool.release(session);
     ctx.state.releaseConnectionSlot(fd);
@@ -1673,13 +1500,12 @@ fn parkConnection(
     ctx: *WorkerContext,
     fd: std.posix.fd_t,
     session: *ConnectionSession,
-    tls_conn: ?http.tls_termination.TlsConnection,
     served: u32,
     connection_ip: []const u8,
 ) void {
     const now = http.event_loop.monotonicMs();
-    const pc = ctx.parked.parkNew(fd, session, tls_conn, served, connection_ip, now) catch {
-        closeNewConnection(ctx, fd, session, tls_conn);
+    const pc = ctx.parked.parkNew(fd, session, served, connection_ip, now) catch {
+        closeNewConnection(ctx, fd, session);
         return;
     };
     ctx.event_loop.add(fd, pc.eventInterest()) catch {
@@ -1760,14 +1586,13 @@ fn initNativeEarlyDataReplayStore(
 /// constructing the process-scoped replay store at all — evaluated only once
 /// the operator has also opted into `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local`
 /// (see the call site). Native resumption being enabled is necessary but not
-/// sufficient — a native (non-OpenSSL) TLS backend that could ever accept
+/// sufficient — a native TLS path that could ever accept
 /// early data must also be configured: native TCP (`native_tls_provider`)
 /// or, when HTTP/3 is enabled, native QUIC/H3 (`h3_credential_provider`).
-/// The OpenSSL terminator owns its own independent session cache and never
-/// consults this seam at all, so plain HTTP, OpenSSL-only, or
-/// resumption-disabled deployments must never gain the configured-entry
-/// allocation or a new startup-failure path for a security feature they
-/// cannot use.
+/// Plain HTTP or configurations without a native TLS/QUIC credential path do
+/// not consult this seam, so those and resumption-disabled deployments must
+/// never gain the configured-entry allocation or a new startup-failure path
+/// for a security feature they cannot use.
 fn nativeEarlyDataReplayStoreNeeded(
     native_resumption_runtime_enabled: bool,
     native_tls_provider_present: bool,
@@ -1783,7 +1608,7 @@ fn nativeEarlyDataReplayStoreNeeded(
 /// alone only answers "could a native PSK/early-data path exist here." The
 /// safe `disabled` default (and any mode other than `process_local`) must
 /// never construct a store, even when a native path exists, so plain HTTP,
-/// OpenSSL-only, resumption-disabled, or explicitly opted-out deployments
+/// no-native-TLS-path, resumption-disabled, or explicitly opted-out deployments
 /// never pay the configured-entry reservation or gain a new
 /// startup-failure path for a feature they haven't enabled.
 fn nativeEarlyDataReplayStoreEnabled(
@@ -6198,8 +6023,8 @@ test "#368 Slice 2: nativeEarlyDataReplayStoreNeeded is false for every configur
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, false, false, false));
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, true, false, false));
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, false, true, true));
-    // OpenSSL-only TCP with HTTP/3 disabled: native resumption enabled, but
-    // neither a native TCP provider nor an eligible H3 path exists.
+    // No native TCP credential provider and HTTP/3 disabled: resumption may be
+    // enabled in config, but no native PSK/early-data path can exist.
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(true, false, false, false));
     // HTTP/3 enabled but no native H3 credential provider actually bootstrapped
     // (e.g. TLS files missing), and no native TCP provider either.

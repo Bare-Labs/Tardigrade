@@ -7,12 +7,16 @@
 // keepalive conns -> p90 ~26ms).
 //
 // This module moves the *idle wait* off the worker: after a response, a
-// keepalive connection's state (fd, pooled session, optional TLS state) is moved
-// into a heap-owned `ParkedConnection` registered in the `ParkedRegistry`, and
-// the worker returns to the pool. The event loop watches the parked fd; when the
+// keepalive connection's state (fd, pooled session) is moved into a
+// heap-owned `ParkedConnection` registered in the `ParkedRegistry`, and the
+// worker returns to the pool. The event loop watches the parked fd; when the
 // next request arrives it dispatches the connection back to a worker, which
 // serves one request and re-parks or closes. Active request handling still uses
 // a worker with blocking I/O, so only the idle gap is decoupled.
+//
+// Plaintext connections only (#649): TLS downstream connections use a
+// different mechanism, `downstream_connection.zig`'s `ActiveRegistry`/
+// `ManagedConnection`, never this registry.
 //
 // Lifecycle of a single ParkedConnection:
 //   parkNew  -> [in map, .parked] -> resumeReady (event loop) -> [.resuming]
@@ -29,19 +33,15 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const gateway_state = @import("../gateway_state.zig");
 const downstream_connection = @import("downstream_connection.zig");
-const tls_termination = @import("tls_backend.zig");
 
 const ConnectionSession = gateway_state.ConnectionSession;
 const ConnectionSessionPool = gateway_state.ConnectionSessionPool;
-const TlsConnection = tls_termination.TlsConnection;
 
 pub const ParkState = enum { parked, resuming };
 
 pub const ParkedConnection = struct {
     fd: std.posix.fd_t,
     session: *ConnectionSession,
-    /// TLS state moved off the worker stack; null for plaintext connections.
-    tls: ?TlsConnection,
     /// Requests already served on this connection (for max_requests_per_connection).
     served: u32,
     /// Monotonic ms timestamp of the last park, used for idle-timeout reaping.
@@ -55,9 +55,6 @@ pub const ParkedConnection = struct {
     }
 
     pub fn transportView(self: *ParkedConnection) downstream_connection.DownstreamTransport {
-        if (self.tls) |*tls| {
-            return .{ .openssl = .{ .conn = tls } };
-        }
         return .{ .plaintext = self.fd };
     }
 
@@ -108,14 +105,13 @@ pub const ParkedRegistry = struct {
     }
 
     /// Park a brand-new connection (first keepalive idle gap). Ownership of
-    /// `session`, `tls`, and `fd` transfers to the returned/registered slot.
-    /// The caller must register `fd` with the event loop only on success; on
+    /// `session` and `fd` transfer to the returned/registered slot. The
+    /// caller must register `fd` with the event loop only on success; on
     /// error the caller still owns the resources and must close them.
     pub fn parkNew(
         self: *ParkedRegistry,
         fd: std.posix.fd_t,
         session: *ConnectionSession,
-        tls: ?TlsConnection,
         served: u32,
         client_ip: []const u8,
         now_ms: u64,
@@ -125,7 +121,6 @@ pub const ParkedRegistry = struct {
         pc.* = .{
             .fd = fd,
             .session = session,
-            .tls = tls,
             .served = served,
             .parked_at_ms = now_ms,
             .state = .parked,
@@ -164,12 +159,11 @@ pub const ParkedRegistry = struct {
         return true;
     }
 
-    /// Free a connection's resources: owner teardown hook, TLS shutdown, socket
-    /// close, pooled-session release, and slot destruction. Caller must not hold
+    /// Free a connection's resources: owner teardown hook, socket close,
+    /// pooled-session release, and slot destruction. Caller must not hold
     /// the mutex (the hook and session pool take their own locks).
     fn freeConn(self: *ParkedRegistry, pc: *ParkedConnection) void {
         if (self.close_hook) |hook| hook(self.close_hook_ctx.?, pc.fd);
-        if (pc.tls) |*tls| tls.deinit();
         _ = std.c.close(pc.fd);
         self.session_pool.release(pc.session);
         self.allocator.destroy(pc);
@@ -185,8 +179,8 @@ pub const ParkedRegistry = struct {
         return null;
     }
 
-    /// Free a checked-out connection: release the pooled session, tear down TLS,
-    /// close the socket, and destroy the slot. Caller must NOT hold the mutex.
+    /// Free a checked-out connection: release the pooled session, close the
+    /// socket, and destroy the slot. Caller must NOT hold the mutex.
     pub fn closeSlot(self: *ParkedRegistry, pc: *ParkedConnection, reason: CloseReason) void {
         _ = reason;
         self.freeConn(pc);
@@ -288,7 +282,7 @@ test "parkNew, resumeReady, checkout, repark transitions" {
     // Use a harmless dummy fd; closeSlot/reap will call close() which just
     // returns EBADF on a non-socket fd.
     const dummy_fd: std.posix.fd_t = 90001;
-    const parked = try reg.parkNew(dummy_fd, s1, null, 0, "127.0.0.1", 1000);
+    const parked = try reg.parkNew(dummy_fd, s1, 0, "127.0.0.1", 1000);
     try testing.expectEqual(@import("event_loop.zig").Interest{ .read = true }, parked.eventInterest());
     try testing.expectEqual(@as(usize, 1), reg.count());
 
@@ -326,8 +320,8 @@ test "reapIdle closes only sufficiently-idle parked connections" {
     var reg = ParkedRegistry.init(allocator, &pool);
     defer reg.deinit();
 
-    _ = try reg.parkNew(90010, try pool.acquire(), null, 0, "10.0.0.1", 1000); // old
-    _ = try reg.parkNew(90011, try pool.acquire(), null, 0, "10.0.0.2", 5000); // fresh
+    _ = try reg.parkNew(90010, try pool.acquire(), 0, "10.0.0.1", 1000); // old
+    _ = try reg.parkNew(90011, try pool.acquire(), 0, "10.0.0.2", 5000); // fresh
     try testing.expectEqual(@as(usize, 2), reg.count());
 
     // now=5500, timeout=1000: fd 90010 (age 4500) reaped, 90011 (age 500) kept.

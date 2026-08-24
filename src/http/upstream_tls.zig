@@ -1,292 +1,61 @@
-//! No-OpenSSL TLS termination stub for the adapter-free profiles
-//! (#379, epic #327, #634).
+//! Native upstream HTTPS/TLS client for every shipping profile
+//! (#379, epic #327, #634, retirement #649).
 //!
-//! Selected via `tls_backend.zig` whenever `tls_openssl_adapter` is false
-//! (`-Dtls-profile=appliance` and `-Dtls-profile=native`). Presents the
-//! same public surface as `tls_termination.zig` so every call site compiles
-//! unchanged, but contains no `@cImport`, no OpenSSL types, and no C
-//! linkage. Downstream TLS on those builds is served by the native
-//! listener (`native_tls_connection.zig`), never by this file; any attempt
-//! to construct the OpenSSL-shaped `TlsTerminator` fails closed with
-//! `error.ContextInitFailed` — a deliberate, inspectable failure rather
-//! than a hidden runtime fallback.
-//!
-//! `UpstreamTlsConn`, in contrast, is a real native upstream HTTPS/TLS
-//! client (#634): a small adapter over the same TLS engine, record layer,
-//! and PKI trust/identity machinery the native downstream listener and
-//! `src/pki/` already provide — `src/tls/webpki_verifier.zig` for
+//! `UpstreamTlsConn` is the native upstream HTTPS/TLS client used for
+//! `proxy_pass https://…` in every profile (#634): a small adapter over the
+//! same TLS engine, record layer, and PKI trust/identity machinery the
+//! native downstream listener (`native_tls_connection.zig`) and `src/pki/`
+//! already provide — `src/tls/webpki_verifier.zig` for
 //! certificate-chain/hostname verification, `identity_loader.zig` for an
-//! optional client (mTLS) credential. It presents the OpenSSL adapter's
-//! synchronous, blocking-socket contract at the API boundary (`connect`
-//! takes a caller-owned, already-connected fd and blocks until the
-//! handshake completes or fails; `read`/`writeAll` block similarly) — but
-//! internally puts that fd in nonblocking mode and drives the record
-//! layer's carrier itself with a bounded `poll()` between `drive()` calls,
-//! because the shared record engine drains its carrier in a loop until
+//! optional client (mTLS) credential. It presents a synchronous,
+//! blocking-socket contract at the API boundary (`connect` takes a
+//! caller-owned, already-connected fd and blocks until the handshake
+//! completes or fails; `read`/`writeAll` block similarly) — but internally
+//! puts that fd in nonblocking mode and drives the record layer's carrier
+//! itself with a bounded `poll()` between `drive()` calls, because the
+//! shared record engine drains its carrier in a loop until
 //! `error.WouldBlock` (see `driveUntilHandshakeComplete`'s doc comment): a
 //! literally blocking fd would make that loop's second read of a batch
 //! block for the full configured socket timeout even when the first read
 //! already delivered everything needed. `waitForFd`'s deadline is read back
 //! from whatever `SO_RCVTIMEO`/`SO_SNDTIMEO` the caller already configured
-//! on the fd (the same knob the OpenSSL adapter relies on), so callers set
-//! up timeouts exactly as before. No `@cImport`, no OpenSSL types, no C
-//! linkage, and no runtime fallback to the OpenSSL adapter — see
+//! on the fd. No `@cImport`, no OpenSSL types, no C linkage, and no
+//! runtime fallback to a foreign implementation — see
 //! docs/TLS_DEPENDENCY_POLICY.md.
 //!
-//! Option structs are duplicated field-for-field from the adapter so
-//! configuration parsing behaves identically in every profile; only the
-//! downstream-terminator types remain inert.
+//! Downstream TLS termination is served entirely by
+//! `native_tls_connection.zig`, not this file: this file used to also hold
+//! a downstream `TlsTerminator`/`TlsConnection` pair (first the retired
+//! OpenSSL adapter's implementation, later a permanently-inert stub kept
+//! only so old call sites compiled), but #649 removed that model
+//! entirely — there is no downstream-terminator surface left here to keep
+//! call sites compiling against. This module is named for what it is now
+//! (the upstream TLS client), not for migration history; `negotiated_dispatch.zig`
+//! is the neutral home for `NegotiatedProtocol` since both this client and
+//! the downstream native listener need it.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const tls_core = @import("tls_core");
 const encrypted_stream = tls_core.encrypted_stream;
 const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
+/// The error surface actually reachable through this native client's API —
+/// no OpenSSL-adapter-only failure modes (init/cipher/CRL/OCSP config,
+/// cert/key mismatch) that this implementation never returns.
 pub const TlsError = error{
     OutOfMemory,
-    OpenSslInitFailed,
     ContextInitFailed,
     CertificateLoadFailed,
     PrivateKeyLoadFailed,
-    CertificateKeyMismatch,
-    ProtocolConfigFailed,
-    CipherConfigFailed,
     VerifyConfigFailed,
-    CrlLoadFailed,
-    OcspLoadFailed,
     HandshakeFailed,
     NoApplicationProtocol,
     TlsReadFailed,
     TlsWriteFailed,
 };
 
-pub const SniCertSpec = struct {
-    server_name: []const u8,
-    cert_path: []const u8,
-    key_path: []const u8,
-};
-
-pub const TlsOptions = struct {
-    cert_path: []const u8,
-    key_path: []const u8,
-    min_version: []const u8 = "1.2",
-    max_version: []const u8 = "1.3",
-    cipher_list: []const u8 = "",
-    cipher_suites: []const u8 = "",
-    sni_certs: []const SniCertSpec = &[_]SniCertSpec{},
-    session_cache_enabled: bool = true,
-    session_cache_size: u32 = 20_480,
-    session_timeout_seconds: u32 = 300,
-    session_tickets_enabled: bool = true,
-    ocsp_stapling_enabled: bool = false,
-    ocsp_response_path: []const u8 = "",
-    ocsp_auto_refresh_enabled: bool = false,
-    ocsp_refresh_interval_ms: u64 = 3_600_000,
-    ocsp_refresh_timeout_ms: u32 = 10_000,
-    client_ca_path: []const u8 = "",
-    client_verify: bool = false,
-    client_verify_depth: u32 = 3,
-    crl_path: []const u8 = "",
-    crl_check: bool = false,
-    dynamic_reload_interval_ms: u64 = 5_000,
-    acme_enabled: bool = false,
-    acme_cert_dir: []const u8 = "",
-    acme_auto_issue: bool = false,
-    acme_directory_url: []const u8 = "https://acme-v02.api.letsencrypt.org/directory",
-    acme_domains: []const []const u8 = &.{},
-    acme_email: []const u8 = "",
-    acme_account_key_path: []const u8 = "",
-    acme_renew_days_before_expiry: u32 = 30,
-    acme_challenge_store: ?*@import("acme_challenge_store.zig").ChallengeStore = null,
-    http1_enabled: bool = true,
-    http2_enabled: bool = true,
-    http1_alpn_fallback_enabled: bool = false,
-};
-
-pub const NegotiatedProtocol = enum {
-    http1_1,
-    http2,
-};
-
-// #641 review: this binary's own `-Dtls-profile` value, not a hardcoded
-// "appliance" — the `native` profile selects this same stub and must not
-// misreport itself as appliance in a handshake-error log line.
-const unavailable_message = "TLS termination is unavailable: this binary was built with " ++
-    "-Dtls-profile=" ++ build_options.tls_profile ++ " and contains no OpenSSL adapter; " ++
-    "downstream TLS on this profile is served by the native listener " ++
-    "(native_tls_connection.zig), which this error path never reaches in " ++
-    "production — see #634";
-
-pub const TlsTerminator = struct {
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator, opts: TlsOptions) TlsError!TlsTerminator {
-        _ = allocator;
-        _ = opts;
-        return error.ContextInitFailed;
-    }
-
-    pub fn deinit(self: *TlsTerminator) void {
-        self.* = undefined;
-    }
-
-    pub fn runMaintenance(self: *TlsTerminator, now_ms: u64) void {
-        _ = self;
-        _ = now_ms;
-    }
-
-    pub fn protocolPolicySnapshot(self: *TlsTerminator) negotiated_dispatch.ListenerProtocolPolicy {
-        _ = self;
-        return .{};
-    }
-
-    pub fn updateProtocolPolicy(self: *TlsTerminator, policy: negotiated_dispatch.ListenerProtocolPolicy) TlsError!void {
-        _ = self;
-        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
-    }
-
-    /// #629: no-op on this profile. The stub never constructs a live
-    /// terminator (`init` always fails closed), so there is nothing whose
-    /// identity-reload behavior could need suppressing; this exists only so
-    /// `edge_gateway.zig`'s unconditional mixed-owner wiring compiles
-    /// identically across profiles.
-    pub fn setIdentityReloadEnabled(self: *TlsTerminator, enabled: bool) void {
-        _ = self;
-        _ = enabled;
-    }
-
-    /// #629: no-op on this profile, matching `setIdentityReloadEnabled`.
-    pub fn currentCertificateDer(self: *TlsTerminator, allocator: std.mem.Allocator) TlsError!?[]u8 {
-        _ = self;
-        _ = allocator;
-        return null;
-    }
-
-    pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
-        return self.acceptWithPolicy(fd, .{});
-    }
-
-    pub fn acceptWithPolicy(self: *TlsTerminator, fd: std.posix.fd_t, policy: negotiated_dispatch.ListenerProtocolPolicy) TlsError!TlsConnection {
-        _ = self;
-        _ = fd;
-        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
-        return error.HandshakeFailed;
-    }
-};
-
-pub const TlsConnection = struct {
-    pub fn deinit(self: *TlsConnection) void {
-        self.* = undefined;
-    }
-
-    pub fn read(self: *TlsConnection, buf: []u8) TlsError!usize {
-        _ = self;
-        _ = buf;
-        return error.TlsReadFailed;
-    }
-
-    pub fn attachBufferMetrics(self: *TlsConnection, metrics: anytype, mutex: anytype) void {
-        _ = self;
-        _ = metrics;
-        _ = mutex;
-    }
-
-    pub fn pending(self: *const TlsConnection) usize {
-        _ = self;
-        return 0;
-    }
-
-    pub fn rawFd(self: *const TlsConnection) std.posix.fd_t {
-        _ = self;
-        return -1;
-    }
-
-    pub const Writer = struct {
-        conn: *TlsConnection,
-
-        pub fn writeAll(self: Writer, data: []const u8) TlsError!void {
-            _ = self;
-            _ = data;
-            return error.TlsWriteFailed;
-        }
-
-        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
-            var buf: [4096]u8 = undefined;
-            const s = try std.fmt.bufPrint(&buf, fmt, args);
-            return self.writeAll(s);
-        }
-
-        pub fn writeByte(self: Writer, byte: u8) TlsError!void {
-            return self.writeAll(&[_]u8{byte});
-        }
-    };
-
-    pub fn writer(self: *TlsConnection) Writer {
-        return .{ .conn = self };
-    }
-
-    pub fn stream(self: *TlsConnection) encrypted_stream.EncryptedStream {
-        return .{ .ptr = self, .vtable = &stub_stream_vtable };
-    }
-
-    pub fn negotiatedAlpn(self: *const TlsConnection) ?[]const u8 {
-        _ = self;
-        return null;
-    }
-
-    pub fn negotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
-        return self.validatedNegotiatedProtocol();
-    }
-
-    pub fn validatedNegotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
-        _ = self;
-        return error.NoApplicationProtocol;
-    }
-};
-
-fn stubStreamBackend(_: *anyopaque) encrypted_stream.BackendKind {
-    return .openssl;
-}
-
-fn stubStreamRead(_: *anyopaque, _: []u8) encrypted_stream.Error!usize {
-    return error.StreamClosed;
-}
-
-fn stubStreamWrite(_: *anyopaque, _: []const u8) encrypted_stream.Error!usize {
-    return error.StreamClosed;
-}
-
-fn stubStreamClose(_: *anyopaque) void {}
-
-fn stubStreamReadiness(_: *anyopaque) encrypted_stream.Readiness {
-    return .{ .peer_closed = true };
-}
-
-fn stubStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.DriveResult {
-    return .{ .made_progress = false, .readiness = stubStreamReadiness(ptr) };
-}
-
-fn stubStreamBufferSnapshot(_: *anyopaque) encrypted_stream.BufferSnapshot {
-    return .{};
-}
-
-const stub_stream_vtable = encrypted_stream.EncryptedStream.VTable{
-    .backendFn = stubStreamBackend,
-    .readFn = stubStreamRead,
-    .writeFn = stubStreamWrite,
-    .closeFn = stubStreamClose,
-    .readinessFn = stubStreamReadiness,
-    .driveFn = stubStreamDrive,
-    .bufferSnapshotFn = stubStreamBufferSnapshot,
-};
-
-/// In the OpenSSL adapter this drains the error queue; here it reports why
-/// TLS is unavailable so handshake-failure logs stay self-explanatory.
-pub fn lastOpenSslError(allocator: std.mem.Allocator) ?[]u8 {
-    return allocator.dupe(u8, unavailable_message) catch null;
-}
+pub const NegotiatedProtocol = negotiated_dispatch.NegotiatedProtocol;
 
 pub const UpstreamTlsOptions = struct {
     skip_verify: bool = false,
@@ -787,24 +556,13 @@ fn writeFd(fd: std.posix.fd_t, bytes: []const u8) encrypted_stream.Error!usize {
     return @intCast(rc);
 }
 
-test "stub terminator fails closed" {
-    try std.testing.expectError(error.ContextInitFailed, TlsTerminator.init(std.testing.allocator, .{
-        .cert_path = "unused.crt",
-        .key_path = "unused.key",
-    }));
-    const message = lastOpenSslError(std.testing.allocator) orelse return error.TestUnexpectedResult;
-    defer std.testing.allocator.free(message);
-    try std.testing.expect(std.mem.startsWith(u8, message, "TLS termination is unavailable"));
-}
-
-// #634: `UpstreamTlsConn` is real here (unlike `TlsTerminator`, which stays a
-// permanent stub on this profile — see the module doc comment), so a bad fd
-// must fail bounded rather than close-fail with a fixed sentinel error. An
-// invalid fd fails immediately at `setNonBlocking` (an `fcntl` on -1 cannot
-// succeed), before any handshake I/O is attempted, hence `ContextInitFailed`
-// rather than `HandshakeFailed` here. `skip_verify = true` isolates this to
-// the fd path, independent of whether the test environment happens to have a
-// system CA bundle installed.
+// #634: a bad fd must fail bounded rather than close-fail with a fixed
+// sentinel error. An invalid fd fails immediately at `setNonBlocking` (an
+// `fcntl` on -1 cannot succeed), before any handshake I/O is attempted,
+// hence `ContextInitFailed` rather than `HandshakeFailed` here.
+// `skip_verify = true` isolates this to the fd path, independent of
+// whether the test environment happens to have a system CA bundle
+// installed.
 test "native upstream TLS connect fails closed on an unusable fd" {
     try std.testing.expectError(error.ContextInitFailed, UpstreamTlsConn.connect(-1, "example.com", .{ .skip_verify = true }));
 }

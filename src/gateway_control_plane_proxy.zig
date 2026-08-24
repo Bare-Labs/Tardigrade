@@ -568,7 +568,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
             const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
             const upstream_host_name = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
             const upstream_port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
-            const tls_options: ?http.tls_termination.UpstreamTlsOptions = if (is_https) .{
+            const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) .{
                 .skip_verify = !cfg.upstream_tls_verify,
                 .ca_bundle_path = cfg.upstream_tls_ca_bundle,
                 .sni_override = cfg.upstream_tls_server_name,

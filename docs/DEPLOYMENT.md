@@ -304,11 +304,13 @@ There is no published Bare Systems image on any registry today — see
 
 The image is a multi-stage build: a build stage compiles `tardi` with the
 pinned Zig toolchain (matching `.github/workflows/ci.yml`) and the default
-"general" TLS profile (OpenSSL adapter — see
+"general" TLS profile — pure-Zig native since #649, no OpenSSL required to
+build or run `tardi` itself (see
 [TLS_DEPENDENCY_POLICY.md](TLS_DEPENDENCY_POLICY.md)); the runtime stage
-contains only `tardi`, its OpenSSL/CA-certificate runtime dependencies, and a
-non-root `tardigrade` user. No Zig toolchain or source tree ships in the
-final image.
+contains only `tardi`, CA-certificate data, and a non-root `tardigrade`
+user. No Zig toolchain or source tree ships in the final image. The
+Dockerfile's own OpenSSL package installs predate #649 and are tracked as
+distribution cleanup separately from this cutover (#634).
 
 ### Build
 

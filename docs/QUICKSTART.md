@@ -15,16 +15,14 @@ default this guide relies on, so it can't run the commands below yet:
 ```bash
 git clone https://github.com/Bare-Systems/Tardigrade.git
 cd Tardigrade
-zig build -Doptimize=ReleaseFast -Dtls-profile=native
+zig build -Doptimize=ReleaseFast
 export PATH="$PWD/zig-out/bin:$PATH"
 tardi version
 ```
 
-The shipping-equivalent native build above requires [Zig](https://ziglang.org/)
-0.16.0 and does not require OpenSSL to compile or run Tardigrade. The repository
-default remains the transitional `general` profile for compatibility while #634
-is completed; a plain `zig build` of that profile still requires the applicable
-OpenSSL development libraries.
+The build above requires [Zig](https://ziglang.org/) 0.16.0 and does not
+require OpenSSL to compile or run Tardigrade — the default `general` TLS
+profile is pure-Zig native.
 
 Once a release that includes `tardi init` is published, the official
 install script will also work for this guide:

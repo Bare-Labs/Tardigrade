@@ -1,9 +1,16 @@
 const std = @import("std");
 const tls = @import("tls_core");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
-const tls_termination = @import("tls_backend.zig");
 
-pub const NegotiatedProtocol = tls_termination.NegotiatedProtocol;
+/// The negotiated application protocol, shared by both the native
+/// downstream listener (`native_tls_connection.zig`) and the native
+/// upstream HTTPS client (`upstream_tls.zig`) — defined here rather than in
+/// either, since neither is a dependency the other should need just for
+/// this enum.
+pub const NegotiatedProtocol = enum {
+    http1_1,
+    http2,
+};
 
 pub const AlpnFallbackPolicy = enum {
     require_match,
@@ -32,14 +39,14 @@ pub const ListenerProtocolPolicy = struct {
         return self.fallbackPolicy();
     }
 
-    pub fn selectedProtocolAllowed(self: ListenerProtocolPolicy, protocol: tls_termination.NegotiatedProtocol) bool {
+    pub fn selectedProtocolAllowed(self: ListenerProtocolPolicy, protocol: NegotiatedProtocol) bool {
         return switch (protocol) {
             .http1_1 => self.http1_enabled,
             .http2 => self.http2_enabled,
         };
     }
 
-    pub fn validateSelected(self: ListenerProtocolPolicy, protocol: tls_termination.NegotiatedProtocol) Error!void {
+    pub fn validateSelected(self: ListenerProtocolPolicy, protocol: NegotiatedProtocol) Error!void {
         if (!self.selectedProtocolAllowed(protocol)) return error.ProtocolDisabled;
     }
 
@@ -89,7 +96,7 @@ pub const http11_only_wire = "\x08http/1.1";
 pub fn mapNegotiatedHttpProtocol(
     negotiated_alpn: ?[]const u8,
     fallback: AlpnFallbackPolicy,
-) Error!tls_termination.NegotiatedProtocol {
+) Error!NegotiatedProtocol {
     if (negotiated_alpn) |alpn| {
         if (std.mem.eql(u8, alpn, tls.algorithms.alpn.h2.bytes)) return .http2;
         if (std.mem.eql(u8, alpn, tls.algorithms.alpn.http_1_1.bytes)) return .http1_1;
@@ -105,7 +112,7 @@ pub fn mapNegotiatedHttpProtocol(
 pub fn selectNegotiatedProtocol(
     negotiated_alpn: ?[]const u8,
     policy: ListenerProtocolPolicy,
-) Error!tls_termination.NegotiatedProtocol {
+) Error!NegotiatedProtocol {
     const protocol = try mapNegotiatedHttpProtocol(negotiated_alpn, policy.negotiatedFallbackPolicy());
     try policy.validateSelected(protocol);
     return protocol;
@@ -114,7 +121,7 @@ pub fn selectNegotiatedProtocol(
 pub fn dispatchToRuntime(
     runtime: anytype,
     conn: anytype,
-    negotiated: tls_termination.NegotiatedProtocol,
+    negotiated: NegotiatedProtocol,
     comptime Runtime: type,
 ) !Runtime.Outcome {
     return switch (negotiated) {
@@ -133,11 +140,11 @@ pub fn dispatchToRuntime(
 }
 
 test "ALPN mapping is explicit" {
-    try std.testing.expectEqual(tls_termination.NegotiatedProtocol.http2, try mapNegotiatedHttpProtocol(tls.algorithms.alpn.h2.bytes, .require_match));
-    try std.testing.expectEqual(tls_termination.NegotiatedProtocol.http1_1, try mapNegotiatedHttpProtocol(tls.algorithms.alpn.http_1_1.bytes, .require_match));
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try mapNegotiatedHttpProtocol(tls.algorithms.alpn.h2.bytes, .require_match));
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try mapNegotiatedHttpProtocol(tls.algorithms.alpn.http_1_1.bytes, .require_match));
     try std.testing.expectError(error.NoApplicationProtocol, mapNegotiatedHttpProtocol("spdy/3", .require_match));
     try std.testing.expectError(error.NoApplicationProtocol, mapNegotiatedHttpProtocol(null, .require_match));
-    try std.testing.expectEqual(tls_termination.NegotiatedProtocol.http1_1, try mapNegotiatedHttpProtocol(null, .allow_http1_default));
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try mapNegotiatedHttpProtocol(null, .allow_http1_default));
 }
 
 test "listener protocol snapshot advertises only enabled protocols in server preference" {
@@ -151,17 +158,17 @@ test "listener protocol snapshot advertises only enabled protocols in server pre
 test "pinned listener policy validates selected protocol and fallback" {
     try std.testing.expectError(error.ProtocolDisabled, selectNegotiatedProtocol(tls.algorithms.alpn.h2.bytes, .{ .http2_enabled = false }));
     try std.testing.expectError(error.NoApplicationProtocol, selectNegotiatedProtocol(null, .{ .allow_http1_without_alpn = false }));
-    try std.testing.expectEqual(tls_termination.NegotiatedProtocol.http1_1, try selectNegotiatedProtocol(null, .{ .allow_http1_without_alpn = true }));
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try selectNegotiatedProtocol(null, .{ .allow_http1_without_alpn = true }));
     try std.testing.expectError(error.NoApplicationProtocol, selectNegotiatedProtocol(null, .{ .http1_enabled = false, .allow_http1_without_alpn = true }));
 }
 
-test "shared runtime dispatch accepts OpenSSL-shaped and EncryptedStream connection shapes" {
+test "shared runtime dispatch accepts generic and EncryptedStream connection shapes" {
     var runtime = TestRuntime{};
-    var openssl_conn = TestOpenSslConn{ .fd = 11 };
-    try std.testing.expectEqual(TestOutcome.park, try dispatchToRuntime(&runtime, &openssl_conn, .http1_1, TestRuntime));
+    var generic_conn = TestGenericConn{ .fd = 11 };
+    try std.testing.expectEqual(TestOutcome.park, try dispatchToRuntime(&runtime, &generic_conn, .http1_1, TestRuntime));
     try std.testing.expectEqual(@as(usize, 1), runtime.http1_calls);
     try std.testing.expectEqual(@as(std.posix.fd_t, 11), runtime.last_fd);
-    try std.testing.expectEqualStrings("h", openssl_conn.written[0..openssl_conn.written_len]);
+    try std.testing.expectEqualStrings("h", generic_conn.written[0..generic_conn.written_len]);
 
     var fake_stream = TestEncryptedStream{ .readiness_state = .{ .can_write_plaintext = true } };
     var pure_zig_conn = encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(fake_stream.stream(), 22);
@@ -173,22 +180,22 @@ test "shared runtime dispatch accepts OpenSSL-shaped and EncryptedStream connect
 
 const TestOutcome = enum { serve_again, park, close };
 
-const TestOpenSslConn = struct {
+const TestGenericConn = struct {
     fd: std.posix.fd_t,
     pending_plaintext: usize = 0,
     written: [8]u8 = undefined,
     written_len: usize = 0,
 
-    pub fn pending(self: *const TestOpenSslConn) usize {
+    pub fn pending(self: *const TestGenericConn) usize {
         return self.pending_plaintext;
     }
 
-    pub fn rawFd(self: *const TestOpenSslConn) std.posix.fd_t {
+    pub fn rawFd(self: *const TestGenericConn) std.posix.fd_t {
         return self.fd;
     }
 
     pub const Writer = struct {
-        conn: *TestOpenSslConn,
+        conn: *TestGenericConn,
 
         pub fn writeByte(self: Writer, byte: u8) !void {
             self.conn.written[self.conn.written_len] = byte;
@@ -196,7 +203,7 @@ const TestOpenSslConn = struct {
         }
     };
 
-    pub fn writer(self: *TestOpenSslConn) Writer {
+    pub fn writer(self: *TestGenericConn) Writer {
         return .{ .conn = self };
     }
 };

@@ -1310,8 +1310,7 @@ const TardigradeProcess = struct {
         // Appliance TLS profile: whenever a test enables TLS files without
         // choosing its own server name, supply the fixture identity's name so
         // startup passes the mandatory single-identity policy.
-        if (!build_options.tls_openssl_adapter and
-            env_map.get("TARDIGRADE_TLS_CERT_PATH") != null and
+        if (env_map.get("TARDIGRADE_TLS_CERT_PATH") != null and
             env_map.get("TARDIGRADE_TLS_SERVER_NAME") == null)
         {
             try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
@@ -1449,7 +1448,7 @@ fn prepareBearClawFixture(
         transcript_file.close();
     }
 
-    const fixture_name = if (build_options.tls_openssl_adapter) "server" else "native_ed25519";
+    const fixture_name = "native_ed25519";
     const server_cert_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/{s}.crt", .{ cwd, fixture_name });
     defer allocator.free(server_cert_abs);
     const server_key_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/{s}.key", .{ cwd, fixture_name });
@@ -1504,11 +1503,9 @@ fn prepareBearClawFixture(
     if (fixture_tls_enabled) {
         try env_map.put("TARDIGRADE_TLS_CERT_PATH", server_cert_abs);
         try env_map.put("TARDIGRADE_TLS_KEY_PATH", server_key_abs);
-        if (!build_options.tls_openssl_adapter) {
-            // Appliance TLS profile: exactly one configured server name is
-            // mandatory whenever TLS files are set.
-            try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
-        }
+        // Appliance TLS profile: exactly one configured server name is
+        // mandatory whenever TLS files are set.
+        try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
     } else {
         _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
         _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
@@ -2507,7 +2504,7 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
         if (ready_over_https) {
-            var resp = (if (!build_options.tls_openssl_adapter and options.ready_client_cert == null and options.ready_client_key == null)
+            var resp = (if (options.ready_client_cert == null and options.ready_client_key == null)
                 sendPureZigTlsHttp1Request(std.testing.allocator, port, ready_path)
             else
                 sendCurlRequest(std.testing.allocator, port, .{
@@ -2939,59 +2936,28 @@ fn nativeTlsFixturePaths(allocator: std.mem.Allocator) !NativeTlsFixturePaths {
     };
 }
 
-fn listenerTlsFixturePaths(allocator: std.mem.Allocator) !NativeTlsFixturePaths {
-    if (!build_options.tls_openssl_adapter) return nativeTlsFixturePaths(allocator);
-    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
-    errdefer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
-    return .{
-        .allocator = allocator,
-        .cert_path = cert_path,
-        .key_path = key_path,
-    };
-}
-
-fn requireNativeTlsProfile() !void {
-    if (build_options.tls_openssl_adapter) return error.SkipZigTest;
-}
+/// #649: every shipping profile is native TLS now, so this always passes.
+/// Kept (rather than deleted at each of its ~60 call sites) as the
+/// existing marker of "this case assumes/exercises the native TLS engine".
+fn requireNativeTlsProfile() !void {}
 
 /// #634: cases asserting the Bare appliance *product policy* — the strict
 /// Ed25519 single-identity loader, `check`/startup credential preflight,
 /// unknown-SNI handshake rejection, restart-owned credential rotation —
-/// hold only on `-Dtls-profile=appliance`. The general-purpose `native`
-/// profile shares the adapter-free native TLS engine
-/// (`requireNativeTlsProfile` passes there too) but uses the permissive
-/// generic credential store, so these behaviors are intentionally absent.
+/// hold only on `-Dtls-profile=appliance`. The general-purpose profile
+/// shares the same native TLS engine but uses the permissive generic
+/// credential store, so these behaviors are intentionally absent.
 fn requireApplianceTlsProfile() !void {
     if (!std.mem.eql(u8, build_options.tls_profile, "appliance")) return error.SkipZigTest;
 }
 
-/// #634: the general-purpose adapter-free profile (`-Dtls-profile=native`)
-/// only — for cases proving generic-native behavior whose appliance
-/// counterpart takes a different code path with its own assertions (e.g.
-/// the appliance credential-config reload rejection vs. the generic
-/// native TLS-topology reload rejection).
+/// #634/#649: the general-purpose profile (`-Dtls-profile=general`, the
+/// default) only — for cases proving generic-native behavior whose
+/// appliance counterpart takes a different code path with its own
+/// assertions (e.g. the appliance credential-config reload rejection vs.
+/// the generic native TLS-topology reload rejection).
 fn requireGenericNativeTlsProfile() !void {
-    try requireNativeTlsProfile();
     if (std.mem.eql(u8, build_options.tls_profile, "appliance")) return error.SkipZigTest;
-}
-
-/// #522: the appliance TLS profile explicitly forbids
-/// `TARDIGRADE_HTTP3_ENABLE_0RTT` (`edge_config.zig`'s
-/// `validateApplianceTlsProfile` rejects it outright as an unsupported
-/// appliance configuration), and QUIC's `NativeCredentialStore` credential
-/// provider is itself only constructed `if (build_options.tls_openssl_
-/// adapter and cfg.http3_enabled ...)` in `edge_gateway.zig` -- native QUIC
-/// never links OpenSSL identity objects, but production 0-RTT composition
-/// for HTTP/3 is currently reachable only under the `.general` profile (the
-/// default `zig build`, no `-Dtls-profile` needed), the mirror image of
-/// `requireNativeTlsProfile` above. This is itself part of #522's finding,
-/// not a workaround: see the QUIC transport-parameter reachability note on
-/// `h3interop.quic.early.*` below.
-fn requireGeneralTlsProfile() !void {
-    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
 }
 
 /// #369: skip external OpenSSL interop cases when the local toolchain has no
@@ -3515,8 +3481,8 @@ const quic_interop_server_name = "tardigrade.test";
 const quic_interop_wire_sni = "localhost";
 
 /// #522: QUIC's `NativeCredentialStore` (`native_tls_connection.zig`, wired
-/// in `edge_gateway.zig` only `if (build_options.tls_openssl_adapter and
-/// cfg.http3_enabled ...)`) is a multi-identity SNI provider with
+/// in `edge_gateway.zig` whenever TLS files and HTTP/3 are configured, in
+/// every profile since #649) is a multi-identity SNI provider with
 /// `unknown_sni_policy=.fail_handshake` -- register both the peer's actual
 /// wire SNI (`quic_interop_wire_sni`) and the intended name under the same
 /// identity so the handshake succeeds regardless of which one the peer
@@ -3688,7 +3654,7 @@ fn assertGtlsSessionReused(allocator: std.mem.Allocator, stderr: []const u8) !vo
 }
 
 test "h3interop.quic.resume" {
-    try requireGeneralTlsProfile();
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
     const client_path = try requireNgtcp2Client(allocator);
     defer allocator.free(client_path);
@@ -3792,7 +3758,7 @@ test "h3interop.quic.resume" {
 }
 
 test "h3interop.quic.early.accepted" {
-    try requireGeneralTlsProfile();
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
     const client_path = try requireNgtcp2Client(allocator);
     defer allocator.free(client_path);
@@ -3894,7 +3860,7 @@ test "h3interop.quic.early.accepted" {
 }
 
 test "h3interop.quic.early.unsafe_425" {
-    try requireGeneralTlsProfile();
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
     const client_path = try requireNgtcp2Client(allocator);
     defer allocator.free(client_path);
@@ -4023,7 +3989,7 @@ test "h3interop.quic.early.unsafe_425" {
 }
 
 test "h3interop.quic.early.replay_fallback" {
-    try requireGeneralTlsProfile();
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
     const client_path = try requireNgtcp2Client(allocator);
     defer allocator.free(client_path);
@@ -8856,20 +8822,18 @@ test "rotation.persistent.n_to_n_plus_1" {
 // secret-free failure outcome each time.
 //
 // This test does not additionally attempt to bundle a TLS credential change
-// into a failing SIGHUP: `requireNativeTlsProfile` gates every test in this
-// file to the native-TLS builds (`-Dtls-profile=appliance`/`native`, where
-// `build_options.tls_openssl_adapter` is false), and inspecting
-// `edge_gateway.run`/`gateway_shutdown.hotReloadConfig` shows the appliance
-// profile's real served identity (`appliance_credentials.ApplianceCredentials`,
-// held in `appliance_identity`) is loaded once at startup and never touched
-// by `hotReloadConfig` at all -- the `native_credentials`/`NativeCredentialStore`
+// into a failing SIGHUP: every TLS profile is native since #649, and
+// inspecting `edge_gateway.run`/`gateway_shutdown.hotReloadConfig` shows the
+// appliance profile's real served identity
+// (`appliance_credentials.ApplianceCredentials`, held in
+// `appliance_identity`) is loaded once at startup and never touched by
+// `hotReloadConfig` at all -- the `native_credentials`/`NativeCredentialStore`
 // two-phase prepare/commit path this criterion originally had in mind is
-// wired up only for the non-appliance (general) profile, and there only for
-// QUIC/H3 (`edge_gateway.zig`'s `if (build_options.tls_openssl_adapter and
-// cfg.http3_enabled ...)`), so it is never reachable here regardless of
-// what this test attempts. `rotation.persistent.quic_credential_reload_
-// atomicity` below exercises that real path instead, over a real external
-// QUIC peer; `rotation.persistent.certificate_binding_change` proves the
+// wired up only for the non-appliance (general) profile, so it is never
+// reachable here regardless of what this test attempts.
+// `rotation.persistent.quic_credential_reload_atomicity` below exercises
+// that real path instead, over a real external QUIC peer;
+// `rotation.persistent.certificate_binding_change` proves the
 // credential-binding side of this through the restart composition the
 // appliance profile does support. What this test still demonstrates,
 // honestly: every sub-case below leaves `ticket0` (bound to the one
@@ -9321,32 +9285,26 @@ test "rotation.persistent.certificate_binding_change" {
 // prepare/commit path that test's own doc comment explains is unreachable
 // under the appliance profile. `edge_gateway.zig` only constructs
 // `native_credentials` (`http.native_tls_connection.NativeCredentialStore`)
-// under the *general* profile (`build_options.tls_openssl_adapter`), and
-// only for QUIC/H3 (`if (build_options.tls_openssl_adapter and
-// cfg.http3_enabled and edge_config.hasTlsFiles(cfg))`) -- TCP/H1 under the
-// general profile always serves through the OpenSSL-adapter
-// `TlsTerminator` instead, which owns its own independent session
-// cache/tickets and never touches `native_resumption_runtime` or persistent
-// ticket keys at all. So this composed proof necessarily drives real
-// QUIC/H3 (the same `gtlsclient` subprocess harness `h3interop.quic.*`
-// above uses), not TCP.
+// under the *general* profile, whenever TLS files are configured -- the
+// same store serves both TCP/H1 and QUIC/H3 there (#649 retired the
+// #629 mixed OpenSSL-TCP/native-HTTP3 composition entirely; there is now
+// exactly one credential owner per profile). So this composed proof drives
+// real QUIC/H3 (the same `gtlsclient` subprocess harness `h3interop.quic.*`
+// above uses) rather than TCP, matching the resumption cache/ticket surface
+// this test cares about, but the credential store it exercises is the same
+// one TCP/H1 shares.
 //
 // Bundles a credential swap with a broken ticket-key candidate in the same
-// SIGHUP. This composition -- TLS files configured, so `edge_gateway.zig`
-// also constructs the OpenSSL-adapter `TlsTerminator` for TCP/H1 alongside
-// `native_credentials` for H3 -- is a mixed OpenSSL-TCP/native-HTTP3 build
-// (#629): since `TARDIGRADE_TLS_CERT_PATH`/`_KEY_PATH` are unchanged (only
-// the file *content* at that path changes, from A's bytes to B's),
-// `hotReloadConfig`'s `nativeCredentialPathsChanged` comparator sees no
-// change and doesn't reject outright, but `mixed_credential_owners` being
-// true also means `native_credentials.prepareReloadFromFiles` is never
-// called at all here (skipped, not called-then-discarded) -- #629 made
-// same-path content changes inert for this composition specifically so H3
-// can never silently diverge from stable TCP. The ticket-key step, which
-// runs independently of that guard, still fails on the broken candidate and
-// rejects the whole reload, so the observable outcome (previous ticket
-// state and served credential both unchanged) matches what this test always
-// asserted; only the internal mechanism changed.
+// SIGHUP. `hotReloadConfig` runs `native_credentials.prepareReloadFromFiles`
+// (staging the new credential, from B's bytes at the same configured path)
+// before it reaches the ticket-key reload step -- `prepareReloadFromFiles`
+// does not swap the live/active credential, only `commitPreparedReload`
+// does, and that is reached only after every earlier reload step succeeds.
+// The ticket-key step fails on the broken candidate and rejects the whole
+// reload before `commitPreparedReload` is ever called, so the observable
+// outcome (previous ticket state and served credential both unchanged)
+// matches what this test always asserted, via ordinary reload atomicity
+// rather than the retired mixed-owner special case.
 //
 // Verifies, against the real external ngtcp2/GnuTLS peer, not merely
 // Tardigrade's own report of itself: (1) the previous ticket state is
@@ -9367,7 +9325,7 @@ test "rotation.persistent.certificate_binding_change" {
 // credential-unchanged claim is verified through the same auth-binding
 // mechanism, not a second, independent proof.
 test "rotation.persistent.quic_credential_reload_atomicity" {
-    try requireGeneralTlsProfile();
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
     try requireOpensslEd25519(allocator);
     const client_path = try requireNgtcp2Client(allocator);
@@ -9481,19 +9439,30 @@ test "rotation.persistent.quic_credential_reload_atomicity" {
     try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"quic\"", "outcome=\"incompatible\"" }) orelse 0);
 }
 
-// #629: real-process companion to the gateway_shutdown.zig unit tests'
+// #629/#649: real-process companion to the gateway_shutdown.zig unit tests'
 // rejection coverage. Those prove the whole reload is rejected when
 // `TLS_CERT_PATH`/`TLS_KEY_PATH`/SNI *configuration* changes; this proves
-// the two remaining review-required cases the unit tests cannot reach on
-// their own (a from-scratch `hotReloadConfig` call that proceeds to success
-// hangs in a bare `zig test` context for reasons unrelated to #629 -- see
-// that file's comments): (1) an unrelated, ordinarily-reloadable field still
-// takes effect when both TLS surfaces are live and their shared configured
-// path is unchanged, and (2) an invalid same-path credential-file
-// replacement cannot partially publish to either surface -- because
-// `mixed_credential_owners` being true means `hotReloadConfig` never even
-// attempts to read the native H3 credential files here, not merely that a
-// read failed and was discarded.
+// the review-required case the unit tests cannot reach on their own (a
+// from-scratch `hotReloadConfig` call that proceeds to success hangs in a
+// bare `zig test` context for reasons unrelated to this -- see that file's
+// comments): an invalid same-path credential-file replacement rejects the
+// *entire* reload, including an unrelated, ordinarily-reloadable field
+// bundled into the same SIGHUP, rather than silently publishing the
+// unrelated change while ignoring the bad credential bytes.
+//
+// Before #649 this composition had two independent credential owners (an
+// OpenSSL `TlsTerminator` for stable TCP, a separate `NativeCredentialStore`
+// for native HTTP/3), and `mixed_credential_owners` being true meant
+// `hotReloadConfig` never even attempted to read the native H3 credential
+// files on a same-path reload, so invalid bytes there were silently inert
+// and the rest of the reload still applied. #649 retired that composition:
+// TCP and HTTP/3 now share the one `NativeCredentialStore`, so every reload
+// with TLS files configured re-reads and re-parses them
+// (`prepareReloadFromFiles`) before anything commits; invalid same-path
+// bytes now fail that parse and reject the whole reload atomically, the
+// same way `native TLS credential reload failed` already fails a reload for
+// files at a *changed* path (`gateway_shutdown.zig`) -- there is no longer
+// a code path that reads a credential file and then discards the result.
 //
 // Named under the `rotation.` prefix (not a bare `hotReloadConfig ...` name)
 // so `zig build test-integration-resumption-interop` -- the required
@@ -9505,20 +9474,20 @@ test "rotation.persistent.quic_credential_reload_atomicity" {
 // credential is unchanged, since `gtlsclient` doesn't expose the negotiated
 // leaf certificate directly (see that test's own doc comment) -- a direct
 // external proof H3 never picked up the invalid same-path replacement, not
-// an inference from the accepted reload alone.
+// an inference from the rejected reload alone.
 test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload" {
-    try requireGeneralTlsProfile();
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
     try requireOpensslEd25519(allocator);
     const client_path = try requireNgtcp2Client(allocator);
     defer allocator.free(client_path);
 
     // Both stable TCP and native HTTP/3 are constructed from this exact
-    // same configured path (matching `edge_gateway.run()`'s production
-    // wiring), so they start on the same identity by construction and this
-    // is a genuine mixed OpenSSL-TCP/native-HTTP3 composition. A throwaway
-    // generated identity, not a checked-in fixture, since this test
-    // overwrites the file content in place below.
+    // same configured path, through the one shared `NativeCredentialStore`
+    // (matching `edge_gateway.run()`'s production wiring), so they start on
+    // the same identity by construction. A throwaway generated identity,
+    // not a checked-in fixture, since this test overwrites the file content
+    // in place below.
     var cred_a = try generateAlternateServerCert(allocator, quic_interop_server_name);
     defer cred_a.deinit();
 
@@ -9625,16 +9594,19 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     tardigrade.sendSignal(std.posix.SIG.HUP);
     compat.sleepNs(300 * std.time.ns_per_ms);
 
-    // 3: the reload as a whole succeeded -- the credential portion was
-    // never touched at all (skipped by `mixed_credential_owners`), not
-    // merely attempted and rejected -- and the unrelated field took effect.
+    // 3: the reload as a whole is rejected -- the invalid same-path
+    // credential bytes fail `prepareReloadFromFiles`, and that failure
+    // rejects the entire SIGHUP atomically, so the bundled unrelated field
+    // change never takes effect either (#649: single shared credential
+    // owner, no partial-apply path left).
     var status = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/tardigrade/reload/status", .insecure = true });
     defer status.deinit();
-    try assertContains(status.body, "\"ok\":true");
+    try assertContains(status.body, "\"ok\":false");
+    try assertContains(status.body, "native TLS credential reload failed");
 
     var second_response = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/dynamic/test", .insecure = true });
     defer second_response.deinit();
-    try assertContains(second_response.body, "second-location");
+    try assertContains(second_response.body, "first-location");
 
     // 4: TCP is still serving identity A over a real handshake.
     const subject_after = try opensslPresentedSubject(allocator, tardigrade.port, quic_interop_server_name);
@@ -11774,7 +11746,7 @@ test "prometheus metrics endpoint exposes counters and can require auth" {
 }
 
 test "bearclaw fixture serves chat over https with bearer auth and transcript persistence" {
-    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{.{
@@ -11861,7 +11833,7 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
 }
 
 test "bearclaw transcript append path errors do not fail the request" {
-    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{.{
@@ -11899,7 +11871,7 @@ test "bearclaw transcript append path errors do not fail the request" {
 
 // TC-TARDIGRADE-002 + TC-TARDIGRADE-004
 test "bearclaw edge prefix routes health without auth and enforces auth on v1 paths" {
-    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
+    try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{
@@ -13652,11 +13624,9 @@ test "proxy streaming mode streams over a unix socket upstream" {
 
 test "proxy streaming mode streams from an upstream requiring a client certificate" {
     const allocator = std.testing.allocator;
-    // The appliance profile stubs the upstream TLS client out entirely
-    // (`UpstreamTlsConn.connect` returns `error.ContextInitFailed`), so *no*
-    // HTTPS upstream works there — buffered or streaming. Upstream mTLS is only
-    // reachable under the general profile.
-    try requireGeneralTlsProfile();
+    // The native upstream HTTPS/TLS client (#634/#643) supports presenting
+    // a configured client certificate (`UpstreamTlsOptions.client_cert_path`)
+    // in every TLS profile — this is not OpenSSL-adapter-only behavior.
     try requireOpenssl(allocator);
 
     // `openssl s_server -Verify 1` refuses any peer without a certificate
@@ -15146,7 +15116,7 @@ test "security headers do not override or duplicate upstream-provided values (#1
 
 test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
     const allocator = std.testing.allocator;
-    var tls_paths = try listenerTlsFixturePaths(allocator);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
@@ -15165,14 +15135,7 @@ test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
     });
     defer tardigrade.stop();
 
-    var response = if (build_options.tls_openssl_adapter)
-        try sendCurlRequest(allocator, tardigrade.port, .{
-            .scheme = "https",
-            .path = "/healthz",
-            .insecure = true,
-        })
-    else
-        try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+    var response = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     // Default HSTS is a 1-year max-age with includeSubDomains on (preload off).
@@ -15181,60 +15144,14 @@ test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
     try std.testing.expectEqualStrings("max-age=31536000; includeSubDomains", response.header("Strict-Transport-Security") orelse "");
 }
 
-test "TLS 1.1 client is rejected when the minimum version is 1.2 (#175)" {
-    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
-    defer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
-    defer allocator.free(key_path);
-
-    // Default TARDIGRADE_TLS_MIN_VERSION is 1.2 (not overridden here).
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .config_text =
-        \\location = /healthz {
-        \\    return 200 alive;
-        \\}
-        ,
-        .ready_https_insecure = true,
-        .ready_path = "/healthz",
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cert_path },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key_path },
-        },
-    });
-    defer tardigrade.stop();
-
-    // Positive control: a client capped at TLS 1.2 still connects. This proves
-    // curl's --tls-max path works locally, so the 1.1 failure below is the
-    // server rejecting the version rather than a client-side curl quirk.
-    var tls12 = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/healthz",
-        .insecure = true,
-        .tls_max = "1.2",
-    });
-    defer tls12.deinit();
-    try std.testing.expectEqual(@as(u16, 200), tls12.status_code);
-
-    // Same curl option path, same listener, same route — but a client capped at
-    // TLS 1.1 has no shared version with the 1.2-minimum server, so the
-    // handshake must fail (curl exits non-zero).
-    var capped = try runCurl(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/healthz",
-        .insecure = true,
-        .tls_max = "1.1",
-    });
-    defer capped.deinit();
-    const rejected = switch (capped.term) {
-        .exited => |code| code != 0,
-        else => true,
-    };
-    try std.testing.expect(rejected);
-}
+// #649: retired "TLS 1.1 client is rejected when the minimum version is
+// 1.2 (#175)" -- it relied on `TARDIGRADE_TLS_MIN_VERSION` defaulting to
+// "1.2" against a real OpenSSL terminator honoring that floor. The native
+// engine is TLS 1.3-only in every profile; `TARDIGRADE_TLS_MIN_VERSION`/
+// `_MAX_VERSION` set to anything but "1.3" is now rejected at config
+// validation time (`edge_config.zig`'s `validateNativeTlsBuildConfig`,
+// covered by "native-TLS builds reject legacy OpenSSL-only TLS settings
+// one at a time").
 
 test "location rewrite action falls through to try_files (#201)" {
     // Guards the routeRequest fall-through after a location `.rewrite` action:
@@ -16902,7 +16819,7 @@ test "failure: malformed and stalled TLS handshakes are rejected without wedging
 
     // Absolute paths to the shared TLS fixture; presence of both cert and key is
     // what enables TLS termination on the listener (edge_config.hasTlsFiles).
-    var tls_paths = try listenerTlsFixturePaths(allocator);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
@@ -16954,14 +16871,7 @@ test "failure: malformed and stalled TLS handshakes are rejected without wedging
     try stalled.writeAll("\x16\x03\x01\x00\x50\x01\x00\x00\x4c\x03\x03");
 
     // The listener still terminates a valid TLS request end-to-end.
-    var response = if (build_options.tls_openssl_adapter)
-        try sendCurlRequest(allocator, tardigrade.port, .{
-            .scheme = "https",
-            .path = "/healthz",
-            .insecure = true,
-        })
-    else
-        try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+    var response = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try assertContains(response.body, "alive");
@@ -16970,19 +16880,12 @@ test "failure: malformed and stalled TLS handshakes are rejected without wedging
     try waitForLogSubstring(
         allocator,
         tardigrade.log_path,
-        if (build_options.tls_openssl_adapter) "tls handshake error" else "native tls handshake failed",
+        "native tls handshake failed",
         3_000,
     );
 
     // And no half-open handshakes leaked — active connections stay bounded.
-    var metrics = if (build_options.tls_openssl_adapter)
-        try sendCurlRequest(allocator, tardigrade.port, .{
-            .scheme = "https",
-            .path = "/status/metrics",
-            .insecure = true,
-        })
-    else
-        try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
     defer metrics.deinit();
     try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
     const active = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse
@@ -18016,12 +17919,19 @@ test "native upstream https: verification disabled succeeds against the same unt
     });
     defer tardigrade.stop();
 
+    // 20s, not this file's usual 10s: unlike the neighboring fail-closed
+    // tests (which only need the handshake to fail fast), this one needs a
+    // full successful handshake plus response through two stacked native
+    // TLS listeners (this test's own `tardigrade` proxying to a full second
+    // `startNativeUpstreamTardigrade` process), which observably ran past
+    // 10s on loaded macOS CI runners while never doing so locally or on
+    // Linux runners.
     var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
         .method = "GET",
         .path = "/secure/upstream-body",
         .body = null,
         .headers = &.{},
-    }, 10_000);
+    }, 20_000);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try assertContains(response.body, "native-upstream-insecure-body");
@@ -18054,13 +17964,18 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     });
     defer tardigrade.stop();
 
+    // 20s per request, not this file's usual 10s: same reasoning as the
+    // neighboring "verification disabled" test above (a full successful
+    // handshake through two stacked native TLS listeners observably ran
+    // past 10s on loaded macOS CI runners), doubled here since this loop
+    // does it twice.
     for (0..2) |_| {
         var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
             .method = "GET",
             .path = "/secure/upstream-body",
             .body = null,
             .headers = &.{},
-        }, 10_000);
+        }, 20_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status_code);
     }
@@ -18709,7 +18624,7 @@ test "appliance hot reload rejects turning TLS off for a server that started wit
 }
 
 // #634 (#641 review): the generic-native counterparts of the two appliance
-// reload-rejection tests above. On `-Dtls-profile=native` the credential
+// reload-rejection tests above. On the general profile the credential
 // store/provider are created only when TLS files exist at startup and
 // `startNewConnection` dispatches on that startup-fixed optional, so a
 // reload that changes TLS topology must be rejected outright — never

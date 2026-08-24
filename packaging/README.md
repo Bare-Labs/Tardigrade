@@ -9,8 +9,8 @@ versus what is a local-build-only tool.
 
 | Format | Status | Notes |
 | --- | --- | --- |
-| Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, per-arch SPDX SBOMs, dependency inventories, and provenance. Releases containing #476 build these official artifacts with `-Dtls-profile=native`; older already-published releases may predate that cutover. |
-| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Implemented in #476; awaiting first release** | #476 adds `macos-15-intel` and `macos-15` release rows for `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux. Both rows build `-Dtls-profile=native` without Homebrew OpenSSL, audit out foreign TLS/crypto/QUIC/H3 linkage, assert the Mach-O architecture, package/extract the archive, verify native build identity, run a real static-site startup/request smoke from the extracted artifact, and exercise the checksum-verifying installer path. The currently published latest release still predates #476, so these assets are not public until the first intentional release containing it. |
+| Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, per-arch SPDX SBOMs, dependency inventories, and provenance. Releases containing #476 build these official artifacts with the default `-Dtls-profile=general` (pure-Zig native since #649); older already-published releases may predate that cutover. |
+| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Implemented in #476; awaiting first release** | #476 adds `macos-15-intel` and `macos-15` release rows for `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux. Both rows build with the default `-Dtls-profile=general` (pure-Zig native since #649) without Homebrew OpenSSL, audit out foreign TLS/crypto/QUIC/H3 linkage, assert the Mach-O architecture, package/extract the archive, verify native build identity, run a real static-site startup/request smoke from the extracted artifact, and exercise the checksum-verifying installer path. The currently published latest release still predates #476, so these assets are not public until the first intentional release containing it. |
 | DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. Host-native builds infer dependency metadata from `tardi version`; cross-compiled binaries can declare `--tls-backend native|openssl-adapter` explicitly. Native binaries declare no OpenSSL runtime dependency, while a transitional local `general`/OpenSSL binary still gets the dependency it actually needs. |
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Host-native builds infer the backend and cross-compiled builds can pass it explicitly. The spec's OpenSSL runtime dependency is conditional on the packaged binary/backend; official native release packages do not declare it. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
@@ -24,7 +24,7 @@ Releases containing #476 explicitly build the general-purpose native Zig
 shipping profile:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=<version>
+zig build -Doptimize=ReleaseFast -Dversion=<version>
 ```
 
 The release workflow audits each produced binary with
@@ -102,7 +102,7 @@ the native profile for a shipping-equivalent package:
 
 ```bash
 # 1. Build the binary first (cross-compile for the target arch as needed)
-zig build -Doptimize=ReleaseFast -Dtls-profile=native
+zig build -Doptimize=ReleaseFast
 
 # 2. Build the DEB. Passing the backend explicitly also works when the target
 #    binary is for a different architecture than the packaging host.
@@ -174,7 +174,7 @@ identically to `dnf install` for a local file.
 dnf install rpm-build
 
 # 2. Build the binary
-zig build -Doptimize=ReleaseFast -Dtls-profile=native
+zig build -Doptimize=ReleaseFast
 
 # 3. Build the RPM. Passing the backend explicitly also works for a
 #    foreign-architecture binary.
@@ -306,7 +306,7 @@ Run a host-native Homebrew install smoke against a local release-shaped archive
 after building a native release binary:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtls-profile=native -Dversion=0.0.0-homebrew-smoke
+zig build -Doptimize=ReleaseFast -Dversion=0.0.0-homebrew-smoke
 ./scripts/test-homebrew-formula.sh
 ```
 

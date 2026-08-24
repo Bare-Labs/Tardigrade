@@ -54,16 +54,13 @@ pub const negotiated_dispatch = @import("http/negotiated_dispatch.zig");
 pub const native_tls_connection = @import("http/native_tls_connection.zig");
 pub const downstream_connection = @import("http/downstream_connection.zig");
 pub const upstream_pool = @import("http/upstream_pool.zig");
-/// TLS termination backend selected by `-Dtls-profile` (#379): the OpenSSL
-/// adapter in the general profile, a no-OpenSSL stub in the Bare Systems
-/// appliance profile. The swap happens in `http/tls_backend.zig` — at the
-/// module graph, not at runtime — so an appliance binary never analyzes
-/// `@cImport("openssl/...")` and cannot silently fall back to the C adapter.
-pub const tls_termination = @import("http/tls_backend.zig");
-/// ACME client backend selected by `-Dtls-profile` (#379): OpenSSL-backed in
-/// the general profile, a no-OpenSSL stub in the appliance profile. Selected
-/// at the module graph so the appliance never links OpenSSL through ACME.
-pub const acme_client = @import("http/acme_backend.zig");
+/// Native upstream HTTPS/TLS client surface, identical across every
+/// `-Dtls-profile` (#379, #649): no `@cImport("openssl/...")` and no foreign
+/// TLS/crypto linkage in any shipping build.
+pub const upstream_tls = @import("http/upstream_tls.zig");
+/// Native ACME client surface, identical across every `-Dtls-profile`
+/// (#379, #649): no OpenSSL linkage in any shipping build.
+pub const acme_client = @import("http/acme_client.zig");
 pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
 pub const http2_stream = @import("http/http2_stream.zig");

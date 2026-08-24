@@ -1515,6 +1515,14 @@ All notable user-facing changes to Tardigrade are documented here.
   label series, because all three combinations now stream. The
   `early_data_retry_semantics` reason, which was emitted but had no counter,
   gains one. Dashboards or alerts referencing the removed series need updating.
+- **OpenSSL production TLS backend (#649)** — `-Dtls-profile=native` is
+  removed; its native-only implementation is merged into
+  `-Dtls-profile=general`, now the default and, alongside `appliance`, the
+  only build profile. No shipping `tardi` binary links `libssl`/`libcrypto`
+  any more, and `tardi version` always reports `tls-backend=native` (the
+  `tls-backend=openssl-adapter` string no longer exists). OpenSSL remains
+  available only out of process, as an interoperability/differential-testing
+  oracle.
 
 ## [0.5.0] - 2026-07-08
 

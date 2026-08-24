@@ -1,19 +1,23 @@
 const std = @import("std");
 
-/// TLS/crypto build profile (#379, epic #327, cutover #634). `general`
-/// links the single approved OpenSSL adapter as a transitional
-/// compatibility backend. `appliance` and `native` are native-only builds:
-/// no OpenSSL configuration, import, or linkage — the OpenSSL adapter
-/// module is replaced with a native stub at the build graph level, so
+/// TLS/crypto build profile (#379, epic #327, cutover #634, retirement
+/// #649). Both profiles are native-only builds: no OpenSSL configuration,
+/// import, or linkage is reachable from any shipping `tardi` target —
 /// `@cImport("openssl/...")` is never analyzed and `libssl`/`libcrypto`
-/// are never linked. `appliance` additionally applies the Bare Systems
-/// product policy (single Ed25519 identity, required server name, fixed
-/// TLS 1.3 policy); `native` is the general-purpose native profile
-/// (multi-identity SNI, generic credential loader) that #634 promotes to
-/// the sole shipping implementation. There is no runtime fallback between
-/// profiles; the selection is embedded in the binary and reported by
-/// `tardi version`. See docs/TLS_DEPENDENCY_POLICY.md.
-const TlsProfile = enum { general, appliance, native };
+/// are never linked for production compile steps. The two tags differ
+/// only in native *product policy*, not implementation ownership:
+/// `general` is the general-purpose native profile (multi-identity SNI,
+/// generic credential loader) and the default; `appliance` additionally
+/// applies the Bare Systems product policy (single Ed25519 identity,
+/// required server name, fixed TLS 1.3 policy). There is no runtime
+/// fallback between profiles, and no foreign-implementation backend is
+/// selectable by any supported production build; the selection is
+/// embedded in the binary and reported by `tardi version`. OpenSSL
+/// remains available only as out-of-process interop/differential test
+/// tooling (see the `test-crypto-openssl` step and `evp_oracle` below),
+/// entirely outside this profile selection. See
+/// docs/TLS_DEPENDENCY_POLICY.md.
+const TlsProfile = enum { general, appliance };
 
 /// Resolves the source revision embedded in benchmark/diagnostic metadata
 /// (e.g. `crypto_bench`'s `_meta.tardigrade_commit`, #378's benchmark
@@ -84,15 +88,13 @@ pub fn build(b: *std.Build) void {
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
-        "TLS/crypto profile: 'general' (default) links the transitional OpenSSL adapter; 'native' is the general-purpose pure-Zig profile and 'appliance' the Bare Systems policy profile — both forbid all foreign TLS/crypto linkage (#379, #634)",
+        "TLS/crypto product policy: 'general' (default) is the general-purpose native profile; 'appliance' is the Bare Systems policy profile — both are pure-Zig native and forbid all foreign TLS/crypto linkage in production builds (#379, #634, #649)",
     ) orelse .general;
-    const link_openssl_adapter = tls_profile == .general;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
     build_options.addOption([]const u8, "commit", commit_sha);
     build_options.addOption([]const u8, "tls_profile", @tagName(tls_profile));
-    build_options.addOption(bool, "tls_openssl_adapter", link_openssl_adapter);
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/zig_compat.zig"),
         .target = target,
@@ -238,7 +240,6 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
         .linkage = if (static_executable) .static else null,
     });
-    if (link_openssl_adapter) configureSsl(exe, prefer_static_system_libs, require_static_system_libs);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -250,8 +251,6 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_test_mod,
     });
-    if (link_openssl_adapter) configureSsl(exe_unit_tests, prefer_static_system_libs, require_static_system_libs);
-
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
@@ -312,7 +311,6 @@ pub fn build(b: *std.Build) void {
         .root_module = allocation_regression_mod,
         .filters = &.{"allocation"},
     });
-    if (link_openssl_adapter) configureSsl(allocation_regression_tests, prefer_static_system_libs, require_static_system_libs);
     const run_allocation_regression_tests = b.addRunArtifact(allocation_regression_tests);
     test_step.dependOn(&run_allocation_regression_tests.step);
 
@@ -320,7 +318,6 @@ pub fn build(b: *std.Build) void {
         .name = "allocation_regression",
         .root_module = allocation_regression_mod,
     });
-    if (link_openssl_adapter) configureSsl(allocation_regression_exe, prefer_static_system_libs, require_static_system_libs);
     const run_allocation_regression = b.addRunArtifact(allocation_regression_exe);
     const allocation_regression_step = b.step("bench-allocations", "Report hot-path allocation budgets as JSON");
     allocation_regression_step.dependOn(&run_allocation_regression.step);
@@ -614,42 +611,45 @@ pub fn build(b: *std.Build) void {
 
     // Differential OpenSSL oracle checks (#377): spawn the system `openssl`
     // command and a test-only EVP child process out-of-process for
-    // deterministic TLS/QUIC derivation and primitive stages.
-    if (link_openssl_adapter) {
-        const evp_oracle_mod = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        evp_oracle_mod.addCSourceFile(.{ .file = b.path("tests/evp_oracle.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-deprecated-declarations" } });
-        const evp_oracle = b.addExecutable(.{
-            .name = "evp_oracle",
-            .root_module = evp_oracle_mod,
-        });
-        configureSystemLibrarySearchPaths(evp_oracle, prefer_static_system_libs);
-        linkSystemLibrary(evp_oracle, "crypto", prefer_static_system_libs, require_static_system_libs);
-        const evp_oracle_install = b.addInstallArtifact(evp_oracle, .{});
-        const crypto_openssl_diff_options = b.addOptions();
-        crypto_openssl_diff_options.addOption([]const u8, "evp_oracle_path", b.getInstallPath(.bin, "evp_oracle"));
+    // deterministic TLS/QUIC derivation and primitive stages. This is
+    // interop/differential test tooling only (#649) — it links system
+    // `libcrypto` into its own standalone `evp_oracle` executable and test
+    // module, entirely outside the `tls_profile`-selected production
+    // module graph (`exe`/`exe_unit_tests` never import or link against
+    // it), so it builds unconditionally regardless of TLS profile.
+    const evp_oracle_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    evp_oracle_mod.addCSourceFile(.{ .file = b.path("tests/evp_oracle.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-deprecated-declarations" } });
+    const evp_oracle = b.addExecutable(.{
+        .name = "evp_oracle",
+        .root_module = evp_oracle_mod,
+    });
+    configureSystemLibrarySearchPaths(evp_oracle, prefer_static_system_libs);
+    linkSystemLibrary(evp_oracle, "crypto", prefer_static_system_libs, require_static_system_libs);
+    const evp_oracle_install = b.addInstallArtifact(evp_oracle, .{});
+    const crypto_openssl_diff_options = b.addOptions();
+    crypto_openssl_diff_options.addOption([]const u8, "evp_oracle_path", b.getInstallPath(.bin, "evp_oracle"));
 
-        const crypto_openssl_diff_mod = b.createModule(.{
-            .root_source_file = b.path("tests/crypto_openssl_diff.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        crypto_openssl_diff_mod.addImport("crypto_openssl_diff_options", crypto_openssl_diff_options.createModule());
-        crypto_openssl_diff_mod.addImport("crypto", crypto_mod);
-        crypto_openssl_diff_mod.addImport("tls_core", tls_core_mod);
-        crypto_openssl_diff_mod.addImport("quic", quic_mod);
-        crypto_openssl_diff_mod.addImport("zig_compat", compat_mod);
-        const crypto_openssl_diff_tests = b.addTest(.{ .root_module = crypto_openssl_diff_mod });
-        const run_crypto_openssl_diff_tests = b.addRunArtifact(crypto_openssl_diff_tests);
-        run_crypto_openssl_diff_tests.step.dependOn(&evp_oracle_install.step);
-        const crypto_openssl_diff_step = b.step("test-crypto-openssl", "Run out-of-process OpenSSL differential crypto checks");
-        crypto_openssl_diff_step.dependOn(&run_crypto_openssl_diff_tests.step);
-        crypto_step.dependOn(&run_crypto_openssl_diff_tests.step);
-        test_step.dependOn(&run_crypto_openssl_diff_tests.step);
-    }
+    const crypto_openssl_diff_mod = b.createModule(.{
+        .root_source_file = b.path("tests/crypto_openssl_diff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_openssl_diff_mod.addImport("crypto_openssl_diff_options", crypto_openssl_diff_options.createModule());
+    crypto_openssl_diff_mod.addImport("crypto", crypto_mod);
+    crypto_openssl_diff_mod.addImport("tls_core", tls_core_mod);
+    crypto_openssl_diff_mod.addImport("quic", quic_mod);
+    crypto_openssl_diff_mod.addImport("zig_compat", compat_mod);
+    const crypto_openssl_diff_tests = b.addTest(.{ .root_module = crypto_openssl_diff_mod });
+    const run_crypto_openssl_diff_tests = b.addRunArtifact(crypto_openssl_diff_tests);
+    run_crypto_openssl_diff_tests.step.dependOn(&evp_oracle_install.step);
+    const crypto_openssl_diff_step = b.step("test-crypto-openssl", "Run out-of-process OpenSSL differential crypto checks");
+    crypto_openssl_diff_step.dependOn(&run_crypto_openssl_diff_tests.step);
+    crypto_step.dependOn(&run_crypto_openssl_diff_tests.step);
+    test_step.dependOn(&run_crypto_openssl_diff_tests.step);
 
     // Bounded checked-in Wycheproof-style corpus (#374): reduced offline
     // negative/edge vectors for provider-supported pure-Zig operations.
@@ -1098,17 +1098,6 @@ pub fn build(b: *std.Build) void {
 fn pathExists(path: []const u8) bool {
     std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     return true;
-}
-
-/// Link OpenSSL against a compile step.
-fn configureSsl(
-    compile: *std.Build.Step.Compile,
-    prefer_static: bool,
-    require_static: bool,
-) void {
-    configureSystemLibrarySearchPaths(compile, prefer_static);
-    linkSystemLibrary(compile, "ssl", prefer_static, require_static);
-    linkSystemLibrary(compile, "crypto", prefer_static, require_static);
 }
 
 fn linkSystemLibrary(

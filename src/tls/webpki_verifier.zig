@@ -3,7 +3,7 @@
 //! Adapts the pure-Zig PKI chain builder/validator (`src/pki/`) to the
 //! engine's `credentials.PeerVerifier` contract, for a TLS client that must
 //! authenticate a server certificate chain against a trust-anchor set —
-//! today the native upstream HTTPS client (`http/tls_termination_stub.zig`),
+//! today the native upstream HTTPS client (`http/upstream_tls.zig`),
 //! and any future native TLS client role — rather than a fixed pin or
 //! insecure passthrough (both already covered by `credentials.FixedVerifier`
 //! via `Trust.insecure_no_verification` / `.pinned_certificate`).
@@ -27,7 +27,7 @@ pub const Error = pki.trust_store.FileError || error{NoSystemTrustAnchors};
 /// Ordered, well-known CA bundle file locations consulted when no explicit
 /// upstream CA bundle path is configured — the native-profile analogue of
 /// OpenSSL's compiled-in default verify path
-/// (`SSL_CTX_set_default_verify_paths`, see `tls_termination.zig`). This is
+/// (`SSL_CTX_set_default_verify_paths`, see `upstream_tls.zig`). This is
 /// plain filesystem access via the pure-Zig PEM/X.509 loader, not a foreign
 /// TLS/crypto library — see the #634 comment clarifying that "pure Zig"
 /// bounds external *protocol/crypto* implementations, not ordinary OS/kernel
@@ -60,7 +60,7 @@ pub const TrustAnchors = struct {
 /// the first well-known system CA bundle location that exists and parses.
 /// Mirrors the OpenSSL upstream adapter's choice between
 /// `SSL_CTX_load_verify_locations` and `SSL_CTX_set_default_verify_paths`
-/// (`tls_termination.zig`'s `UpstreamTlsConn.connect`), without linking
+/// (`upstream_tls.zig`'s `UpstreamTlsConn.connect`), without linking
 /// OpenSSL: both paths go through the same pure-Zig PEM/X.509 loader.
 /// Deterministic failure (`error.NoSystemTrustAnchors`) when neither an
 /// explicit bundle nor any well-known system location is usable — this never

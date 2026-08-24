@@ -52,16 +52,18 @@ explicit override to something else is rejected); `tls_cipher_list`/
 `tls_cipher_suites` must be empty (the cipher is fixed); `tls_client_verify`,
 `tls_ocsp_stapling`, `tls_crl_check`, and `tls_acme_enabled` must be off;
 `tls_session_cache`/`tls_session_tickets` must be off (default off in
-appliance builds; these are OpenSSL-terminator-only features this owner
-never constructs); and if `http3_enabled` is set, a complete identity must
+appliance builds; these were OpenSSL-terminator-only features, and #649
+retired that terminator from every profile, so this owner never constructs
+one regardless); and if `http3_enabled` is set, a complete identity must
 also be configured and `http3_enable_0rtt`/`http3_connection_migration` must
 be off, and `http3_retry_policy` must remain `off`. Each violation is a
-distinct deterministic failure, not a silent no-op: the OpenSSL-only
-capability checks (version pin, ciphers, mTLS, session cache/tickets,
-OCSP, CRL, ACME, credential watcher, PROXY protocol) are shared with the
-`native` profile and fail with `UnsupportedNativeTlsConfiguration` (#634),
-while the appliance-only policy checks (identity cardinality, server-name
-coupling, HTTP/3 restrictions) fail with
+distinct deterministic failure, not a silent no-op: the retired-OpenSSL-
+terminator capability checks (version pin, ciphers, mTLS, session
+cache/tickets, OCSP, CRL, ACME, credential watcher, PROXY protocol) are not
+appliance-specific — `validateNativeTlsBuildConfig` runs unconditionally for
+every TLS profile (`general` and `appliance` alike, #634/#649) and fails with
+`UnsupportedNativeTlsConfiguration`, while the appliance-only policy checks
+(identity cardinality, server-name coupling, HTTP/3 restrictions) fail with
 `UnsupportedApplianceConfiguration`.
 
 ### SNI behavior

@@ -40,7 +40,8 @@ In scope (Phases 1 / 1b / 1c / 2 / 3):
   keep-alive still spares the origin per-request accept/fd churn and brings
   unix upstreams under the same idle/lifetime/active-cap policy and metrics
   as TCP.
-- For TLS the pooled entry owns the OpenSSL connection, so the handshake is
+- For TLS the pooled entry owns the native upstream `UpstreamTlsConn`
+  (`src/http/upstream_tls.zig`, #634/#649), so the handshake is
   amortized across requests; the key is scheme-prefixed (`http:`/`https:`).
 - Per-origin idle pool with idle-timeout, max-lifetime, and max-idle-per-host
   caps; idle reaper on the maintenance tick.
@@ -317,7 +318,8 @@ h1 fallback).
 
 Implementation-wise there is one production connection type for both:
 `PooledH2Conn = H2Conn(*UpstreamH2Transport)`, where `UpstreamH2Transport` is
-a runtime union over the OpenSSL upstream connection and a plain socket. h2c
+a runtime union over the native upstream `UpstreamTlsConn` and a plain
+socket. h2c
 connections therefore share the same pool, actor, refcount lifecycle, idle
 reaper, buffered/streaming paths, and metrics as TLS h2 — they appear under
 `h2c:host:port` keys in the per-origin series and count as `protocol="h2"` in

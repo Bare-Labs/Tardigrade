@@ -27,7 +27,7 @@ Use this checklist before tagging and distributing a Tardigrade release.
 
 - [ ] Confirm `scripts/release-metadata.sh` resolves the intended tag/version
 - [ ] Update `docs/SUPPORT_MATRIX.md` when public behavior or maturity claims changed
-- [ ] Run `./scripts/test-install.sh` against a ReleaseFast native build (`-Dtls-profile=native`)
+- [ ] Run `./scripts/test-install.sh` against a ReleaseFast native build (`-Dtls-profile=general`, the default)
 - [ ] Render the Homebrew formula from this release tag with
       `./scripts/update-homebrew-formula.sh --tag <tag>`,
       run `ruby -c packaging/homebrew/tardigrade.rb`, and run
@@ -42,8 +42,9 @@ Use this checklist before tagging and distributing a Tardigrade release.
       `tardigrade-darwin-arm64.tar.gz`) archives plus published `.deb`/`.rpm`
       assets
 - [ ] Verify every published archive's `dependency-inventory-*.json` reports
-      `profile=native`, `reported_backend=native`, `links_openssl=false`, and
-      no forbidden foreign TLS/crypto/QUIC/H3 dependency
+      `profile=general` (or `appliance`), `reported_backend=native`,
+      `links_openssl=false`, and no forbidden foreign TLS/crypto/QUIC/H3
+      dependency
 - [ ] Verify published DEB/RPM metadata does not declare OpenSSL/libssl/libcrypto
       as a Tardigrade runtime dependency
 - [ ] Copy the rendered Homebrew formula into `Bare-Systems/homebrew-tap` with
@@ -55,8 +56,9 @@ Use this checklist before tagging and distributing a Tardigrade release.
       `dependency-inventory-*.json` artifacts, and verify archive provenance
       with `gh attestation verify <archive> --repo Bare-Systems/Tardigrade`
 - [ ] On the first release containing #463, exercise `scripts/install.sh`
-      against the published release on Intel and Apple Silicon macOS **without
-      installing Homebrew OpenSSL for Tardigrade**, then verify `tardi version`,
+      against the published release on Intel and Apple Silicon macOS **with no
+      OpenSSL installed on the host** (no shipping profile links it after
+      #649), then verify `tardi version`,
       the `tardigrade -> tardi` compatibility alias, and a minimal real
       startup/request path from the installed artifact
 - [ ] Close #463 only after the first published Darwin assets, checksums,

@@ -6,7 +6,7 @@
 //! `docs/UPSTREAM_POOLING.md` for the design rationale and deferred work.
 //!
 //! Scope: HTTP/1.1 over TCP, plain or TLS (#141 Phase 1c). For TLS the pooled
-//! entry owns the OpenSSL connection; the key is scheme-prefixed so plain and
+//! entry owns the native `UpstreamTlsConn`; the key is scheme-prefixed so plain and
 //! TLS connections to the same host are never confused. Unix-socket pooling is
 //! deferred. The caller owns the HTTP exchange and decides reusability before
 //! calling `release`.
@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const compat = @import("zig_compat");
-const tls_termination = @import("tls_backend.zig");
+const upstream_tls = @import("upstream_tls.zig");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 pub const Config = struct {
@@ -61,13 +61,13 @@ pub fn currentWorkerId() u64 {
 /// A pooled connection: an owned transport plus age bookkeeping. `stream` may
 /// wrap a raw fd (data-plane, via `netStreamFromFd`) or an event-loop stream
 /// (FastCGI, via `connectUnixSocket`/`tcpConnectToHost`). For TLS upstreams
-/// `tls` holds the heap-owned OpenSSL connection (allocated with the pool's
+/// `tls` holds the heap-owned native `UpstreamTlsConn` (allocated with the pool's
 /// allocator); the pool deinits and frees it when the connection is closed.
 /// `tls` is null for plain HTTP and FastCGI. `released_by` records the worker
 /// that last parked it (set on `release`, read on `acquire`).
 pub const PooledConn = struct {
     stream: compat.NetStream,
-    tls: ?*tls_termination.UpstreamTlsConn = null,
+    tls: ?*upstream_tls.UpstreamTlsConn = null,
     created_ms: u64,
     last_used_ms: u64,
     released_by: u64 = 0,

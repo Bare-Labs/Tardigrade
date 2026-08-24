@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# TLS dependency source/configuration audit (#379, epic #327).
+# TLS dependency source/configuration audit (#379, epic #327, retirement
+# #649).
 #
 # Enforces Tardigrade's external-library policy before anything is compiled:
 #
 #   1. Forbidden TLS/crypto/QUIC/H3 dependency names must not appear in build
 #      configuration, workflows, scripts, or packaging metadata. External
 #      implementations are allowed only as out-of-process interoperability
-#      peers (scripts/interop/), never in the link graph.
-#   2. OpenSSL may be referenced only inside the approved general-profile
-#      adapter boundary.
+#      peers (scripts/interop/) or test-only tooling under tests/, never in
+#      the production link graph.
+#   2. OpenSSL must not be referenced anywhere under src/ at all -- #649
+#      retired the approved adapter boundary that used to be the sole
+#      exception here.
 #   3. Native implementation paths (TLS, PKI, QUIC, crypto, HTTP/3) must not
 #      contain any @cImport at all.
 #
@@ -109,9 +112,12 @@ resolve_build_sources() {
 }
 
 # ── 1. Forbidden dependency identifiers in build/config surfaces ─────────────
-# openssl itself is not in this list: the general profile's adapter is the
-# single approved exception, enforced separately by checks 2 and 3 and by the
-# binary audit (scripts/audit-release-binary.sh).
+# openssl itself is not in this list: it remains a legitimate name in
+# test/interop tooling and packaging metadata (evp_oracle, differential
+# tests, DEB/RPM dependency inference) even though #649 forbids it from the
+# production link graph entirely -- that prohibition is enforced separately
+# by checks 2 and 3 and by the binary audit
+# (scripts/audit-release-binary.sh).
 FORBIDDEN_NAMES='ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libressl|rustls|s2n-tls|libtls|botan'
 
 # Build configuration (the resolved build-graph sources plus the manifest),
@@ -152,28 +158,18 @@ for file in "${scan_files[@]}"; do
     fi
 done
 
-# ── 2. OpenSSL references restricted to the approved adapter boundary ─────────
-# Match the literal `openssl/` header path anywhere in comment-stripped source
-# rather than one exact @cInclude spelling, so whitespace variants and
-# reformatted includes cannot escape the allowlist.
-OPENSSL_ALLOWLIST=(
-    src/http/tls_termination.zig
-    src/http/acme_client.zig
-)
-
+# ── 2. OpenSSL must not be referenced anywhere under src/ ────────────────────
+# Match the literal `openssl/` header path anywhere in comment-stripped
+# source rather than one exact @cInclude spelling, so whitespace variants
+# and reformatted includes cannot slip through. #649 retired the adapter
+# boundary this check used to allowlist (src/http/tls_termination.zig and
+# src/http/acme_client.zig now name the native implementation, not the
+# retired OpenSSL one) -- there is no longer any approved exception.
 while IFS= read -r zigfile; do
-    allowed=false
-    for allowed_file in "${OPENSSL_ALLOWLIST[@]}"; do
-        if [ "$zigfile" = "$allowed_file" ]; then
-            allowed=true
-            break
-        fi
-    done
-    [ "$allowed" = true ] && continue
     if matches="$(stripped "$zigfile" | grep -niE 'openssl/' 2>/dev/null)"; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
-            fail "OpenSSL reference outside the approved adapter boundary in $zigfile: $line"
+            fail "OpenSSL reference in production source $zigfile: $line"
         done <<<"$matches"
     fi
 done < <(find src -name '*.zig' -type f | sort)
@@ -198,4 +194,4 @@ if [ "$failures" -gt 0 ]; then
     echo "dependency audit failed with $failures violation(s)" >&2
     exit 1
 fi
-echo "dependency audit passed: no forbidden dependencies, OpenSSL confined to the adapter boundary, native paths free of @cImport"
+echo "dependency audit passed: no forbidden dependencies, no OpenSSL in production source, native paths free of @cImport"

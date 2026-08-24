@@ -194,7 +194,7 @@ pub const EdgeConfig = struct {
     tls_cipher_suites: []const u8,
     /// The one exact DNS host name served by the fixed appliance TLS identity
     /// (#392). Required (and strictly validated) in the appliance TLS profile;
-    /// unused by the general OpenSSL terminator.
+    /// not used by the general profile.
     tls_server_name: []const u8,
     tls_sni_certs: []TlsSniCert,
     tls_session_cache_enabled: bool,
@@ -203,9 +203,9 @@ pub const EdgeConfig = struct {
     tls_session_tickets_enabled: bool,
     /// #488: native (pure-Zig) TLS/QUIC resumption runtime configuration.
     /// Deliberately distinct from the `tls_session_*`/`tls_session_tickets_*`
-    /// fields above, which remain OpenSSL-facing only — native settings
-    /// affect only the native TLS-over-TCP and QUIC/H3 engines and must
-    /// never be conflated with the OpenSSL terminator's own session config.
+    /// fields above, which are retired legacy knobs rejected by native builds.
+    /// These settings configure the native TLS-over-TCP and QUIC/H3 engines and
+    /// remain separate from those unsupported compatibility fields.
     /// One of "disabled" (default), "stateful", "stateless", "hybrid"; see
     /// `nativeResumptionMode`.
     tls_native_resumption_mode: []const u8,
@@ -832,13 +832,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     var tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_key_path);
-    // The native engine (appliance/native profiles) is TLS 1.3-only
-    // regardless of this setting; default it to "1.3" there instead of the
-    // general profile's "1.2" so an operator who never touches it gets a
-    // config that accurately describes what the engine does, and an
-    // explicit override to anything else is caught by
-    // validateNativeTlsBuildConfig.
-    const tls_min_version = envOrDefault(allocator, "TARDIGRADE_TLS_MIN_VERSION", if (is_native_tls_build) "1.3" else "1.2") catch unreachable;
+    // The native engine is TLS 1.3-only regardless of this setting; default
+    // it to "1.3" so an operator who never touches it gets a config that
+    // accurately describes what the engine does, and an explicit override
+    // to anything else is caught by validateNativeTlsBuildConfig.
+    const tls_min_version = envOrDefault(allocator, "TARDIGRADE_TLS_MIN_VERSION", "1.3") catch unreachable;
     errdefer allocator.free(tls_min_version);
     const tls_max_version = envOrDefault(allocator, "TARDIGRADE_TLS_MAX_VERSION", "1.3") catch unreachable;
     errdefer allocator.free(tls_max_version);
@@ -859,16 +857,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(tls_sni_certs);
     }
-    // Session cache/tickets are OpenSSL-terminator-only features that
-    // native-TLS builds never construct; default them off there (general
-    // profile keeps its on-by-default resumption behavior) so an operator
-    // who never touches these gets an accurate config, and an explicit
+    // Session cache/tickets were OpenSSL-terminator-only features that the
+    // native engine never constructs; default them off so an operator who
+    // never touches these gets an accurate config, and an explicit
     // override to `true` is caught by validateNativeTlsBuildConfig.
     // Native resumption is the separate #488 `tls_native_*` surface below.
-    const tls_session_cache_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_CACHE", !is_native_tls_build);
+    const tls_session_cache_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_CACHE", false);
     const tls_session_cache_size = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_CACHE_SIZE", 20_480);
     const tls_session_timeout_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS", 300);
-    const tls_session_tickets_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_TICKETS", !is_native_tls_build);
+    const tls_session_tickets_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_TICKETS", false);
     // #488: native resumption defaults to disabled/safe regardless of TLS
     // profile — this is a distinct opt-in surface from the OpenSSL-facing
     // `tls_session_*` settings above and is validated deterministically in
@@ -906,13 +903,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_crl_path = envOrDefault(allocator, "TARDIGRADE_TLS_CRL_PATH", "") catch unreachable;
     errdefer allocator.free(tls_crl_path);
     const tls_crl_check = parseBoolEnv(allocator, "TARDIGRADE_TLS_CRL_CHECK", false);
-    // Dynamic file-watching is an OpenSSL-terminator-only feature that
-    // native-TLS builds never construct (native credential rotation is the
-    // explicit SIGHUP reload path); default it off there (general profile
-    // keeps its on-by-default watcher) so an operator who never touches
-    // this gets an accurate config, and an explicit nonzero override is
-    // caught by validateNativeTlsBuildConfig.
-    const tls_dynamic_reload_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS", if (is_native_tls_build) 0 else 5000);
+    // Dynamic file-watching was an OpenSSL-terminator-only feature that the
+    // native engine never constructs (native credential rotation is the
+    // explicit SIGHUP reload path); default it off so an operator who never
+    // touches this gets an accurate config, and an explicit nonzero
+    // override is caught by validateNativeTlsBuildConfig.
+    const tls_dynamic_reload_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS", 0);
     const tls_acme_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_ACME_ENABLED", false);
     const tls_acme_cert_dir = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_CERT_DIR", "") catch unreachable;
     errdefer allocator.free(tls_acme_cert_dir);
@@ -2875,13 +2871,6 @@ pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
 pub const is_appliance_tls_profile =
     std.mem.eql(u8, build_options.tls_profile, "appliance");
 
-/// True when this binary was built without the OpenSSL adapter
-/// (`-Dtls-profile=appliance` or `-Dtls-profile=native`, #634): TCP TLS
-/// termination runs on the native pure-Zig path and every
-/// OpenSSL-adapter-only capability must fail deterministically at config
-/// validation instead of being silently ignored.
-pub const is_native_tls_build = !build_options.tls_openssl_adapter;
-
 /// #488: native (pure-Zig) resumption mode this config resolves to. Callers
 /// must only rely on this after `validate()` has succeeded — an unrecognized
 /// raw string falls back to `.disabled`, the safe default, rather than
@@ -2992,24 +2981,22 @@ fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
 /// appliance-appropriate defaults for `tls_min_version` and the session
 /// cache/ticket flags), so a config that never touches these settings
 /// always passes.
-/// #634: capability gate shared by every native-TLS build
-/// (`-Dtls-profile=appliance` and `-Dtls-profile=native`). These are
-/// implementation limits of the native TCP TLS path — settings only the
-/// OpenSSL adapter implements must fail deterministically at validation
-/// time rather than being silently ignored by a build that never
-/// constructs the adapter. Appliance-only *product policy* (single
-/// identity, required server name, HTTP/3 feature restrictions) lives in
-/// `validateApplianceTlsProfile`/`validateTlsServerNamePolicy` instead.
+/// #634/#649: capability gate shared by every TLS profile — `general` and
+/// `appliance` are both native-only builds. These are implementation
+/// limits of the native TCP TLS path — settings only the retired OpenSSL
+/// adapter implemented must fail deterministically at validation time
+/// rather than being silently ignored. Appliance-only *product policy*
+/// (single identity, required server name, HTTP/3 feature restrictions)
+/// lives in `validateApplianceTlsProfile`/`validateTlsServerNamePolicy`
+/// instead.
 fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
-    if (!is_native_tls_build) return;
-
     // ACME is checked before the TLS-files gate below: enabling ACME is a
     // request to *obtain* credentials, so it is meaningful — and must fail
     // deterministically — precisely when no cert/key pair is configured
     // yet. Every check after the gate concerns behavior of an active local
     // identity and is inert without one.
     if (cfg.tls_acme_enabled) {
-        logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (the ACME client is OpenSSL-adapter-only until its native implementation lands, #634)", .{});
+        logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (ACME issuance/renewal is not implemented by native Tardigrade and #649 retired the only production build that ever supported it, #634)", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
 
@@ -4253,7 +4240,6 @@ test "#368 Slice 3: parseEarlyDataReplayMaxEntriesConfig rejects malformed input
 }
 
 test "native-TLS build defaults never trip the native or appliance validation gates" {
-    if (!is_native_tls_build) return;
     const allocator = std.testing.allocator;
     var cfg = try loadFromEnv(allocator);
     defer cfg.deinit(allocator);
@@ -4261,8 +4247,7 @@ test "native-TLS build defaults never trip the native or appliance validation ga
     try validateApplianceTlsProfile(&cfg);
 }
 
-test "native-TLS builds reject OpenSSL-adapter-only TLS settings one at a time" {
-    if (!is_native_tls_build) return;
+test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
     const allocator = std.testing.allocator;
 
     const cert_path = "tests/fixtures/tls/native_ed25519.crt";
@@ -4395,7 +4380,6 @@ test "appliance profile rejects a configured server name with no credential file
 }
 
 test "native-TLS builds reject PROXY protocol, credential watching, and OCSP auto-refresh with TLS active" {
-    if (!is_native_tls_build) return;
     const allocator = std.testing.allocator;
 
     var base = try loadFromEnv(allocator);

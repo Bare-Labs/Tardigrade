@@ -2984,7 +2984,6 @@ fn ipHashIndex(client_ip: []const u8, len: usize) usize {
 pub const WorkerContext = struct {
     config_store: *ReloadableConfigStore,
     state: *GatewayState,
-    tls: ?*http.tls_termination.TlsTerminator,
     native_credentials: ?*http.native_tls_connection.NativeCredentialStore,
     /// Borrowed credential provider used by the native TCP TLS accept path.
     /// Appliance profile: borrowed from the `ApplianceCredentials` owner.

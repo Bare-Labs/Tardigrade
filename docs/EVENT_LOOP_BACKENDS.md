@@ -68,10 +68,14 @@ detail in [`docs/CONCURRENCY.md`](CONCURRENCY.md):
      (#137) is off. The main loop's `event_loop.wait()` result checks
      `ev.fd == listen_fd and !sharding_enabled` before calling
      `gaccept.acceptReadyConnections`.
-  2. **Parked HTTP/1 keepalive readiness** for the legacy blocking
-     OpenSSL/plaintext path (`src/http/keepalive_park.zig`'s
-     `ParkedRegistry`, #138) — the idle gap between requests on a
-     keep-alive connection served by a worker.
+  2. **Parked HTTP/1 keepalive readiness** for the legacy blocking plaintext
+     path (`src/http/keepalive_park.zig`'s `ParkedRegistry`, #138) — the idle
+     gap between requests on a keep-alive connection served by a worker. This
+     path's `DownstreamTransport.openssl` variant is a #649 holdover: the
+     `tls_termination.zig` `TlsTerminator`/`TlsConnection` types it wraps are
+     permanently inert (`TlsTerminator.init` always returns
+     `error.ContextInitFailed`), so in practice this role only ever parks
+     plaintext connections today.
   3. **Active managed/native downstream readiness and drive scheduling**
      for the optional pure-Zig (`native_tls_provider`) TLS path
      (`src/http/downstream_connection.zig`'s `ActiveRegistry` /
@@ -92,7 +96,7 @@ detail in [`docs/CONCURRENCY.md`](CONCURRENCY.md):
      the shared `EventLoop`. So the shared loop's role for this path,
      like for parked keepalive, is bounding idle/handshake wait time off
      a worker thread — not driving the request hot path.
-  Request processing on the default OpenSSL/plaintext path is unaffected by
+  Request processing on the legacy blocking plaintext path is unaffected by
   any of this: it never touches `EventLoop` and blocks on the worker thread
   for its full lifecycle.
 - When listener sharding (#137) is enabled
@@ -108,9 +112,10 @@ detail in [`docs/CONCURRENCY.md`](CONCURRENCY.md):
 - Accepted connections are dispatched to a bounded `WorkerPool`
   (`src/http/worker_pool.zig`) of OS threads, but "one worker owns the whole
   connection lifecycle uninterrupted" is only accurate for the legacy
-  OpenSSL/plaintext path — there a worker does own one connection's full
-  synchronous lifecycle (TLS handshake, HTTP parse, proxy/serve, response
-  write) using **blocking** socket calls
+  blocking plaintext path — there a worker does own one connection's full
+  synchronous lifecycle (HTTP parse, proxy/serve, response write; no TLS
+  handshake, since this path never carries live TLS after #649) using
+  **blocking** socket calls
   (`read`/`write`/`poll`/`SO_RCVTIMEO`/`SO_SNDTIMEO`) with no handoff back to
   `EventLoop` until an idle keepalive gap. For the native-TLS path, a worker
   instead owns *active request/handshake processing*: a connection can yield
@@ -203,14 +208,16 @@ at all unless a separate future change first migrates them onto the shared
 - **Complexity / maintenance:** Already implemented, tested, and in
   production use (398 lines, unit-tested for both backends via CI matrix).
   Zero incremental maintenance cost to keep it.
-- **TLS/encrypted-stream integration:** Already fully integrated for both
-  TLS paths — `keepalive_park.zig` moves the legacy blocking `TlsConnection`
-  (OpenSSL) state off the worker stack across the idle gap, and
-  `downstream_connection.ActiveRegistry`/`ManagedConnection` does the
-  analogous thing for the optional pure-Zig native TLS path (handshake wait
-  and idle-between-requests wait). In both cases the event loop only tracks
-  fd readiness; it never touches TLS record state or drives handshake/record
-  processing itself.
+- **TLS/encrypted-stream integration:** Already fully integrated — since
+  #649 retired the OpenSSL downstream terminator, the native pure-Zig TLS
+  path is the only one that ever carries live TLS state, and
+  `downstream_connection.ActiveRegistry`/`ManagedConnection` moves it off the
+  worker stack across handshake wait and the idle-between-requests gap.
+  `keepalive_park.zig`'s parking still exists for the legacy blocking path,
+  but that path is plaintext-only now (its `TlsConnection` wrapper is
+  permanently inert). In both roles the event loop only tracks fd readiness;
+  it never touches TLS record state or drives handshake/record processing
+  itself.
 - **Proxy streaming / backpressure:** Already integrated with #139's
   streaming relay and #140's (now closed) watermark/buffer-accounting work,
   which are both built on synchronous blocking reads/writes, not on
@@ -255,8 +262,9 @@ at all unless a separate future change first migrates them onto the shared
 - Pulling in `libxev` as a dependency also cuts against the project's
   documented "core Zig only" direction for the data plane (see
   `docs/UPSTREAM_POOLING.md`'s HTTP/2 upstream work, which built h2 framing
-  in-repo rather than take an external dependency, keeping OpenSSL as the
-  one intentional exception).
+  in-repo rather than take an external dependency; #649 has since retired
+  OpenSSL as a production dependency too, so there is no longer any
+  intentional exception to that direction).
 - **Verdict:** Not justified now. Revisit only if/when the handler model
   itself is being redesigned around non-blocking I/O for other reasons.
 
@@ -322,10 +330,11 @@ at all unless a separate future change first migrates them onto the shared
   spanning all three current `EventLoop` responsibilities — that never
   drives per-request I/O in this codebase's current architecture.
 - **TLS/encrypted-stream integration:** Would not change — TLS record
-  handling (both the legacy OpenSSL path and the native pure-Zig path)
-  happens inside the blocking worker once a connection is checked out, not
-  in the event loop, so `io_uring` adoption at the readiness/idle-wait
-  boundary described above would not touch TLS state machines either way.
+  handling (the native pure-Zig path; the legacy path is plaintext-only
+  since #649) happens inside the blocking worker once a connection is
+  checked out, not in the event loop, so `io_uring` adoption at the
+  readiness/idle-wait boundary described above would not touch TLS state
+  machines either way.
 - **Proxy streaming and backpressure:** No expected interaction with #139
   (streaming relay) or #140 (watermark backpressure) as currently designed,
   since both operate on synchronous blocking reads/writes inside worker
@@ -353,7 +362,7 @@ at all unless a separate future change first migrates them onto the shared
 | Linux fast path today | Proven, readiness-only role (accept/park/native-active) | Same as A | Needs non-blocking rewrite to pay off | Not production-ready on 0.16 for socket path | Real upside only for non-blocking, high-fan-out I/O Tardigrade doesn't have yet |
 | macOS support | Native (`kqueue`) | Native | Native (kqueue backend) | Blocked on 0.16 maturity | None — Linux-only, needs feature-flag gate |
 | Complexity / maintenance | Already paid for | Refactor cost, no new capability | New dependency + handler rewrite | Blocked, not a maintenance question yet | High — new SQ/CQ lifecycle, cancellation model |
-| TLS integration | Done for both OpenSSL (park) and native (active registry) paths, out of event loop's path | Unaffected | Would need rework if handler goes non-blocking | Unaffected until viable | Unaffected (TLS stays in worker) |
+| TLS integration | Done for the native (active registry) path, out of event loop's path; park path is plaintext-only since #649 | Unaffected | Would need rework if handler goes non-blocking | Unaffected until viable | Unaffected (TLS stays in worker) |
 | Proxy streaming/backpressure (#139/#140) | Built on blocking relay, already integrated | Unaffected | Would require redesign | Already broke FastCGI in production (Phase 2) | No interaction as currently designed |
 | Timers/cancellation/parking/drain | Implemented, no known bottleneck | Unaffected | Would move into libxev's model | Unaffected until viable | Unchanged at readiness-only boundary — reaper/drain untouched |
 | Prototype required to decide? | N/A (shipped) | No | Only if handler model changes | No — blocked on toolchain, not on prototyping | Built, opt-in, unbenchmarked (Phase 1) |
