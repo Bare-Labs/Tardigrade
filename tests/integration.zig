@@ -17650,6 +17650,55 @@ test "native upstream https: verified request to a trusted upstream succeeds" {
     try assertContains(response.body, "native-upstream-trusted-body");
 }
 
+// #646: the shared TLS 1.3 handshake engine used to hard-cap every peer
+// `CertificateEntry` at 2 KiB and the whole Certificate message at 8 KiB,
+// rejecting otherwise-valid public WebPKI leaves before the verifier ever
+// ran. `native_ed25519_bigsan_chain.crt` is a CA-issued Ed25519 leaf (CN
+// `tardigrade.test`, issued by `native_ed25519_bigsan_ca.crt`) carrying 61
+// SAN DNS names — an ordinary large-multi-domain-certificate shape, and
+// deliberately kept under `pki.x509`'s independent (pre-existing, unrelated
+// to this issue) 64-entry `max_general_names` SAN parse limit — whose DER
+// encoding is ~3.3 KiB: comfortably past the old 2 KiB per-entry cap (this
+// test would have failed closed against it before this fix) and
+// comfortably under the current one.
+test "native upstream https: verified request to an upstream with a large-SAN certificate succeeds" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    const ca_cert = try upstreamTlsFixture("native_ed25519_bigsan_ca.crt", allocator);
+    defer allocator.free(ca_cert);
+
+    var origin = try startNativeUpstreamTardigrade(allocator, "native_ed25519_bigsan_chain.crt", "native-upstream-bigsan-body");
+    defer origin.stop();
+
+    const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
+    defer allocator.free(upstream_url);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location /secure/ {
+        \\    proxy_pass /;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URL", .value = upstream_url },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/secure/upstream-body",
+        .body = null,
+        .headers = &.{},
+    }, 10_000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "native-upstream-bigsan-body");
+}
+
 // Proves the native upstream client's mTLS wiring end-to-end: this PR is the
 // first place that loads a client identity and installs a
 // `FixedCredentialProvider` onto `UpstreamTlsConn` (`connect()`'s
