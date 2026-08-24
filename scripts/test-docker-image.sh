@@ -13,9 +13,10 @@ CONTAINER_NAME="tardigrade-smoke-test"
 TMPDIR="$(mktemp -d)"
 
 PIDCHECK_CONTAINER_NAME="${CONTAINER_NAME}-pidcheck"
+AUDIT_CONTAINER_NAME="${CONTAINER_NAME}-audit"
 
 cleanup() {
-    docker rm -f "$CONTAINER_NAME" "$PIDCHECK_CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$CONTAINER_NAME" "$PIDCHECK_CONTAINER_NAME" "$AUDIT_CONTAINER_NAME" >/dev/null 2>&1 || true
     docker rmi "$IMAGE_TAG" >/dev/null 2>&1 || true
     rm -rf "$TMPDIR"
 }
@@ -54,6 +55,22 @@ fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 docker build -t "$IMAGE_TAG" "$REPO_ROOT"
+
+# ── Audit the exact runtime binary for native-only linkage/identity ─────────
+# Composition must never be inferred from Dockerfile text alone: extract the
+# precise binary copied into the runtime stage and run the same linkage/
+# self-report audit the release pipeline runs, proving it links no
+# OpenSSL/libcrypto (or other foreign TLS/crypto/QUIC/H3) library and
+# self-reports the native production identity.
+docker create --name "$AUDIT_CONTAINER_NAME" "$IMAGE_TAG" >/dev/null
+docker cp "${AUDIT_CONTAINER_NAME}:/usr/local/bin/tardi" "$TMPDIR/tardi"
+docker rm -f "$AUDIT_CONTAINER_NAME" >/dev/null 2>&1
+chmod +x "$TMPDIR/tardi"
+"${REPO_ROOT}/scripts/audit-release-binary.sh" \
+    --binary "$TMPDIR/tardi" \
+    --profile general \
+    --output "$TMPDIR/dependency-inventory.json"
+echo "docker runtime binary: native-only linkage audit passed"
 
 # ── Runtime image must not contain Zig/compiler build tooling ───────────────
 if docker run --rm --entrypoint sh "$IMAGE_TAG" -c 'command -v zig' >/dev/null 2>&1; then

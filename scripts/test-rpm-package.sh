@@ -72,9 +72,9 @@ docker run --pull=never --rm \
     --volume "${ZIG_DIR}:/opt/zig:ro" \
     "$RPM_TEST_IMAGE" bash -euxc '
         # Rocky minor repos can briefly offer a newer best candidate before all
-        # matching dependency packages are mirrored. The smoke test only needs a
-        # coherent distro-provided OpenSSL development stack.
-        if ! dnf --setopt=retries=3 --nobest install -y rpm-build openssl-devel openssl-libs systemd-rpm-macros; then
+        # matching dependency packages are mirrored. jq is required by
+        # packaging/rpm/build.sh to validate the native-linkage audit result.
+        if ! dnf --setopt=retries=3 --nobest install -y rpm-build systemd-rpm-macros jq; then
             echo "CI infrastructure failure: dnf dependency bootstrap failed in RPM smoke setup" >&2
             exit 75
         fi
@@ -114,6 +114,28 @@ docker run --pull=never --rm \
         rpm_path=$(find /output -name "tardigrade-*.rpm" | head -1)
         test -n "$rpm_path"
         test -f "$rpm_path"
+
+        # Regression: the standalone builder must not accept a caller-asserted
+        # OpenSSL backend as a valid production mode (#650).
+        if /repo/packaging/rpm/build.sh \
+            --version 0.0.0 \
+            --arch "$zig_arch" \
+            --binary /tmp/tardigrade/zig-out/bin/tardi \
+            --tls-backend openssl-adapter \
+            --output /output/rejected 2>/dev/null; then
+            echo "FAIL: rpm builder accepted --tls-backend openssl-adapter" >&2
+            exit 1
+        fi
+        echo "rpm builder: --tls-backend openssl-adapter correctly rejected"
+
+        # Regression: package metadata must declare no OpenSSL runtime dependency.
+        rpm_requires="$(rpm -qp --requires "$rpm_path")"
+        if printf "%s\n" "$rpm_requires" | grep -qiE "libssl|libcrypto|openssl"; then
+            echo "FAIL: native RPM unexpectedly declares an OpenSSL dependency:" >&2
+            printf "%s\n" "$rpm_requires" >&2
+            exit 1
+        fi
+        echo "rpm metadata: no OpenSSL dependency"
 
         dnf --setopt=retries=3 install -y "$rpm_path"
 
