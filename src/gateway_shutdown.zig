@@ -11,7 +11,6 @@ const edge_config = @import("edge_config.zig");
 const gp = @import("gateway_proxy.zig");
 const gc = @import("gateway_connection.zig");
 const gs = @import("gateway_state.zig");
-const gprotocol_policy = @import("gateway_protocol_policy.zig");
 
 const GatewayState = gs.GatewayState;
 const WorkerContext = gs.WorkerContext;
@@ -249,8 +248,8 @@ pub fn hotReloadConfig(
     // #629's mixed TLS-adapter/native-HTTP3 composition — stable TCP served
     // by the OpenSSL `TlsTerminator` while native HTTP/3 used its own
     // `NativeCredentialStore` — no longer exists: #649 retired the OpenSSL
-    // production backend, so `worker_ctx.tls` (the downstream terminator
-    // slot) is always null and every credential owner is native.
+    // production backend and the downstream terminator slot entirely, so
+    // every credential owner is native.
     var prepared_native_credentials: ?http.native_tls_connection.NativeCredentialStore.PreparedReload = null;
     defer if (prepared_native_credentials) |*prepared| prepared.deinit();
     if (worker_ctx.native_credentials) |store| {
@@ -304,20 +303,6 @@ pub fn hotReloadConfig(
             state.metrics.recordTicketKeyReload(.reload_accepted);
             state.metrics_mutex.unlock();
         }
-    }
-    if (worker_ctx.tls) |tls| {
-        tls.updateProtocolPolicy(gprotocol_policy.listenerPolicyFromConfig(cfg_ptr)) catch |err| {
-            worker_ctx.config_store.destroyVersion(prepared_version);
-            const msg = std.fmt.bufPrint(&state.last_reload_error, "TLS policy update failed: {}", .{err}) catch "TLS policy update failed";
-            state.reload_mutex.lock();
-            state.last_reload_ok = false;
-            state.last_reload_at_ms = now_ms;
-            state.last_reload_error_len = msg.len;
-            state.reload_mutex.unlock();
-            state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload rejected by TLS protocol policy update: {}", .{err});
-            return;
-        };
     }
     if (worker_ctx.native_credentials) |store| {
         if (prepared_native_credentials) |*prepared| {
@@ -574,10 +559,10 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 // #649: retired "#368 Slice 3: hotReloadConfig rejects a combined
 // replay+protocol-policy reload atomically..." — it drove a real
 // `http.tls_termination.TlsTerminator.init()` to prove ordering against the
-// OpenSSL terminator specifically; that terminator no longer exists in any
-// shipping build (`TlsTerminator.init` now always fails closed with
-// `error.ContextInitFailed`). `earlyDataReplayConfigChanged` above still
-// covers the ordering-independent comparator logic in every profile.
+// OpenSSL terminator specifically; that terminator, and the downstream
+// `TlsTerminator`/`TlsConnection` type pair entirely, no longer exist in
+// any shipping build. `earlyDataReplayConfigChanged` above still covers
+// the ordering-independent comparator logic in every profile.
 
 test "applianceCredentialConfigChanged detects credential-affecting fields" {
     const allocator = std.testing.allocator;
@@ -650,10 +635,10 @@ test "applianceCredentialConfigChanged rejects plaintext-to-TLS and TLS-to-plain
 // #649: retired the #629 mixed TLS-adapter/native-HTTP3 composition tests
 // and their fixture helpers (`setupMixedFixture`, `MixedReloadHarness`,
 // `LoadedIdentity`, `expectTcpLeaf`/`expectTcpSniLeaf`, ...) — the OpenSSL
-// `TlsTerminator` those fixtures constructed no longer exists in any
-// shipping build, so the scenario they proved (stable TCP and native
-// HTTP/3 serving from two independent credential owners) can no longer
-// occur; `worker_ctx.tls` is always null now.
+// `TlsTerminator` those fixtures constructed no longer exists at all (not
+// even as an inert stub; `WorkerContext` no longer has a `tls` field), so
+// the scenario they proved (stable TCP and native HTTP/3 serving from two
+// independent credential owners) can no longer occur.
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
     // Warn when restart-only path/URL fields differ; they are NOT rebound here.

@@ -310,15 +310,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var config_store = try ReloadableConfigStore.initBorrowed(state_allocator, cfg);
     defer config_store.deinit();
     var http3_runtime: ?http.http3_runtime.Runtime = null;
-    var tls_terminator: ?http.tls_termination.TlsTerminator = null;
     var native_credentials: ?http.native_tls_connection.NativeCredentialStore = null;
     // #488: one process-scoped native resumption runtime, shared by every
-    // native TCP connection and by the QUIC/H3 runtime — never by the
-    // OpenSSL terminator, which owns its own independent session cache
-    // (`tls_terminator`/`tls_session_*` above). Declared and deferred here,
-    // ahead of every borrower below, so its teardown runs last: after
-    // `http3_runtime`, the active/parked connection registries, and every
-    // dynamically accepted native connection have already torn down.
+    // native TCP connection and by the QUIC/H3 runtime. Declared and
+    // deferred here, ahead of every borrower below, so its teardown runs
+    // last: after `http3_runtime`, the active/parked connection registries,
+    // and every dynamically accepted native connection have already torn
+    // down.
     var native_resumption_entropy: tls_core.production_crypto.OsEntropy = .{};
     var native_resumption_provider: tls_core.production_crypto.Provider = undefined;
     var native_resumption_runtime: ?tls_core.resumption_runtime.Runtime = null;
@@ -400,7 +398,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
     defer if (native_credentials) |*store| store.deinit();
-    defer if (tls_terminator) |*tls| tls.deinit();
     const native_early_data_replay_composition = nativeEarlyDataReplayComposition(
         cfg.tls_native_early_data_replay_mode,
         native_resumption_runtime != null,
@@ -503,22 +500,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
     defer if (http3_runtime) |*runtime| runtime.deinit();
-    if (tls_terminator != null and native_credentials != null and
-        if (http3_runtime) |*runtime| runtime.snapshot().server_bootstrapped else false)
-    {
-        // #629: this is a mixed OpenSSL-TCP/native-HTTP3 composition, and
-        // native H3 is genuinely live (not just "credentials happened to
-        // load" — `server_bootstrapped` is the same signal
-        // `computeReloadedHttp3Advertisement` already uses to decide
-        // whether H3 is actually serving). Native H3's credential store can
-        // be independently hot-reloaded; suppress the OpenSSL terminator's
-        // own independent identity-reload watcher so its certificate/SNI
-        // identity cannot drift away from H3's outside a coordinated
-        // restart. Checked here (after HTTP/3 bootstrap, not right after
-        // credential load) so a QUIC bootstrap failure doesn't lock TCP's
-        // identity into restart-only for a protocol that never came up.
-        tls_terminator.?.setIdentityReloadEnabled(false);
-    }
     // NOTE (#138): defaulting worker_threads to CPU count is correct for a
     // non-blocking event loop, but Tardigrade currently uses a thread-per-
     // connection blocking model where a worker is held for a connection's whole
@@ -538,7 +519,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var worker_ctx = WorkerContext{
         .config_store = &config_store,
         .state = &state,
-        .tls = if (tls_terminator) |*tls| tls else null,
         .native_credentials = if (native_credentials) |*store| store else null,
         .native_tls_provider = native_tls_provider,
         .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
@@ -917,7 +897,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             gshutdown.runActiveHealthChecks(current_cfg, &state, worker_ctx.config_store);
             gshutdown.runDnsDiscoveryRefresh(current_cfg, &state);
             gshutdown.runProxyCacheMaintenance(current_cfg, &state);
-            if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
             // Close keepalive connections idle longer than the keepalive timeout
             // while parked off the worker pool (#138).
             _ = parked.reapIdle(http.event_loop.monotonicMs(), current_cfg.keep_alive_timeout_ms);
@@ -1259,8 +1238,9 @@ fn isBenignDisconnect(err: anyerror) bool {
     };
 }
 
-/// Serve exactly one HTTP/1.1 request on `conn` (a `*TlsConnection` or a
-/// plaintext `NetStream`), then decide what to do with the connection.
+/// Serve exactly one HTTP/1.1 request on `conn` (a plaintext `NetStream` or
+/// a native TLS connection stream), then decide what to do with the
+/// connection.
 fn serveOneRequest(
     ctx: *WorkerContext,
     conn: anytype,
@@ -1317,12 +1297,11 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         return;
     };
 
-    // Ownership of session/fd/TLS transfers to the parked registry on `park`.
+    // Ownership of session/fd transfers to the parked registry on `park`.
     // Until then, this teardown runs on every other exit (set `transferred` to
     // skip it once ownership has moved).
     var transferred = false;
-    var tls_to_park: ?http.tls_termination.TlsConnection = null;
-    defer if (!transferred) closeNewConnection(ctx, client_fd, session, tls_to_park);
+    defer if (!transferred) closeNewConnection(ctx, client_fd, session);
 
     const owned_connection_ip = gconn.clientIpFromFd(ctx.state.allocator, client_fd) catch null;
     var transferred_ip = false;
@@ -1349,76 +1328,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     else
         cfg.keep_alive_timeout_ms;
 
-    if (ctx.tls) |tls| {
-        gconn.setNonBlocking(client_fd, false) catch |err| {
-            ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
-            return;
-        };
-        // Apply the TLS handshake timeout before PROXY protocol parsing and
-        // SSL_accept. Falls back to keep_alive_timeout_ms when not explicitly
-        // configured so the old behavior is preserved for operators that haven't
-        // set the new field.
-        if (handshake_timeout_ms > 0) {
-            gconn.setSocketTimeoutMs(client_fd, handshake_timeout_ms, handshake_timeout_ms) catch |err| {
-                ctx.state.logger.warn(null, "failed to set client handshake timeout: {}", .{err});
-            };
-        }
-
-        // Parse PROXY protocol header from the raw TCP socket before SSL_accept.
-        // The PROXY header is plaintext even on TLS connections and must be
-        // consumed before OpenSSL sees the TLS ClientHello.
-        if (cfg.proxy_protocol_mode != .off and !session.proxy_protocol_checked) {
-            gconn.peekAndConsumeProxyHeaderFromRawFd(
-                client_fd,
-                cfg.proxy_protocol_mode,
-                &session.proxy_client_ip_buf,
-                &session.proxy_client_ip_len,
-            ) catch |err| {
-                ctx.state.logger.warn(null, "proxy protocol parse failed on TLS connection: {}", .{err});
-                return;
-            };
-            session.proxy_protocol_checked = true;
-        }
-        const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
-        var tls_conn = tls.acceptWithPolicy(client_fd, tls_protocol_policy) catch |err| {
-            if (http.tls_termination.lastOpenSslError(ctx.state.allocator)) |openssl_err| {
-                defer ctx.state.allocator.free(openssl_err);
-                ctx.state.logger.warn(null, "tls handshake error: {} ({s})", .{ err, openssl_err });
-            } else {
-                ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
-            }
-            return;
-        };
-        tls_conn.attachBufferMetrics(&ctx.state.metrics, &ctx.state.metrics_mutex);
-        // The TLS object now needs teardown on every exit; record it so the
-        // teardown defer (or a failed park) frees it exactly once.
-        tls_to_park = tls_conn;
-
-        // Handshake complete — switch to request-phase timeouts.
-        // SO_RCVTIMEO covers header/body reads; SO_SNDTIMEO covers response writes.
-        if (header_timeout_ms > 0 or write_timeout_ms > 0) {
-            gconn.setSocketTimeoutMs(client_fd, header_timeout_ms, write_timeout_ms) catch |err| {
-                ctx.state.logger.warn(null, "failed to set post-handshake socket timeout: {}", .{err});
-            };
-        }
-
-        var served: u32 = 0;
-        const negotiated = tls_conn.validatedNegotiatedProtocol() catch |err| {
-            ctx.state.logger.err(null, "negotiated HTTP protocol error: {}", .{err});
-            return;
-        };
-        const dispatch_result = dispatchNegotiatedHttp(ctx, &tls_conn, negotiated, session, cfg, connection_ip, &served) catch |err| {
-            tls_to_park = tls_conn;
-            ctx.state.logger.err(null, "negotiated HTTP dispatch error: {}", .{err});
-            return;
-        };
-        tls_to_park = tls_conn;
-        if (dispatch_result == .park) {
-            transferred = true;
-            parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
-        }
-        return;
-    } else if (ctx.native_tls_provider) |native_provider| {
+    if (ctx.native_tls_provider) |native_provider| {
         if (cfg.proxy_protocol_mode != .off) {
             ctx.state.logger.warn(null, "native TLS path does not support PROXY protocol preface parsing yet", .{});
             return;
@@ -1509,7 +1419,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             .serve_again => {},
             .park => {
                 transferred = true;
-                parkConnection(ctx, client_fd, session, null, served, connection_ip);
+                parkConnection(ctx, client_fd, session, served, connection_ip);
                 return;
             },
             .close => return,
@@ -1519,34 +1429,19 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
 
 fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnection) void {
     var served = pc.served;
-    if (pc.tls) |*tls_conn| {
-        while (true) switch (serveOneRequest(ctx, tls_conn, pc.session, pc.ip(), &served, false)) {
-            .serve_again => {},
-            .park => {
-                pc.served = served;
-                reparkConnection(ctx, pc);
-                return;
-            },
-            .close => {
-                ctx.parked.closeSlot(pc, .peer);
-                return;
-            },
-        };
-    } else {
-        const stream = compat.netStreamFromFd(pc.fd);
-        while (true) switch (serveOneRequest(ctx, stream, pc.session, pc.ip(), &served, false)) {
-            .serve_again => {},
-            .park => {
-                pc.served = served;
-                reparkConnection(ctx, pc);
-                return;
-            },
-            .close => {
-                ctx.parked.closeSlot(pc, .peer);
-                return;
-            },
-        };
-    }
+    const stream = compat.netStreamFromFd(pc.fd);
+    while (true) switch (serveOneRequest(ctx, stream, pc.session, pc.ip(), &served, false)) {
+        .serve_again => {},
+        .park => {
+            pc.served = served;
+            reparkConnection(ctx, pc);
+            return;
+        },
+        .close => {
+            ctx.parked.closeSlot(pc, .peer);
+            return;
+        },
+    };
 }
 
 fn dispatchNegotiatedHttp(
@@ -1586,19 +1481,14 @@ const GatewayHttpRuntime = struct {
     }
 };
 
-/// Tear down a connection that was never parked: TLS shutdown, socket close,
-/// pooled-session release, and connection-slot release. Mirrors the registry's
-/// teardown so a connection is accounted identically whichever path closes it.
+/// Tear down a connection that was never parked: socket close, pooled-session
+/// release, and connection-slot release. Mirrors the registry's teardown so a
+/// connection is accounted identically whichever path closes it.
 fn closeNewConnection(
     ctx: *WorkerContext,
     fd: std.posix.fd_t,
     session: *ConnectionSession,
-    tls_conn: ?http.tls_termination.TlsConnection,
 ) void {
-    if (tls_conn) |t| {
-        var tt = t;
-        tt.deinit();
-    }
     _ = std.c.close(fd);
     ctx.session_pool.release(session);
     ctx.state.releaseConnectionSlot(fd);
@@ -1610,13 +1500,12 @@ fn parkConnection(
     ctx: *WorkerContext,
     fd: std.posix.fd_t,
     session: *ConnectionSession,
-    tls_conn: ?http.tls_termination.TlsConnection,
     served: u32,
     connection_ip: []const u8,
 ) void {
     const now = http.event_loop.monotonicMs();
-    const pc = ctx.parked.parkNew(fd, session, tls_conn, served, connection_ip, now) catch {
-        closeNewConnection(ctx, fd, session, tls_conn);
+    const pc = ctx.parked.parkNew(fd, session, served, connection_ip, now) catch {
+        closeNewConnection(ctx, fd, session);
         return;
     };
     ctx.event_loop.add(fd, pc.eventInterest()) catch {

@@ -50,8 +50,9 @@ pub fn daysUntilExpiry(cert_path: []const u8) ?i64 {
     return null;
 }
 
-/// The ACME issuance/renewal workflow is unavailable in the appliance profile.
-/// Fail closed with an inspectable error instead of a hidden no-op.
+/// The ACME issuance/renewal workflow is unavailable in every profile
+/// (#649: no OpenSSL-backed implementation remains). Fail closed with an
+/// inspectable error instead of a hidden no-op.
 pub fn runOnce(opts: AcmeOptions) AcmeError!void {
     _ = opts;
     return error.AcmeProtocolError;

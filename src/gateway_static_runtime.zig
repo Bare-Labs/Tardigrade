@@ -277,8 +277,8 @@ pub fn writeStaticServedResponse(
     if (served.file_path) |file_path| {
         if (@TypeOf(conn) == compat.NetStream) {
             // conn is always a raw plaintext socket here: TLS connections use
-            // *TlsConnection (a different type), which fails the TypeOf check
-            // above and causes static_file.serve to return a body instead of a
+            // a different connection type, which fails the TypeOf check above
+            // and causes static_file.serve to return a body instead of a
             // file_path. NetStream.inner is therefore always null at this point.
             var in_fc = try std.Io.Dir.openFileAbsolute(compat.io(), file_path, .{});
             defer in_fc.close(compat.io());

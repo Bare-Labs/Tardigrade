@@ -520,9 +520,7 @@ pub const Response = struct {
 fn classifyWriterMode(comptime Writer: type, header_only: bool) metrics_mod.ResponseWriteMode {
     _ = header_only;
     const name = @typeName(Writer);
-    if (std.mem.indexOf(u8, name, "tls_termination.TlsConnection.Writer") != null or
-        std.mem.indexOf(u8, name, "encrypted_stream_connection.EncryptedStreamHttpConnection.Writer") != null)
-    {
+    if (std.mem.indexOf(u8, name, "encrypted_stream_connection.EncryptedStreamHttpConnection.Writer") != null) {
         return .tls_buffered;
     }
     return .fallback;

@@ -6,7 +6,6 @@ const metrics_mod = @import("metrics.zig");
 const native_tls_connection = @import("native_tls_connection.zig");
 const request_mod = @import("request.zig");
 const response_mod = @import("response.zig");
-const tls_termination = @import("tls_termination.zig");
 const hpack = @import("hpack.zig");
 
 const encrypted_stream = tls_core.encrypted_stream;
@@ -31,20 +30,13 @@ pub const EncryptedWait = union(enum) {
     stalled,
 };
 
-pub const OpenSslTransport = struct {
-    conn: *tls_termination.TlsConnection,
-    allocator: ?std.mem.Allocator = null,
-};
-
 pub const DownstreamTransport = union(enum) {
     plaintext: std.posix.fd_t,
-    openssl: OpenSslTransport,
     native: *native_tls_connection.NativeTlsConnection,
 
     pub fn rawFd(self: *const DownstreamTransport) std.posix.fd_t {
         return switch (self.*) {
             .plaintext => |fd| fd,
-            .openssl => |transport| transport.conn.rawFd(),
             .native => |conn| conn.rawFd(),
         };
     }
@@ -52,7 +44,6 @@ pub const DownstreamTransport = union(enum) {
     pub fn encryptedStream(self: *DownstreamTransport) ?encrypted_stream.EncryptedStream {
         return switch (self.*) {
             .plaintext => null,
-            .openssl => |transport| transport.conn.stream(),
             .native => |conn| conn.stream(),
         };
     }
@@ -60,7 +51,6 @@ pub const DownstreamTransport = union(enum) {
     pub fn pendingPlaintext(self: *const DownstreamTransport) usize {
         return switch (self.*) {
             .plaintext => 0,
-            .openssl => |transport| transport.conn.pending(),
             .native => |conn| conn.record.bufferSnapshot().current.inbound_plaintext,
         };
     }
@@ -68,7 +58,6 @@ pub const DownstreamTransport = union(enum) {
     pub fn readiness(self: *DownstreamTransport) encrypted_stream.Readiness {
         return switch (self.*) {
             .plaintext => .{ .wants_read = true, .can_write_plaintext = true },
-            .openssl => |transport| transport.conn.stream().readiness(),
             .native => |conn| conn.readiness(),
         };
     }
@@ -83,12 +72,6 @@ pub const DownstreamTransport = union(enum) {
     pub fn deinit(self: *DownstreamTransport) void {
         switch (self.*) {
             .plaintext => |fd| closeFd(fd),
-            .openssl => |transport| {
-                const fd = transport.conn.rawFd();
-                transport.conn.deinit();
-                if (fd >= 0) closeFd(fd);
-                if (transport.allocator) |allocator| allocator.destroy(transport.conn);
-            },
             .native => |conn| conn.destroy(),
         }
         self.* = undefined;
