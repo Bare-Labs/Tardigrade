@@ -45,24 +45,116 @@ fi
 DEB_PATH="${OUTPUT_DIR}/tardigrade_${VERSION}_amd64.deb"
 test -f "$DEB_PATH"
 
+# ── Regression: the standalone builder must not accept a caller-asserted
+# OpenSSL backend as a valid production mode (#650) ─────────────────────────
+if "${REPO_ROOT}/packaging/deb/build.sh" \
+    --version "$VERSION" \
+    --arch amd64 \
+    --binary "$BINARY" \
+    --tls-backend openssl-adapter \
+    --output "${OUTPUT_DIR}/rejected" 2>/dev/null; then
+    echo "FAIL: deb builder accepted --tls-backend openssl-adapter" >&2
+    exit 1
+fi
+echo "deb builder: --tls-backend openssl-adapter correctly rejected"
+
+# ── Regression: cross-architecture packaging via --audit-inventory (#650) ───
+# The audit-inventory path is what preserves cross-architecture packaging
+# without a caller-asserted backend flag; exercise it here (a non-executable
+# copy of the host binary stands in for a foreign-architecture artifact)
+# rather than leaving it validated only by hand.
+NONEXEC_BINARY="${TMPDIR}/tardi-nonexec"
+cp "$BINARY" "$NONEXEC_BINARY"
+chmod -x "$NONEXEC_BINARY"
+INVENTORY_PATH="${TMPDIR}/audit-inventory.json"
+"${REPO_ROOT}/scripts/audit-release-binary.sh" \
+    --binary "$BINARY" \
+    --profile general \
+    --output "$INVENTORY_PATH"
+"${REPO_ROOT}/packaging/deb/build.sh" \
+    --version "$VERSION" \
+    --arch amd64 \
+    --binary "$NONEXEC_BINARY" \
+    --audit-inventory "$INVENTORY_PATH" \
+    --output "${OUTPUT_DIR}/cross-arch"
+test -f "${OUTPUT_DIR}/cross-arch/tardigrade_${VERSION}_amd64.deb"
+echo "deb builder: --audit-inventory cross-architecture path succeeded"
+
+# A mismatched inventory (not generated for this exact binary) must be rejected.
+OTHER_INVENTORY="${TMPDIR}/audit-inventory-mismatched.json"
+jq '.binary_sha256 = "0000000000000000000000000000000000000000000000000000000000000"' \
+    "$INVENTORY_PATH" > "$OTHER_INVENTORY"
+if "${REPO_ROOT}/packaging/deb/build.sh" \
+    --version "$VERSION" \
+    --arch amd64 \
+    --binary "$NONEXEC_BINARY" \
+    --audit-inventory "$OTHER_INVENTORY" \
+    --output "${OUTPUT_DIR}/rejected-mismatch" 2>/dev/null; then
+    echo "FAIL: deb builder accepted an --audit-inventory with a mismatched SHA-256" >&2
+    exit 1
+fi
+echo "deb builder: mismatched --audit-inventory correctly rejected"
+
+# ── Regression: package metadata must declare no OpenSSL runtime dependency ──
+DEB_DEPENDS="$(dpkg-deb -f "$DEB_PATH" Depends 2>/dev/null || true)"
+if printf '%s\n' "$DEB_DEPENDS" | grep -qiE 'libssl|libcrypto|openssl'; then
+    echo "FAIL: native DEB unexpectedly declares an OpenSSL dependency: $DEB_DEPENDS" >&2
+    exit 1
+fi
+echo "deb metadata: no OpenSSL dependency"
+
 if ! retry 3 docker pull "$DEB_TEST_IMAGE"; then
     echo "CI infrastructure failure: unable to pull DEB smoke test image ($DEB_TEST_IMAGE)" >&2
     exit 75
 fi
 
-docker run --pull=never --rm -v "${OUTPUT_DIR}:/artifacts:ro" "$DEB_TEST_IMAGE" bash -euxc '
+docker run --pull=never --rm \
+    -v "${OUTPUT_DIR}:/artifacts:ro" \
+    -v "${REPO_ROOT}/scripts/audit-release-binary.sh:/opt/audit-release-binary.sh:ro" \
+    "$DEB_TEST_IMAGE" bash -euxc '
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get -o Acquire::Retries=3 update; then
         echo "CI infrastructure failure: apt index refresh failed in DEB smoke setup" >&2
         exit 75
     fi
-    if ! apt-get -o Acquire::Retries=3 install -y ca-certificates libssl3; then
+    if ! apt-get -o Acquire::Retries=3 install -y ca-certificates curl binutils; then
         echo "CI infrastructure failure: apt dependency bootstrap failed in DEB smoke setup" >&2
         exit 75
     fi
     apt-get -o Acquire::Retries=3 install -y /artifacts/tardigrade_0.0.0-smoke_amd64.deb
     test -x /usr/bin/tardi
     /usr/bin/tardi version >/dev/null
+
+    # Audit the exact binary actually installed by the package (#650) --
+    # metadata/layout checks alone would not catch a package that installs
+    # a binary linking OpenSSL, or one that mismatches its own reported
+    # identity.
+    bash /opt/audit-release-binary.sh \
+        --binary /usr/bin/tardi \
+        --profile general \
+        --output /tmp/deb-inventory.json
+
+    # A real request against the installed binary/config, not just `tardi
+    # version` (#650): start it with the same starter config the package
+    # ships, wait for a live response, then stop it.
+    tardi run -c /etc/tardigrade/tardigrade.conf &
+    tardi_pid=$!
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -fsS -H "Host: localhost" http://127.0.0.1:8069/health >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$ready" != true ]; then
+        echo "FAIL: installed tardi never became ready to serve /health" >&2
+        exit 1
+    fi
+    curl -fsS -H "Host: localhost" http://127.0.0.1:8069/health
+    kill "$tardi_pid"
+    wait "$tardi_pid" 2>/dev/null || true
+
     test -f /etc/tardigrade/tardigrade.conf
     test -f /etc/tardigrade/tardigrade.env
     test -f /lib/systemd/system/tardigrade.service

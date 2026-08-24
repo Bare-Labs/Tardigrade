@@ -72,9 +72,13 @@ docker run --pull=never --rm \
     --volume "${ZIG_DIR}:/opt/zig:ro" \
     "$RPM_TEST_IMAGE" bash -euxc '
         # Rocky minor repos can briefly offer a newer best candidate before all
-        # matching dependency packages are mirrored. The smoke test only needs a
-        # coherent distro-provided OpenSSL development stack.
-        if ! dnf --setopt=retries=3 --nobest install -y rpm-build openssl-devel openssl-libs systemd-rpm-macros; then
+        # matching dependency packages are mirrored. jq is required by
+        # packaging/rpm/build.sh to validate the native-linkage audit result;
+        # binutils (readelf) is required by scripts/audit-release-binary.sh.
+        # curl is not listed here: the base image already ships curl-minimal,
+        # which provides a fully working `curl` binary for the plain HTTP
+        # request below, and the full curl package conflicts with it.
+        if ! dnf --setopt=retries=3 --nobest install -y rpm-build systemd-rpm-macros jq binutils; then
             echo "CI infrastructure failure: dnf dependency bootstrap failed in RPM smoke setup" >&2
             exit 75
         fi
@@ -92,17 +96,21 @@ docker run --pull=never --rm \
         cd /tmp/tardigrade
         rm -rf zig-out .zig-cache
 
-        # glibc 2.34 (Rocky/RHEL 9'"'"'s version) merged libpthread into libc and
-        # re-versioned pthread_create/pthread_join/etc. under a new GLIBC_2.34
-        # symbol version. Zig'"'"'s default native-target glibc floor predates that,
-        # so it doesn'"'"'t know those symbol versions exist and dynamic linking
-        # against the real /usr/lib64/libssl.so fails with "undefined reference"
-        # even though the symbols are genuinely present at runtime. Passing an
-        # explicit glibc-version floor (not a ceiling -- linking is still against
-        # the real system libc.so.6 dynamically) fixes it; bare "native"/"native-native-gnu"
-        # does not, and was confirmed to reproduce the same failure.
+        # Before #649/#650, this needed an explicit glibc-version floor
+        # (`-Dtarget=$arch-linux-gnu.2.34`): glibc 2.34 (Rocky/RHEL 9'"'"'s
+        # version) merged libpthread into libc and re-versioned
+        # pthread_create/pthread_join/etc. under a new GLIBC_2.34 symbol
+        # version, and dynamically linking the OpenSSL adapter'"'"'s libssl.so
+        # pulled in those reversioned symbols before Zig'"'"'s default
+        # native-target glibc floor knew they existed, failing with
+        # "undefined reference" even though the symbols were genuinely
+        # present at runtime. Tardigrade'"'"'s native build links no OpenSSL (or
+        # any other foreign library) at all, so that failure no longer
+        # reproduces here -- confirmed by building this exact target with
+        # the bare native target and no explicit floor -- and the floor is
+        # not re-added.
         zig_arch="$(uname -m)"
-        zig build -Doptimize=ReleaseFast -Dtarget="${zig_arch}-linux-gnu.2.34"
+        zig build -Doptimize=ReleaseFast
         test -x zig-out/bin/tardi
 
         /repo/packaging/rpm/build.sh \
@@ -115,10 +123,104 @@ docker run --pull=never --rm \
         test -n "$rpm_path"
         test -f "$rpm_path"
 
+        # Regression: the standalone builder must not accept a caller-asserted
+        # OpenSSL backend as a valid production mode (#650). --output targets
+        # a container-local /tmp path, not the host-bind-mounted /output: this
+        # call is expected to fail before ever writing anything, but even the
+        # happy-path calls below must never write into /output as root, since
+        # the host-side cleanup afterward runs as the unprivileged CI user and
+        # cannot remove root-owned files/directories it creates there.
+        if /repo/packaging/rpm/build.sh \
+            --version 0.0.0 \
+            --arch "$zig_arch" \
+            --binary /tmp/tardigrade/zig-out/bin/tardi \
+            --tls-backend openssl-adapter \
+            --output /tmp/rejected 2>/dev/null; then
+            echo "FAIL: rpm builder accepted --tls-backend openssl-adapter" >&2
+            exit 1
+        fi
+        echo "rpm builder: --tls-backend openssl-adapter correctly rejected"
+
+        # Regression: cross-architecture packaging via --audit-inventory (#650).
+        # The audit-inventory path is what preserves cross-architecture
+        # packaging without a caller-asserted backend flag; exercise it here
+        # (a non-executable copy of the host binary stands in for a
+        # foreign-architecture artifact) rather than leaving it validated only
+        # by hand.
+        cp /tmp/tardigrade/zig-out/bin/tardi /tmp/tardi-nonexec
+        chmod -x /tmp/tardi-nonexec
+        /repo/scripts/audit-release-binary.sh \
+            --binary /tmp/tardigrade/zig-out/bin/tardi \
+            --profile general \
+            --output /tmp/audit-inventory.json
+        /repo/packaging/rpm/build.sh \
+            --version 0.0.0 \
+            --arch "$zig_arch" \
+            --binary /tmp/tardi-nonexec \
+            --audit-inventory /tmp/audit-inventory.json \
+            --output /tmp/output-cross-arch
+        test -n "$(find /tmp/output-cross-arch -name "tardigrade-*.rpm" -print -quit)"
+        echo "rpm builder: --audit-inventory cross-architecture path succeeded"
+
+        # A mismatched inventory (not generated for this exact binary) must be
+        # rejected.
+        jq ".binary_sha256 = \"0000000000000000000000000000000000000000000000000000000000000\"" \
+            /tmp/audit-inventory.json > /tmp/audit-inventory-mismatched.json
+        if /repo/packaging/rpm/build.sh \
+            --version 0.0.0 \
+            --arch "$zig_arch" \
+            --binary /tmp/tardi-nonexec \
+            --audit-inventory /tmp/audit-inventory-mismatched.json \
+            --output /tmp/output-rejected-mismatch 2>/dev/null; then
+            echo "FAIL: rpm builder accepted an --audit-inventory with a mismatched SHA-256" >&2
+            exit 1
+        fi
+        echo "rpm builder: mismatched --audit-inventory correctly rejected"
+
+        # Regression: package metadata must declare no OpenSSL runtime dependency.
+        rpm_requires="$(rpm -qp --requires "$rpm_path")"
+        if printf "%s\n" "$rpm_requires" | grep -qiE "libssl|libcrypto|openssl"; then
+            echo "FAIL: native RPM unexpectedly declares an OpenSSL dependency:" >&2
+            printf "%s\n" "$rpm_requires" >&2
+            exit 1
+        fi
+        echo "rpm metadata: no OpenSSL dependency"
+
         dnf --setopt=retries=3 install -y "$rpm_path"
 
         test -x /usr/bin/tardi
         /usr/bin/tardi version >/dev/null
+
+        # Audit the exact binary actually installed by the package (#650) --
+        # metadata/layout checks alone would not catch a package that installs
+        # a binary linking OpenSSL, or one that mismatches its own reported
+        # identity.
+        /repo/scripts/audit-release-binary.sh \
+            --binary /usr/bin/tardi \
+            --profile general \
+            --output /tmp/rpm-installed-inventory.json
+
+        # A real request against the installed binary/config, not just `tardi
+        # version` (#650): start it with the same starter config the package
+        # ships, wait for a live response, then stop it.
+        tardi run -c /etc/tardigrade/tardigrade.conf &
+        tardi_pid=$!
+        ready=false
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS -H "Host: localhost" http://127.0.0.1:8069/health >/dev/null 2>&1; then
+                ready=true
+                break
+            fi
+            sleep 1
+        done
+        if [ "$ready" != true ]; then
+            echo "FAIL: installed tardi never became ready to serve /health" >&2
+            exit 1
+        fi
+        curl -fsS -H "Host: localhost" http://127.0.0.1:8069/health
+        kill "$tardi_pid"
+        wait "$tardi_pid" 2>/dev/null || true
+
         test -f /etc/tardigrade/tardigrade.env
         test -f /etc/tardigrade/tardigrade.conf
         test -f /usr/lib/systemd/system/tardigrade.service

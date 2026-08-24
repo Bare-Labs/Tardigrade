@@ -155,8 +155,8 @@ validate_native_inventory() {
 
     gh release download "$TAG" --repo "$REPO" --pattern "$inventory_asset" --dir "$tmpdir" --clobber
     inventory_path="$tmpdir/$inventory_asset"
-    if [ "$(jq -r '.profile' "$inventory_path")" != "native" ] ||
-        [ "$(jq -r '.reported_profile' "$inventory_path")" != "native" ] ||
+    if [ "$(jq -r '.profile' "$inventory_path")" != "general" ] ||
+        [ "$(jq -r '.reported_profile' "$inventory_path")" != "general" ] ||
         [ "$(jq -r '.reported_backend' "$inventory_path")" != "native" ] ||
         [ "$(jq -r '.links_openssl' "$inventory_path")" != "false" ] ||
         [ "$(jq -r '.status' "$inventory_path")" != "pass" ]; then

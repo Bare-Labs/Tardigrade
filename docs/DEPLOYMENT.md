@@ -308,8 +308,13 @@ pinned Zig toolchain (matching `.github/workflows/ci.yml`) and the default
 build or run `tardi` itself (see
 [TLS_DEPENDENCY_POLICY.md](TLS_DEPENDENCY_POLICY.md)); the runtime stage
 contains only `tardi`, CA-certificate data, and a non-root `tardigrade`
-user. No Zig toolchain, source tree, OpenSSL package, or other foreign
-implementation library ships in the final image.
+user. Neither stage installs `libssl-dev`/`libssl3` or any other foreign
+TLS/crypto library for Tardigrade (#650); `ca-certificates` remains in the
+runtime image as ordinary OS trust-store substrate, not a Tardigrade
+implementation dependency. No Zig toolchain or source tree ships in the
+final image. `scripts/test-docker-image.sh` extracts the exact runtime
+binary and audits it with `scripts/audit-release-binary.sh` rather than
+inferring native-only composition from the Dockerfile text alone.
 
 ### Build
 

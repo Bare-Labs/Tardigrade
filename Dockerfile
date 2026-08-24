@@ -17,8 +17,8 @@ COPY . .
 RUN sh ./scripts/install-zig.sh 0.16.0 /opt/zig \
     && ln -s "$(find /opt/zig -maxdepth 3 -type f -name zig)" /usr/local/bin/zig
 
-# Default "general" TLS profile: pure-Zig native implementation, with no
-# OpenSSL build or runtime dependency.
+# Default "general" TLS profile: pure-Zig native (#649) — no OpenSSL/libcrypto
+# build dependency for Tardigrade itself (see docs/TLS_DEPENDENCY_POLICY.md).
 RUN zig build -Doptimize=ReleaseFast
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
