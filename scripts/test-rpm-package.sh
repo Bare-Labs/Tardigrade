@@ -124,13 +124,18 @@ docker run --pull=never --rm \
         test -f "$rpm_path"
 
         # Regression: the standalone builder must not accept a caller-asserted
-        # OpenSSL backend as a valid production mode (#650).
+        # OpenSSL backend as a valid production mode (#650). --output targets
+        # a container-local /tmp path, not the host-bind-mounted /output: this
+        # call is expected to fail before ever writing anything, but even the
+        # happy-path calls below must never write into /output as root, since
+        # the host-side cleanup afterward runs as the unprivileged CI user and
+        # cannot remove root-owned files/directories it creates there.
         if /repo/packaging/rpm/build.sh \
             --version 0.0.0 \
             --arch "$zig_arch" \
             --binary /tmp/tardigrade/zig-out/bin/tardi \
             --tls-backend openssl-adapter \
-            --output /output/rejected 2>/dev/null; then
+            --output /tmp/rejected 2>/dev/null; then
             echo "FAIL: rpm builder accepted --tls-backend openssl-adapter" >&2
             exit 1
         fi
@@ -153,8 +158,8 @@ docker run --pull=never --rm \
             --arch "$zig_arch" \
             --binary /tmp/tardi-nonexec \
             --audit-inventory /tmp/audit-inventory.json \
-            --output /output/cross-arch
-        test -n "$(find /output/cross-arch -name "tardigrade-*.rpm" -print -quit)"
+            --output /tmp/output-cross-arch
+        test -n "$(find /tmp/output-cross-arch -name "tardigrade-*.rpm" -print -quit)"
         echo "rpm builder: --audit-inventory cross-architecture path succeeded"
 
         # A mismatched inventory (not generated for this exact binary) must be
@@ -166,7 +171,7 @@ docker run --pull=never --rm \
             --arch "$zig_arch" \
             --binary /tmp/tardi-nonexec \
             --audit-inventory /tmp/audit-inventory-mismatched.json \
-            --output /output/rejected-mismatch 2>/dev/null; then
+            --output /tmp/output-rejected-mismatch 2>/dev/null; then
             echo "FAIL: rpm builder accepted an --audit-inventory with a mismatched SHA-256" >&2
             exit 1
         fi
