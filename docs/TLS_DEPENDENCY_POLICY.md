@@ -227,8 +227,13 @@ on macOS) and emits a machine-readable JSON inventory. It fails if:
 - an artifact's self-reported `tls-profile` disagrees with the profile it
   was built and audited as.
 
-The inventory records the binary, profile, host OS, inspection tool,
-self-reported backend, full dependency list, and any violations.
+The inventory records the binary, its SHA-256 checksum, profile, host OS,
+inspection tool, self-reported backend, full dependency list, and any
+violations. The checksum lets a consumer that cannot execute the binary
+itself — e.g. the standalone DEB/RPM builders packaging a cross-architecture
+artifact (`packaging/deb/build.sh`, `packaging/rpm/build.sh`) — bind an
+already-produced inventory to the exact artifact instead of trusting a
+caller-supplied backend flag.
 
 ### CI
 
@@ -257,9 +262,19 @@ release assets and SBOM.
 - **#645**/**#646** extended the native certificate-signature matrix and
   raised handshake size bounds so the native upstream client is usable
   against ordinary public-WebPKI origins.
-- **#649** (this cutover) made native the default and *only* selectable
-  production implementation: retired the OpenSSL adapter, `configureSsl`,
-  the `general`/`native` profile distinction (merged into a single native
+- **#649** made native the default and *only* selectable production
+  implementation: retired the OpenSSL adapter, `configureSsl`, the
+  `general`/`native` profile distinction (merged into a single native
   `general` tag), and every OpenSSL production source surface. #634 stays
   open for the distribution/packaging and final-release-proof work it also
   covers, which #649 does not.
+- **#650** finished the local/package/container distribution cutover left
+  open by #649: the root `Dockerfile` no longer installs `libssl-dev` or
+  `libssl3` for Tardigrade, its runtime binary is audited directly with
+  `scripts/audit-release-binary.sh` rather than inferred from Dockerfile
+  text, and the standalone `packaging/deb/build.sh`/`packaging/rpm/build.sh`
+  builders no longer accept `--tls-backend openssl-adapter` or emit an
+  OpenSSL runtime dependency — the packaged artifact's native identity is
+  always proven by the same audit script (self-audited for a host-executable
+  binary, or via a SHA-256-bound `--audit-inventory` file for
+  cross-architecture packaging) instead of a caller-supplied backend flag.

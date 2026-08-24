@@ -56,8 +56,8 @@ JSON
             dependency-inventory-tardigrade-linux-x86_64.json)
                 cat > "$dir/dependency-inventory-tardigrade-linux-x86_64.json" <<'JSON'
 {
-  "profile": "native",
-  "reported_profile": "native",
+  "profile": "general",
+  "reported_profile": "general",
   "reported_backend": "native",
   "links_openssl": false,
   "status": "pass"

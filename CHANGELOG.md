@@ -1523,6 +1523,19 @@ All notable user-facing changes to Tardigrade are documented here.
   `tls-backend=openssl-adapter` string no longer exists). OpenSSL remains
   available only out of process, as an interoperability/differential-testing
   oracle.
+- **OpenSSL from the local Docker image and standalone DEB/RPM packaging
+  (#650)** — the root `Dockerfile` no longer installs `libssl-dev` in the
+  build stage or `libssl3` in the runtime stage; `scripts/test-docker-image.sh`
+  now extracts the exact runtime binary and audits it with
+  `scripts/audit-release-binary.sh` instead of inferring composition from
+  Dockerfile text. `packaging/deb/build.sh` and `packaging/rpm/build.sh` no
+  longer accept `--tls-backend native|openssl-adapter`; every produced
+  package's native identity is proven with `scripts/audit-release-binary.sh`
+  (self-audited for a host-executable binary, or via a new SHA-256-bound
+  `--audit-inventory` file for cross-architecture packaging) instead of a
+  caller-supplied backend flag, and no package declares an OpenSSL runtime
+  dependency any more — the RPM spec's conditional `Requires: openssl-libs`
+  is removed outright.
 
 ## [0.5.0] - 2026-07-08
 

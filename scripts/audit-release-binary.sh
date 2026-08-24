@@ -3,10 +3,14 @@
 # cutover #634, retirement #649).
 #
 # Inspects a produced tardi binary's dynamic dependencies and emits a
-# machine-readable inventory. Every supported profile (`general` and
-# `appliance`) is native-only: this fails if the binary links OpenSSL,
-# libcrypto, or any other foreign TLS/crypto/QUIC/H3/certificate library, and
-# confirms the binary self-reports the native TLS path.
+# machine-readable inventory (including a SHA-256 checksum of the audited
+# binary, so a consumer that cannot execute it directly -- e.g. a
+# cross-architecture package builder -- can still bind the audit result to the
+# exact artifact bytes instead of trusting an unverified file). Every
+# supported profile (`general` and `appliance`) is native-only: this fails if
+# the binary links OpenSSL, libcrypto, or any other foreign
+# TLS/crypto/QUIC/H3/certificate library, and confirms the binary self-reports
+# the native TLS path.
 #
 # Usage:
 #   audit-release-binary.sh --binary PATH --profile {general|appliance} \
@@ -131,6 +135,19 @@ Darwin)
     ;;
 esac
 
+# ── Binary checksum ───────────────────────────────────────────────────────────
+# Lets a consumer of the emitted inventory (e.g. a cross-architecture package
+# builder that cannot execute this binary itself) bind the audit result to the
+# exact artifact bytes instead of trusting an unverified caller-supplied file.
+if command -v sha256sum >/dev/null 2>&1; then
+    binary_sha256="$(sha256sum "$BINARY" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+    binary_sha256="$(shasum -a 256 "$BINARY" | awk '{print $1}')"
+else
+    echo "inspection failed: neither sha256sum nor shasum is available" >&2
+    exit 2
+fi
+
 links_openssl=false
 if printf '%s\n' "$dep_names" | grep -qiE 'libssl|libcrypto'; then
     links_openssl=true
@@ -186,6 +203,7 @@ fi
 emit_inventory() {
     printf '{\n'
     printf '  "binary": %s,\n' "$(json_string "$BINARY")"
+    printf '  "binary_sha256": %s,\n' "$(json_string "$binary_sha256")"
     printf '  "profile": %s,\n' "$(json_string "$PROFILE")"
     printf '  "host_os": %s,\n' "$(json_string "$os")"
     printf '  "inspection_tool": %s,\n' "$(json_string "$inspection_tool")"

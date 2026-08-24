@@ -2,18 +2,34 @@
 # Build a Debian/Ubuntu .deb package for Tardigrade.
 #
 # Usage:
-#   ./packaging/deb/build.sh [--version VERSION] [--arch ARCH] [--binary PATH]
+#   ./packaging/deb/build.sh [--version VERSION] [--arch ARCH] [--binary PATH] \
+#       [--profile {general|appliance}] [--audit-inventory PATH] [--output DIR]
 #
 # Options:
-#   --version VERSION       Package version (default: inferred from `git describe`)
-#   --arch ARCH             Target architecture: amd64 or arm64 (default: host arch)
-#   --binary PATH           Path to pre-built tardi binary (default: zig-out/bin/tardi)
-#   --tls-backend BACKEND   native or openssl-adapter. When omitted, infer from
-#                           the executable binary's `tardi version` output.
-#   --output DIR            Output directory for .deb file (default: dist/)
+#   --version VERSION        Package version (default: inferred from `git describe`)
+#   --arch ARCH              Target architecture: amd64 or arm64 (default: host arch)
+#   --binary PATH            Path to pre-built tardi binary (default: zig-out/bin/tardi)
+#   --profile PROFILE        TLS/crypto product policy the binary was built with:
+#                             general or appliance (default: general, the
+#                             general-purpose native profile this builder ships)
+#   --audit-inventory PATH   A scripts/audit-release-binary.sh --output inventory
+#                             JSON already generated for this exact BINARY (matched
+#                             by SHA-256). Required when BINARY cannot execute on
+#                             this host (cross-architecture packaging); ignored
+#                             otherwise in favor of a fresh self-audit.
+#   --output DIR             Output directory for .deb file (default: dist/)
+#
+# Tardigrade ships exactly one production TLS/crypto implementation: the
+# native path, with no OpenSSL/libcrypto (or other foreign TLS/crypto/QUIC/H3)
+# linkage (#649). This builder proves that with scripts/audit-release-binary.sh
+# rather than trusting a caller-supplied backend flag, and the resulting
+# package declares no OpenSSL runtime dependency.
 #
 # Prerequisites:
 #   dpkg-deb (part of dpkg, available on Debian/Ubuntu)
+#   jq
+#   scripts/audit-release-binary.sh's own prerequisites (readelf/objdump on
+#   Linux, otool on macOS)
 #   A pre-built tardi binary for the target architecture
 
 set -euo pipefail
@@ -22,16 +38,18 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VERSION=""
 ARCH=""
 BINARY="${REPO_ROOT}/zig-out/bin/tardi"
-TLS_BACKEND=""
+PROFILE="general"
+AUDIT_INVENTORY=""
 OUTPUT_DIR="${REPO_ROOT}/dist"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version)     VERSION="$2"; shift 2 ;;
-        --arch)        ARCH="$2"; shift 2 ;;
-        --binary)      BINARY="$2"; shift 2 ;;
-        --tls-backend) TLS_BACKEND="$2"; shift 2 ;;
-        --output)      OUTPUT_DIR="$2"; shift 2 ;;
+        --version)         VERSION="$2"; shift 2 ;;
+        --arch)            ARCH="$2"; shift 2 ;;
+        --binary)          BINARY="$2"; shift 2 ;;
+        --profile)         PROFILE="$2"; shift 2 ;;
+        --audit-inventory) AUDIT_INVENTORY="$2"; shift 2 ;;
+        --output)          OUTPUT_DIR="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -55,42 +73,63 @@ if [[ ! -f "$BINARY" ]]; then
     exit 1
 fi
 
-# Package dependency metadata follows the artifact actually being packaged.
-# Host-native binaries (including the official release binary after its native
-# linkage audit) are inferred from their self-report. Cross-compiled binaries
-# that cannot execute on the packaging host remain supported by passing
-# --tls-backend explicitly instead of guessing from the target filename.
-if [[ -z "$TLS_BACKEND" ]]; then
-    if [[ ! -x "$BINARY" ]]; then
-        echo "Binary is not executable on this host; pass --tls-backend native or --tls-backend openssl-adapter" >&2
+case "$PROFILE" in
+    general | appliance) ;;
+    *) echo "Invalid --profile '$PROFILE' (expected general or appliance)" >&2; exit 1 ;;
+esac
+
+# ── Prove the packaged artifact is the native production implementation ────
+# The only supported production Tardigrade implementation is the native
+# TLS/crypto path (#649). This must never be established by a caller-provided
+# boolean/backend flag or inferred from the binary's filename -- always by
+# running (or checking the result of) scripts/audit-release-binary.sh.
+AUDIT_DIR=$(mktemp -d)
+trap 'rm -rf "$AUDIT_DIR"' EXIT
+AUDIT_JSON="${AUDIT_DIR}/audit.json"
+
+if [[ -x "$BINARY" ]] && "$BINARY" version >/dev/null 2>&1; then
+    "${REPO_ROOT}/scripts/audit-release-binary.sh" \
+        --binary "$BINARY" \
+        --profile "$PROFILE" \
+        --output "$AUDIT_JSON"
+elif [[ -n "$AUDIT_INVENTORY" ]]; then
+    if [[ ! -f "$AUDIT_INVENTORY" ]]; then
+        echo "Audit inventory not found: $AUDIT_INVENTORY" >&2
         exit 1
     fi
-    BINARY_VERSION_OUTPUT="$("$BINARY" version 2>/dev/null || true)"
-    case "$BINARY_VERSION_OUTPUT" in
-        *"tls-backend=native"*) TLS_BACKEND="native" ;;
-        *"tls-backend=openssl-adapter"*) TLS_BACKEND="openssl-adapter" ;;
-        *)
-            echo "Unable to determine TLS backend from '$BINARY version'; pass --tls-backend explicitly" >&2
-            exit 1
-            ;;
-    esac
+    if command -v sha256sum >/dev/null 2>&1; then
+        binary_sha256="$(sha256sum "$BINARY" | awk '{print $1}')"
+    else
+        binary_sha256="$(shasum -a 256 "$BINARY" | awk '{print $1}')"
+    fi
+    inventory_sha256="$(jq -r '.binary_sha256 // empty' "$AUDIT_INVENTORY")"
+    if [[ -z "$inventory_sha256" || "$inventory_sha256" != "$binary_sha256" ]]; then
+        echo "Audit inventory SHA-256 does not match --binary '$BINARY'; it was not generated for this exact artifact" >&2
+        exit 1
+    fi
+    cp "$AUDIT_INVENTORY" "$AUDIT_JSON"
+else
+    echo "Binary is not executable on this host (cross-architecture packaging)." >&2
+    echo "Pass --audit-inventory pointing to a scripts/audit-release-binary.sh --output" >&2
+    echo "inventory JSON already generated for this exact binary (e.g. on the target" >&2
+    echo "architecture, or under emulation)." >&2
+    exit 1
 fi
 
-OPENSSL_DEPENDS=""
-case "$TLS_BACKEND" in
-    native) ;;
-    openssl-adapter) OPENSSL_DEPENDS="Depends: libssl3 | libssl1.1" ;;
-    *)
-        echo "Invalid --tls-backend '$TLS_BACKEND' (expected native or openssl-adapter)" >&2
-        exit 1
-        ;;
-esac
+if [[ "$(jq -r '.status' "$AUDIT_JSON")" != "pass" ]] ||
+   [[ "$(jq -r '.reported_backend' "$AUDIT_JSON")" != "native" ]] ||
+   [[ "$(jq -r '.links_openssl' "$AUDIT_JSON")" != "false" ]] ||
+   [[ "$(jq -r '.reported_profile' "$AUDIT_JSON")" != "$PROFILE" ]]; then
+    echo "Audit does not prove a native, OpenSSL-free '$PROFILE' production artifact:" >&2
+    jq -r '.violations[]? // empty' "$AUDIT_JSON" >&2 || true
+    exit 1
+fi
 
 echo "Building tardigrade_${VERSION}_${ARCH}.deb ..."
 
 # ── Package tree ─────────────────────────────────────────────────────────────
 WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT
+trap 'rm -rf "$WORK_DIR" "$AUDIT_DIR"' EXIT
 
 PKG_DIR="${WORK_DIR}/tardigrade_${VERSION}_${ARCH}"
 BIN_DIR="${PKG_DIR}/usr/bin"
@@ -150,19 +189,14 @@ cat > "${DEBIAN_DIR}/conffiles" <<'CONFEOF'
 /etc/tardigrade/tardigrade.env
 CONFEOF
 
-# DEBIAN/control. Do not emit a blank paragraph when the native package has no
-# OpenSSL dependency: Debian control-file paragraphs are separated by blanks.
+# DEBIAN/control. The native package declares no OpenSSL/libssl/libcrypto
+# runtime dependency for Tardigrade -- there is no other production backend.
 cat > "${DEBIAN_DIR}/control" <<CONTROL
 Package: tardigrade
 Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Bare Systems <security@baresystems.dev>
 Installed-Size: $(du -sk "$BIN_DIR" | awk '{print $1}')
-CONTROL
-if [[ -n "$OPENSSL_DEPENDS" ]]; then
-    printf '%s\n' "$OPENSSL_DEPENDS" >> "${DEBIAN_DIR}/control"
-fi
-cat >> "${DEBIAN_DIR}/control" <<CONTROL
 Section: net
 Priority: optional
 Homepage: https://github.com/Bare-Systems/Tardigrade
