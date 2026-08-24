@@ -75,7 +75,7 @@ jobs:
 
           replace("src/http/negotiated_dispatch.zig", 'test "shared runtime dispatch accepts OpenSSL-shaped and EncryptedStream connection shapes" {', 'test "shared runtime dispatch accepts generic and EncryptedStream connection shapes" {')
           replace("src/http/negotiated_dispatch.zig", "TestOpenSslConn", "TestGenericConn", expected=5)
-          replace("src/http/negotiated_dispatch.zig", "openssl_conn", "generic_conn", expected=3)
+          replace("src/http/negotiated_dispatch.zig", "openssl_conn", "generic_conn", expected=4)
 
           checks = {
               "docs/UPSTREAM_POOLING.md": ["src/http/tls_termination.zig"],
