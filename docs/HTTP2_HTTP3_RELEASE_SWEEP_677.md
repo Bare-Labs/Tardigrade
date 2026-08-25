@@ -17,6 +17,7 @@ can be completed.
   support reported
 - nghttp: `nghttp2/1.69.0`
 - h2load: `nghttp2/1.69.0`
+- OpenSSL: `3.6.3`
 
 ## Passed Local Gates
 
@@ -52,6 +53,71 @@ zig build build-h3-interop --summary all --error-style verbose
 
 Result: passed. Build summary reported `3/3 steps succeeded`; the native
 `h3_interop_tool` executable was built.
+
+```sh
+zig build test-integration-native-tls --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 19/24 tests
+passed (5 skipped)`.
+
+This includes the native TLS listener HTTP/2 ALPN dispatch row:
+`native TLS listener dispatches ALPN h2 through HTTP/2 frames`.
+
+```sh
+zig build test-integration -Dintegration-test-filter='interop.openssl.h2' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 3/3 tests
+passed`.
+
+Covered rows:
+
+- `interop.openssl.h2.tls_resume`
+- `interop.openssl.h2.proxy_request_translation_is_secret_safe`
+- `interop.openssl.h2.auth_required_proxy_fails_closed`
+
+These rows use OpenSSL `s_client` with explicit `-alpn h2` and
+`-servername tardigrade.test`, then send real HTTP/2 frame bytes through the
+TLS connection.
+
+```sh
+zig build test-integration -Dintegration-test-filter='interop.h2.' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 21/21 tests
+passed`.
+
+Covered rows:
+
+- malformed authority rejected before upstream side effects
+- oversized body across DATA frames rejected boundedly
+- connection memory cap rejection before per-stream cap
+- mismatched content length rejected before upstream side effects
+- forbidden transfer-encoding header rejected before upstream side effects
+- SETTINGS/WINDOW_UPDATE overflow failure scope
+- stream overflow and memory-accounting release
+- response flow control waiting for WINDOW_UPDATE
+- multiplexed streams completing after WINDOW_UPDATE
+- peer initial-window-size behavior
+- ACL/rate-limit/retry/passive-health/circuit-breaker/middleware failure
+  behavior over HTTP/2
+- return-directive parity over HTTP/2
+- location streaming override failure behavior
+
+```sh
+zig build test-integration-resumption-interop --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 43/49 tests
+passed (6 skipped)`.
+
+Additional visible soak output:
+
+- `soak.reconnect_resumption: iterations=40 accepted=40 executions=80 heavy=false`
+- `soak.persistent.multi_process_nonce_safety: heavy=false rounds=2 samples_per_process=8 lease_width=1000000 final_generation=3 tuples=52`
 
 ## External HTTP/3 Interop Harness
 
@@ -120,6 +186,22 @@ a follow-up should isolate the curl stderr/stdout for the three Bearclaw HTTPS
 cases and decide whether the failure is environment-specific, test flakiness,
 or a product regression.
 
+## Independent H2 Client Attempts
+
+`nghttp` was available, but this build does not expose a connect-to/resolve
+override. The local test certificate identity is `tardigrade.test`, while the
+temporary server listens on loopback. Without changing host resolution, `nghttp`
+could not be used to connect to `127.0.0.1` while sending the required
+authority/SNI.
+
+curl was also available with HTTP/2 support and was attempted with
+`--http2 --resolve tardigrade.test:<port>:127.0.0.1 --noproxy '*'`. In this
+environment the server logged `error.NoApplicableCredential` during readiness
+probes, so the manual curl slice was not counted as proof. The OpenSSL H2 rows
+above remain the successful independent external H2 proof for this local slice
+because they set both ALPN and SNI explicitly and complete application-level
+HTTP/2 exchanges.
+
 ## Coverage and Remaining Gaps
 
 Covered by this slice:
@@ -129,6 +211,11 @@ Covered by this slice:
 - required `zig build test-quic` gate passed
 - HTTP/3 repeated connection, resumption, cancellation, and resource-settle
   soaks passed in the PR-safe profile
+- native TLS/H2 listener integration passed
+- OpenSSL H2 external-client rows passed
+- HTTP/2 malformed/proxy/flow-control filtered integration rows passed
+- resumption/restart/rotation/soak filtered integration rows passed with
+  documented skips
 - native H3 interop tool built
 - external H3 peer matrix reported explicit local skips
 - required `zig build test-integration` gate was run and produced concrete
@@ -137,7 +224,7 @@ Covered by this slice:
 Not covered by this slice:
 
 - release artifact identity from an installed/release candidate `tardi`
-- independent HTTP/2 TLS/ALPN/application exchange using `nghttp`
+- independent HTTP/2 TLS/ALPN/application exchange using `nghttp` specifically
 - HTTP/2 malformed frame and HPACK failure-scope matrix
 - browser protocol attempts
 - real external HTTP/3 peer proof with ngtcp2, quiche, or aioquic
