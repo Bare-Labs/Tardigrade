@@ -761,6 +761,66 @@ check "validation doc uses numeric netem percentages without literal percent sig
     "--loss 1 --reorder 2 --delay 20" "$VALIDATION_TEXT"
 
 echo ""
+echo "==> Test 24: --runs > 1 aggregates rps/p50/p95/p99/p999/throughput/CPU/RSS/FDs correctly, excludes null samples instead of coercing them to 0 (#668 review)"
+(
+    # shellcheck disable=SC2034 # read by flush_multirun_result, sourced via eval below — shellcheck can't see across that
+    RUNS=3
+    RESULTS_JSON='{}'
+    declare -A _run_quic_list=()
+    declare -A _run_rps_list=()
+    declare -A _run_p50_list=()
+    declare -A _run_p95_list=()
+    declare -A _run_p99_list=()
+    declare -A _run_p999_list=()
+    declare -A _run_errors_list=()
+    declare -A _run_mbps_list=()
+    declare -A _run_cpu_list=()
+    declare -A _run_rss_list=()
+    declare -A _run_fds_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list _max_from_space_list attach_quic_transport_state flush_multirun_result)"
+
+    # Third run's p50 sample is "null" (that run produced no usable p50, e.g.
+    # a scenario that failed to parse latency for one pass) — everything else
+    # has three real samples. A coercion bug would average in a phantom 0.0
+    # and drag the p50 mean down to 0.733 instead of excluding it.
+    _run_rps_list[static-http1]='100 110 105 '
+    _run_p50_list[static-http1]='1.0 1.2 null '
+    _run_p95_list[static-http1]='2.0 2.2 2.1 '
+    _run_p99_list[static-http1]='5 6 5.5 '
+    _run_p999_list[static-http1]='10 11 10.5 '
+    _run_errors_list[static-http1]='0 2 1 '
+    _run_mbps_list[static-http1]='1.5 1.6 1.55 '
+    _run_cpu_list[static-http1]='50 55 52 '
+    _run_rss_list[static-http1]='10 12 11 '
+    _run_fds_list[static-http1]='40 45 42 '
+
+    flush_multirun_result "static-http1"
+    echo "$RESULTS_JSON" > /tmp/tardi-multirun-metrics-test.json
+)
+MULTIRUN_METRICS_JSON="$(jq . /tmp/tardi-multirun-metrics-test.json)"
+check "rps mean is computed across all 3 runs (105.0)" \
+    '"rps": 105' "$MULTIRUN_METRICS_JSON"
+check "p50 excludes the null sample instead of coercing it to 0 (mean of 1.0/1.2 = 1.1, not 0.733)" \
+    '"p50_ms": 1.1' "$MULTIRUN_METRICS_JSON"
+check_not "p50 is not silently dropped from multi-run output" \
+    '"p50_ms": null' "$MULTIRUN_METRICS_JSON"
+check "p95 survives --runs > 1 aggregation (mean 2.1)" \
+    '"p95_ms": 2.1' "$MULTIRUN_METRICS_JSON"
+check "p999 survives --runs > 1 aggregation (mean 10.5)" \
+    '"p999_ms": 10.5' "$MULTIRUN_METRICS_JSON"
+check "throughput_mbps survives --runs > 1 aggregation, not dropped (mean 1.55)" \
+    '"throughput_mbps": 1.55' "$MULTIRUN_METRICS_JSON"
+check "cpu_pct_avg survives --runs > 1 aggregation, not dropped (mean 52.333)" \
+    '"cpu_pct_avg": 52.333' "$MULTIRUN_METRICS_JSON"
+check "rss_mb_peak uses the run-to-run maximum (12), not a mean or the last sample" \
+    '"rss_mb_peak": 12' "$MULTIRUN_METRICS_JSON"
+check "open_fds_peak uses the run-to-run maximum (45), not a mean or the last sample" \
+    '"open_fds_peak": 45' "$MULTIRUN_METRICS_JSON"
+check "errors sums across all runs (0+2+1=3), not just the last run" \
+    '"errors": 3' "$MULTIRUN_METRICS_JSON"
+rm -f /tmp/tardi-multirun-metrics-test.json
+
+echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"
 HELP_OUTPUT="$("$RUN_SH" --help 2>&1)"
 check "static-http1 still documented"   "static-http1" "$HELP_OUTPUT"
