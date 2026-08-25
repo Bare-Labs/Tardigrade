@@ -60,6 +60,25 @@ jobs:
           benchmarks/competitive/netem-impair.sh
           benchmarks/test-h3-benchmark.sh
 
+      # A native `zig build` with no explicit -Dcpu embeds the exact CPU
+      # features of whatever host builds it. release.yml and the Dockerfile
+      # both build natively (host arch == shipped target arch) and publish
+      # the result for users to run on arbitrary other hardware, so both
+      # must pin -Dcpu=baseline or the published binary/image can crash with
+      # Illegal Instruction on real hardware that lacks the build host's
+      # specific CPU features (confirmed on real non-CI x86_64/aarch64
+      # hardware while validating v0.6.0's published release).
+      - name: Verify release/Docker builds pin a portable CPU baseline
+        run: |
+          grep -qE -- '-Dcpu=baseline' .github/workflows/release.yml || {
+            echo "release.yml's release binary build must pin -Dcpu=baseline (see Dockerfile for why)" >&2
+            exit 1
+          }
+          grep -qE -- '-Dcpu=baseline' Dockerfile || {
+            echo "Dockerfile's zig build must pin -Dcpu=baseline (see release.yml for why)" >&2
+            exit 1
+          }
+
       - name: Validate Homebrew formula renderer
         run: |
           tmpdir="$(mktemp -d)"
