@@ -114,17 +114,28 @@ jobs:
             deb_arch: amd64
             rpm_arch: x86_64
             linux_packages: true
+            # Pin a portable glibc floor: a plain native build on this
+            # runner links against symbols requiring the runner's full
+            # glibc version, which is newer than what many still-supported
+            # distros (e.g. Ubuntu 22.04 LTS glibc 2.35, RHEL9/Rocky9/Alma9
+            # glibc 2.34) ship, so the published archive/DEB/RPM fail to
+            # even start there. 2.28 matches the long-established
+            # manylinux2014/RHEL8 portable-Linux-binary floor.
+            zig_target: x86_64-linux-gnu.2.28
           - os: ubuntu-24.04-arm
             archive_name: tardigrade-linux-aarch64
             deb_arch: arm64
             rpm_arch: aarch64
             linux_packages: true
+            zig_target: aarch64-linux-gnu.2.28
           - os: macos-15-intel
             archive_name: tardigrade-darwin-x86_64
             linux_packages: false
+            zig_target: ""
           - os: macos-15
             archive_name: tardigrade-darwin-arm64
             linux_packages: false
+            zig_target: ""
 
     steps:
       - name: Checkout release commit
@@ -170,6 +181,7 @@ jobs:
       - name: Build native release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
         # -Dcpu=baseline: this is a native build (host arch == target arch),
         # which by default has Zig auto-detect and embed the exact CPU
         # features of this specific runner. A published release binary has
@@ -177,7 +189,20 @@ jobs:
         # runner's microarchitecture -- so pin the portable baseline
         # instruction set explicitly rather than inheriting whatever this
         # host happens to support.
-        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline "-Dversion=$VERSION"
+        #
+        # -Dtarget=<arch>-linux-gnu.2.28 (Linux only): a plain native build
+        # also links against this runner's full glibc symbol versions,
+        # which are newer than many still-supported distros ship (Ubuntu
+        # 22.04 LTS, RHEL9/Rocky9/Alma9), so the published archive/DEB/RPM
+        # fail to even start there. Pin the portable glibc floor explicitly;
+        # matrix.zig_target is empty on Darwin, which has no equivalent
+        # versioned-libc concern.
+        run: |
+          if [ -n "$ZIG_TARGET" ]; then
+            zig build -Doptimize=ReleaseFast -Dcpu=baseline "-Dtarget=$ZIG_TARGET" "-Dversion=$VERSION"
+          else
+            zig build -Doptimize=ReleaseFast -Dcpu=baseline "-Dversion=$VERSION"
+          fi
 
       - name: Verify macOS binary architecture
         if: runner.os == 'macOS'

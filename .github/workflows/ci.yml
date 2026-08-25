@@ -79,6 +79,16 @@ jobs:
             exit 1
           }
 
+      # The Docker image bundles its own glibc (from its base image), so it
+      # doesn't need this -- only the native archive/DEB/RPM build, which
+      # runs on a user's own host glibc.
+      - name: Verify release Linux builds pin a portable glibc floor
+        run: |
+          grep -qE -- 'linux-gnu\.2\.[0-9]+' .github/workflows/release.yml || {
+            echo "release.yml's Linux matrix entries must pin an explicit -Dtarget=<arch>-linux-gnu.<version> glibc floor (confirmed v0.6.1's plain native build required glibc newer than Ubuntu 22.04 LTS/RHEL9 ship)" >&2
+            exit 1
+          }
+
       - name: Validate Homebrew formula renderer
         run: |
           tmpdir="$(mktemp -d)"
