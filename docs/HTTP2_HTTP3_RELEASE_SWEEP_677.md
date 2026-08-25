@@ -206,6 +206,18 @@ Result: passed. Build summary reported `8/8 steps succeeded; 21/21 tests
 passed`.
 
 ```sh
+zig build test-integration -Dintegration-test-filter='native upstream h2' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 1/1 tests
+passed`.
+
+This is the best-effort native upstream H2 row:
+`native upstream h2 (best-effort, not CI-gated): negotiates h2 and completes a
+real proxied request over H2`.
+
+```sh
 zig build test-integration-resumption-interop --summary all --error-style verbose
 ```
 
@@ -452,6 +464,7 @@ Covered by this slice:
 - HTTP/2 malformed/proxy/flow-control filtered integration rows passed
 - ReleaseFast HTTP/2 malformed/proxy/flow-control filtered integration rows
   passed
+- native upstream H2 best-effort proxied request row passed
 - resumption/restart/rotation/soak filtered integration rows passed with
   documented skips
 - failure-mode chaos harness passed
