@@ -92,6 +92,15 @@ if ! command -v tc >/dev/null 2>&1; then
     exit 1
 fi
 
+# Checked up front, before the qdisc is ever applied: writing the evidence
+# file below needs jq, and failing there (after the wrapped command already
+# ran) would let jq's own exit status silently overwrite the wrapped
+# command's real CMD_STATUS instead of reporting it.
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is not installed. SCENARIO NOT EXECUTED." >&2
+    exit 1
+fi
+
 EVIDENCE_FILE="${EVIDENCE_FILE:-${REPO_ROOT}/benchmarks/competitive/results/netem-evidence-$(date -u +%Y%m%d-%H%M%S).json}"
 mkdir -p "$(dirname "$EVIDENCE_FILE")"
 

@@ -42,6 +42,20 @@
 
 set -euo pipefail
 
+# POSIX single-quote escaping for safe embedding of an arbitrary value into a
+# remote shell command string built as text and handed to `ssh`. Values like
+# --wrk-path, --host-header, and the target URL are spliced unquoted into
+# that string below; without this, a value containing a single quote breaks
+# out of the intended quoting on the remote host.
+sq() {
+    local s=$1
+    local q="'"
+    local esc="'\\''"
+    printf '%s' "$q"
+    printf '%s' "${s//$q/$esc}"
+    printf '%s' "$q"
+}
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 TARGET_HOST="127.0.0.1"
 TARGET_PORT="8069"
@@ -97,14 +111,16 @@ if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" true 2>/dev/null; t
 fi
 
 echo "Verifying wrk at ${WRK_PATH} on ${REMOTE_HOST}..."
-if ! ssh "$REMOTE_HOST" "test -x ${WRK_PATH}" 2>/dev/null; then
+# shellcheck disable=SC2029 # sq() is meant to expand client-side, quoting the value for the remote shell
+if ! ssh "$REMOTE_HOST" "test -x $(sq "$WRK_PATH")" 2>/dev/null; then
     echo "wrk not found or not executable at ${WRK_PATH} on ${REMOTE_HOST}." >&2
     echo "Build it with: ssh ${REMOTE_HOST} 'cd ~/tools/wrk && make'" >&2
     exit 1
 fi
 
 echo "Verifying target ${BASE_URL}/health from ${REMOTE_HOST}..."
-if ! ssh "$REMOTE_HOST" "curl -sf --max-time 5 '${BASE_URL}/health' >/dev/null" 2>/dev/null; then
+# shellcheck disable=SC2029 # sq() is meant to expand client-side, quoting the value for the remote shell
+if ! ssh "$REMOTE_HOST" "curl -sf --max-time 5 $(sq "${BASE_URL}/health") >/dev/null" 2>/dev/null; then
     echo "Target ${BASE_URL}/health did not respond from ${REMOTE_HOST}." >&2
     exit 1
 fi
@@ -124,18 +140,23 @@ run_wrk_remote() {
     local url="$1" label="$2"
     local header_flags=""
     if [[ -n "$HOST_HEADER" ]]; then
-        header_flags="-H 'Host: ${HOST_HEADER}'"
+        header_flags="-H $(sq "Host: ${HOST_HEADER}")"
     fi
 
     local raw
+    # shellcheck disable=SC2029 # sq() is meant to expand client-side, quoting each value for the remote shell
     raw=$(ssh "$REMOTE_HOST" \
-        "${WRK_PATH} -t${THREADS} -c${CONNECTIONS} -d${DURATION}s -L ${header_flags} '${url}'" \
+        "$(sq "$WRK_PATH") -t${THREADS} -c${CONNECTIONS} -d${DURATION}s -L ${header_flags} $(sq "$url")" \
         2>&1) || true
 
     local rps p50 p99 errors
     rps=$(echo "$raw" | grep -E "Requests/sec" | awk '{print $2}' | tr -d ',' || echo 0)
-    p50=$(echo "$raw" | awk '/50%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0}' || echo 0)
-    p99=$(echo "$raw" | awk '/99%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0}' || echo 0)
+    # wrk prints latency with a ms/us/s suffix depending on magnitude (e.g.
+    # "1.11s" for anything >= 1 second, exactly the slow-client/overload
+    # scenarios this metric matters most for). ms/us must be checked before
+    # the bare "s" suffix since both also end in "s".
+    p50=$(echo "$raw" | awk '/50%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}' || echo 0)
+    p99=$(echo "$raw" | awk '/99%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}' || echo 0)
     errors=$(echo "$raw" | grep -E "Non-2xx" | grep -oE '[0-9]+' | head -1 || echo 0)
     rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
     echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"

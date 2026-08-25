@@ -187,9 +187,16 @@ echo "==> Test 2c: --runs > 1 aggregates each run's scenario-local quic delta in
     RESULTS_JSON='{}'
     declare -A _run_quic_list=()
     declare -A _run_rps_list=()
+    declare -A _run_p50_list=()
+    declare -A _run_p95_list=()
     declare -A _run_p99_list=()
+    declare -A _run_p999_list=()
     declare -A _run_errors_list=()
-    eval "$(source_functions "$RUN_SH" _stats_from_space_list attach_quic_transport_state flush_multirun_result)"
+    declare -A _run_mbps_list=()
+    declare -A _run_cpu_list=()
+    declare -A _run_rss_list=()
+    declare -A _run_fds_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list _max_from_space_list attach_quic_transport_state flush_multirun_result)"
 
     _run_rps_list[static-http3]='100 110 '
     _run_p99_list[static-http3]='5 6 '
@@ -563,9 +570,16 @@ echo "==> Test 17: multi-run scenario accounting distinguishes attempted runs fr
     RESULTS_JSON='{}'
     declare -A _run_quic_list=()
     declare -A _run_rps_list=()
+    declare -A _run_p50_list=()
+    declare -A _run_p95_list=()
     declare -A _run_p99_list=()
+    declare -A _run_p999_list=()
     declare -A _run_errors_list=()
-    eval "$(source_functions "$RUN_SH" _stats_from_space_list attach_quic_transport_state flush_multirun_result)"
+    declare -A _run_mbps_list=()
+    declare -A _run_cpu_list=()
+    declare -A _run_rss_list=()
+    declare -A _run_fds_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list _max_from_space_list attach_quic_transport_state flush_multirun_result)"
     _run_rps_list[static-http3]='100 110 '
     _run_p99_list[static-http3]='5 6 '
     _run_errors_list[static-http3]='0 0 '

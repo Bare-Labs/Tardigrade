@@ -34,6 +34,14 @@ H3_LISTEN_OFFSET="250"
 H3_TLS_SERVER_NAME="tardigrade.test"
 TUNE_COMPARISON=false
 H3_TUNED_UDP_BUFFER_BYTES="4194304"
+# Set by run_tardigrade_http3_matrix right before launching the tuned pass, so
+# udp_buffer_metadata_json (called once, globally, after all passes finish)
+# can report what was actually requested. TARDIGRADE_HTTP3_UDP_*_BUFFER_BYTES
+# themselves are only ever exported into the Tardigrade child process via
+# `env NAME=VALUE ... "$BINARY" run`, never into this script's own
+# environment, so reading them directly here always reads unset/0.
+H3_TUNED_UDP_RECV_REQUESTED_BYTES=""
+H3_TUNED_UDP_SEND_REQUESTED_BYTES=""
 TMP_DIR=""
 ORIGIN_PID=""
 EDGE_PID=""
@@ -411,8 +419,8 @@ udp_buffer_metadata_json() {
             --arg wmem_max "$(udp_sysctl net.core.wmem_max)" \
             --arg rmem_default "$(udp_sysctl net.core.rmem_default)" \
             --arg wmem_default "$(udp_sysctl net.core.wmem_default)" \
-            --arg requested_recv "${TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES:-0}" \
-            --arg requested_send "${TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES:-0}" \
+            --arg requested_recv "${H3_TUNED_UDP_RECV_REQUESTED_BYTES:-0}" \
+            --arg requested_send "${H3_TUNED_UDP_SEND_REQUESTED_BYTES:-0}" \
             '{
                 host_ceiling: {
                     "net.core.rmem_max": $rmem_max,
@@ -429,8 +437,8 @@ udp_buffer_metadata_json() {
         jq -n \
             --arg maxsockbuf "$(udp_sysctl kern.ipc.maxsockbuf)" \
             --arg recvspace "$(udp_sysctl net.inet.udp.recvspace)" \
-            --arg requested_recv "${TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES:-0}" \
-            --arg requested_send "${TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES:-0}" \
+            --arg requested_recv "${H3_TUNED_UDP_RECV_REQUESTED_BYTES:-0}" \
+            --arg requested_send "${H3_TUNED_UDP_SEND_REQUESTED_BYTES:-0}" \
             '{
                 host_ceiling: {
                     "kern.ipc.maxsockbuf": $maxsockbuf,
@@ -465,7 +473,14 @@ h2load_h3_supported() {
     elif command -v ldd >/dev/null 2>&1; then
         ldd "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
     else
-        return 0
+        # Neither linkage-inspection tool is available, so QUIC-library
+        # linkage can't be verified — this must fail closed (unsupported),
+        # matching the "prefer false negatives, never false positives"
+        # design this function documents above. Returning success here would
+        # readmit exactly the false-positive `--h3 --help`-only check this
+        # function was written to replace.
+        echo "  Neither otool nor ldd is available to verify h2load's QUIC linkage; treating HTTP/3 as unsupported on this host." >&2
+        return 1
     fi
 }
 
@@ -860,6 +875,8 @@ run_tardigrade_http3_matrix() {
     if $TUNE_COMPARISON && ! $SMOKE; then
         echo ""
         echo "== tardigrade-http3 tuned UDP buffers (${port}) =="
+        H3_TUNED_UDP_RECV_REQUESTED_BYTES="$H3_TUNED_UDP_BUFFER_BYTES"
+        H3_TUNED_UDP_SEND_REQUESTED_BYTES="$H3_TUNED_UDP_BUFFER_BYTES"
         start_tardigrade_http3 "$port" \
             "TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}" \
             "TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}"
@@ -912,6 +929,11 @@ run_connection_churn() {
     errors=$(printf '%s\n' "$raw" | wrk_error_count)
     rps=${rps:-0}
     errors=${errors:-0}
+    if [[ "$errors" != "0" ]]; then
+        echo "wrk reported ${errors} errors for connection-churn-http1 (${server})" >&2
+        echo "$raw" >&2
+        exit 1
+    fi
     echo "  connection-churn-http1 — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}"
     jq -n \
         --arg server "$server" \
