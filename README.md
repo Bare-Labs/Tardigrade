@@ -81,28 +81,25 @@ curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/i
 The installer downloads the matching release archive, verifies it against
 `tardigrade-checksums.txt`, and installs the `tardi` binary (with a
 `tardigrade` compatibility alias) into `$HOME/.local/bin` by default. The
-**currently published latest release still contains Linux x86_64/aarch64
-archives only**. The release packaging implemented by #476 adds native Intel
-and Apple Silicon Darwin archives; macOS becomes a supported
-`install.sh`/raw-archive path starting with the first intentional release that
-contains that change. See [packaging/README.md](packaging/README.md#current-status)
-for exact status.
+currently published latest release provides Linux x86_64/aarch64 archives
+plus Intel and Apple Silicon Darwin archives. See
+[packaging/README.md](packaging/README.md#current-status) for exact status.
 
 The release workflow builds official Linux and Darwin archives (and Linux
 DEB/RPM packages) with the general-purpose native Zig TLS profile
-(`-Dtls-profile=general`, the default). Those artifacts do not require
-OpenSSL as a Tardigrade build or runtime dependency at all, and their
-release dependency inventory is audited to reject `libssl`, `libcrypto`, and
-other foreign TLS/crypto/QUIC/H3 implementations. Older already-published
-releases predate the #649 cutover and may still use the retired
-OpenSSL-backed profile.
+(`-Dtls-profile=general`, the default), an explicit portable CPU baseline,
+and — for Linux — an explicit portable glibc floor, so the published
+artifact runs on real hardware and distros beyond the exact CI runner that
+built it. Those artifacts do not require OpenSSL as a Tardigrade build or
+runtime dependency at all, and their release dependency inventory is
+audited to reject `libssl`, `libcrypto`, and other foreign TLS/crypto/QUIC/H3
+implementations. Older already-published releases (`v0.5.0` and earlier)
+predate the #649 cutover and used the retired OpenSSL-backed profile.
 
-The initial Darwin archives are unsigned and not notarized; see the Gatekeeper
+The Darwin archives are unsigned and not notarized; see the Gatekeeper
 note in [packaging/README.md](packaging/README.md) before redistributing
-browser-downloaded artifacts. Homebrew publication remains preparatory until a
-release publishes native audited archives with the current `tardi` archive
-layout and the tap formula points at that release's checksums. Launchd lifecycle
-validation (#467) is a separate follow-up.
+browser-downloaded artifacts. Launchd lifecycle validation (#467) is a
+separate follow-up.
 
 Other install paths:
 
@@ -111,9 +108,7 @@ Other install paths:
   service files — see [packaging/README.md](packaging/README.md) for
   current status and install/build instructions.
 - Homebrew formula generation and tap publication workflow — see
-  [packaging/README.md](packaging/README.md#homebrew-macos-and-linux). Do not
-  advertise `brew install tardigrade` until the formula points at a native
-  release that passes the release-backed smoke.
+  [packaging/README.md](packaging/README.md#homebrew-macos-and-linux).
 - Build from source (see below).
 
 For running Tardigrade as a managed service — systemd unit, filesystem
