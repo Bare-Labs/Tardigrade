@@ -502,6 +502,19 @@ validate_profile_accept_batching() {
     fi
 }
 
+validate_shard_distribution() {
+    local label="$1" shard_count="$2"
+    shift 2
+
+    local active_shards
+    active_shards="$(printf '%s\n' "$@" | jq -s '[.[].accept_metrics.accepts_total_delta[]? | select(.value > 0) | .shard] | unique | length')" || return 1
+
+    if (( active_shards <= 1 )); then
+        echo "${label}: requested ${shard_count} listener shards, but accepts landed on only ${active_shards} shard(s) across the churn/burst/mixed workloads; refusing to record this as shard-fairness evidence" >&2
+        return 1
+    fi
+}
+
 validate_workload_batching() {
     local profile="$1" workload="$2" result="$3"
     local accepted batches
@@ -718,6 +731,9 @@ run_profile() {
     fi
     recover_after_close_workload "${label}: post-mixed"
     validate_profile_accept_batching "$label" "$batch_limit" "$fairness_yield_every" "$churn_json" "$burst_json" "$mixed_json" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    if (( shard_count > 1 )); then
+        validate_shard_distribution "$label" "$shard_count" "$churn_json" "$burst_json" "$mixed_json" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    fi
 
     scrape_metrics > "$metrics_file" || { rc="$?"; profile_fail "$rc"; return "$?"; }
     validate_profile_artifacts \

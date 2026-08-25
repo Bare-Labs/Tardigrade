@@ -72,8 +72,10 @@ fi
 # Returns "+X.X%" / "-X.X%" with a warning emoji on regressions > 5%.
 format_delta() {
     local cur=$1 prev=$2
-    # Both must be non-zero numbers
-    if [[ "$prev" == "null" || "$prev" == "0" || "$cur" == "null" || "$cur" == "0" ]]; then
+    # prev must be a non-zero number to avoid division by zero. cur may
+    # legitimately be 0 (e.g. a total throughput collapse) and must still be
+    # reported as a -100% regression rather than hidden behind "n/a".
+    if [[ "$prev" == "null" || "$prev" == "0" || "$cur" == "null" ]]; then
         echo "n/a"
         return
     fi
@@ -105,16 +107,18 @@ build_table() {
         local rps p50 p95 p99 p999 errors tput tput_raw cpu cpu_raw rss rss_raw
         rps=$(jq      -r --arg s "$scenario" '.[$s].rps            // 0'      "$RESULTS_FILE" | awk '{printf "%\x27.0f", $1}')
         rps_raw=$(jq  -r --arg s "$scenario" '.[$s].rps            // 0'      "$RESULTS_FILE")
-        p50=$(jq      -r --arg s "$scenario" '.[$s].p50_ms         // 0'      "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
+        p50=$(jq      -r --arg s "$scenario" '.[$s].p50_ms         // "null"' "$RESULTS_FILE")
         p95=$(jq      -r --arg s "$scenario" '.[$s].p95_ms         // "null"' "$RESULTS_FILE")
-        p99=$(jq      -r --arg s "$scenario" '.[$s].p99_ms         // 0'      "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
+        p99=$(jq      -r --arg s "$scenario" '.[$s].p99_ms         // "null"' "$RESULTS_FILE")
         p999=$(jq     -r --arg s "$scenario" '.[$s].p999_ms        // "null"' "$RESULTS_FILE")
         errors=$(jq   -r --arg s "$scenario" '.[$s].errors         // 0'      "$RESULTS_FILE")
         tput_raw=$(jq -r --arg s "$scenario" '.[$s].throughput_mbps // "null"' "$RESULTS_FILE")
         cpu_raw=$(jq  -r --arg s "$scenario" '.[$s].cpu_pct_avg    // "null"' "$RESULTS_FILE")
         rss_raw=$(jq  -r --arg s "$scenario" '.[$s].rss_mb_peak    // "null"' "$RESULTS_FILE")
 
+        if [[ "$p50"  == "null" ]]; then p50="-";  else p50=$(echo  "$p50"  | awk '{printf "%.1f", $1}'); fi
         if [[ "$p95"  == "null" ]]; then p95="-";  else p95=$(echo  "$p95"  | awk '{printf "%.1f", $1}'); fi
+        if [[ "$p99"  == "null" ]]; then p99="-";  else p99=$(echo  "$p99"  | awk '{printf "%.1f", $1}'); fi
         if [[ "$p999" == "null" ]]; then p999="-"; else p999=$(echo "$p999" | awk '{printf "%.1f", $1}'); fi
         if [[ "$tput_raw" == "null" ]]; then tput="-"; else tput=$(echo "$tput_raw" | awk '{printf "%.1f", $1}'); fi
         if [[ "$cpu_raw"  == "null" ]]; then cpu="-";  else cpu=$(echo  "$cpu_raw"  | awk '{printf "%.1f", $1}'); fi
@@ -162,6 +166,18 @@ fi
 
 if [[ ! -f "$UPDATE_README" ]]; then
     echo "README file not found: $UPDATE_README" >&2
+    exit 1
+fi
+
+# Both markers must be present, or the awk replacement below will either
+# silently drop everything after a missing END marker, or silently no-op
+# (report success without inserting anything) if START is missing.
+if ! grep -qF '<!-- BENCHMARK_REPORT_START -->' "$UPDATE_README"; then
+    echo "README update marker not found: <!-- BENCHMARK_REPORT_START --> is missing from $UPDATE_README" >&2
+    exit 1
+fi
+if ! grep -qF '<!-- BENCHMARK_REPORT_END -->' "$UPDATE_README"; then
+    echo "README update marker not found: <!-- BENCHMARK_REPORT_END --> is missing from $UPDATE_README" >&2
     exit 1
 fi
 
