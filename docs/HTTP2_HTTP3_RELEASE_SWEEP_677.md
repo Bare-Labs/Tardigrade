@@ -241,6 +241,32 @@ These production H3 resumption/0-RTT external-peer rows require a built
 ngtcp2/GnuTLS `gtlsclient` configured through `H3_INTEROP_CLIENT_PATH`; that
 peer was not available on this host.
 
+After the local ngtcp2/GnuTLS peer build was completed with the include-order
+workaround below, the H3 production rows were rerun:
+
+```sh
+H3_INTEROP_CLIENT_PATH=/tmp/tardigrade-h3-peer-macos2/client/build/examples/gtlsclient \
+  zig build test-integration -Dintegration-test-filter='h3interop.quic.' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 4/4 tests
+passed`.
+
+The broader resumption/interop target was also rerun with the same peer path
+and peer dynamic-library path:
+
+```sh
+DYLD_LIBRARY_PATH=/tmp/tardigrade-h3-peer-macos2/client/build/lib:\
+/tmp/tardigrade-h3-peer-macos2/client/build/crypto/gnutls:\
+/tmp/tardigrade-h3-peer-macos2/prefix/lib \
+H3_INTEROP_CLIENT_PATH=/tmp/tardigrade-h3-peer-macos2/client/build/examples/gtlsclient \
+  zig build test-integration-resumption-interop --summary all --error-style verbose
+```
+
+Result: passed after the test-harness SNI/OpenSSL fix in this PR. Build
+summary reported `8/8 steps succeeded; 49/49 tests passed`.
+
 ```sh
 zig build test-failure --summary all --error-style verbose
 ```
@@ -336,6 +362,35 @@ This proves only that the native interop tool builds and that the harness
 reports missing peers explicitly. It does not satisfy #677's real-QUIC proof
 rule.
 
+After building the ngtcp2/GnuTLS peer locally, the matrix was rerun with GNU
+bash 5.3 (macOS `/bin/bash` 3.2 exits early on an empty-array expansion under
+`set -u`):
+
+```sh
+DYLD_LIBRARY_PATH=/tmp/tardigrade-h3-peer-macos2/client/build/lib:\
+/tmp/tardigrade-h3-peer-macos2/client/build/crypto/gnutls:\
+/tmp/tardigrade-h3-peer-macos2/prefix/lib \
+NGTCP2_EXAMPLES_DIR=/tmp/tardigrade-h3-peer-macos2/client/build/examples \
+  /opt/homebrew/bin/bash scripts/interop/run-interop.sh
+```
+
+Result: passed for the ngtcp2 rows. Summary reported `4 passed, 0 failed,
+4 skipped`.
+
+Passed rows:
+
+- native client -> ngtcp2 `gtlsserver`
+- ngtcp2 `gtlsclient` -> native server
+- native HRR client -> ngtcp2 `gtlsserver`
+- ngtcp2 HRR `gtlsclient` -> native server
+
+Still skipped:
+
+- native client -> quiche `http3-server`
+- quiche `http3-client` -> native server
+- native client -> aioquic server
+- aioquic client -> native server
+
 ## External HTTP/3 Peer Build Attempt
 
 The canonical peer dependency installer,
@@ -390,8 +445,15 @@ Failure shape:
 - CMake placed `/opt/homebrew/include` before `/tmp/.../prefix/include`, so
   the compile picked up Homebrew's older nghttp3 `1.15.0` headers
 
-This is a local macOS peer-build environment issue, not a Tardigrade protocol
-result. The deterministic H3 external-peer rows remain unproven in this slice.
+The local build was continued by reordering the generated `/tmp` CMake
+`flags.make` files so `/tmp/tardigrade-h3-peer-macos2/prefix/include` precedes
+`/opt/homebrew/include` for both `gtlsclient` and `gtlsserver`, then rebuilding
+the example targets. That produced:
+
+- `/tmp/tardigrade-h3-peer-macos2/client/build/examples/gtlsclient`
+- `/tmp/tardigrade-h3-peer-macos2/client/build/examples/gtlsserver`
+
+This workaround was local to `/tmp` and is not a Tardigrade product change.
 
 ## Failed Local Gate
 
@@ -474,9 +536,12 @@ Covered by this slice:
 - H3 UDP runtime drain smoke passed
 - native H3 interop tool built
 - external H3 peer matrix reported explicit local skips
-- production `h3interop.quic.*` rows reported explicit local skips
-- canonical H3 peer build was attempted and failed for a documented macOS
-  include-path/tooling reason before any Tardigrade H3 exchange could run
+- ngtcp2/GnuTLS external H3 peer was built locally with a `/tmp` include-order
+  workaround
+- external H3 matrix passed the native/ngtcp2 directions and HRR directions
+- production `h3interop.quic.*` rows passed with the ngtcp2/GnuTLS client
+- resumption/restart/rotation/soak filtered integration rows passed 49/49 with
+  the ngtcp2/GnuTLS client wired in
 - required `zig build test-integration` gate was run and produced concrete
   failures for triage
 
@@ -486,7 +551,7 @@ Not covered by this slice:
 - independent HTTP/2 TLS/ALPN/application exchange using `nghttp` specifically
 - HTTP/2 malformed frame and HPACK failure-scope matrix
 - browser protocol attempts
-- real external HTTP/3 peer proof with ngtcp2, quiche, or aioquic
+- real external HTTP/3 peer proof with quiche or aioquic
 - H3 Alt-Svc proof against a usable advertised endpoint
 - controlled-host resource sweep beyond the existing PR-safe soaks
 - final #389 stable-promotion evidence
