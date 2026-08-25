@@ -1412,18 +1412,28 @@ run_k6_scenario() {
     local script="$1" label="$2"
     shift 2
     local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXXXX)
+    local errfile; errfile=$(mktemp /tmp/k6-stderr-XXXXXX)
     local extra_flags=()
     $INSECURE && extra_flags+=(--insecure-skip-tls-verify)
 
     start_process_monitor
+    local k6_status=0
     BASE_URL="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}" \
         K6_HOST_HEADER="$HOST_HEADER" \
         k6 run --no-color --quiet \
             --summary-export "$tmpfile" \
             ${extra_flags[@]+"${extra_flags[@]}"} \
             "$@" \
-            "$(dirname "$0")/scenarios/${script}.js" 2>/dev/null || true
+            "$(dirname "$0")/scenarios/${script}.js" 2>"$errfile" || k6_status=$?
     stop_process_monitor
+
+    if [[ $k6_status -ne 0 ]]; then
+        echo "  ${label}: k6 exited ${k6_status}, no valid result — not reporting a fabricated 0" >&2
+        cat "$errfile" >&2
+        rm -f "$tmpfile" "$errfile"
+        return 1
+    fi
+    rm -f "$errfile"
 
     _k6_parse_summary "$tmpfile" "$label"
     rm -f "$tmpfile"
@@ -1599,7 +1609,7 @@ scenario_keepalive_starvation() {
         -e "IDLE_VUS=${KEEPALIVE_STARVATION_IDLE_VUS:-20}" \
         -e "ACTIVE_VUS=${KEEPALIVE_STARVATION_ACTIVE_VUS:-10}" \
         -e "IDLE_SLEEP_S=${KEEPALIVE_STARVATION_IDLE_SLEEP_S:-10}" \
-        -e "K6_DURATION=${DURATION}s"
+        -e "SCENARIO_DURATION=${DURATION}s"
 }
 
 scenario_proxy_payload_64k() {

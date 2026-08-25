@@ -20,7 +20,11 @@ import { Trend } from 'k6/metrics';
 //   BASE_URL            target URL base  (default: http://127.0.0.1:8069)
 //   K6_TARGET_PATH      request path     (default: /health)
 //   K6_HOST_HEADER      optional Host header override
-//   K6_DURATION         test duration    (default: 30s)
+//   SCENARIO_DURATION   test duration    (default: 30s) — deliberately not
+//                       K6_DURATION: k6 treats that name as a global VU/
+//                       duration override and ignores the `scenarios` block
+//                       below entirely once it's set, then fails looking for
+//                       a `default` export this script doesn't have.
 //   IDLE_VUS            number of idle keepalive holders (default: 20)
 //   ACTIVE_VUS          number of active request VUs    (default: 10)
 //   IDLE_SLEEP_S        seconds between idle-holder requests (default: 10)
@@ -41,13 +45,13 @@ export const options = {
     idle_holders: {
       executor: 'constant-vus',
       vus: idleVUs,
-      duration: __ENV.K6_DURATION || '30s',
+      duration: __ENV.SCENARIO_DURATION || '30s',
       exec: 'idleHolder',
     },
     active_burst: {
       executor: 'constant-vus',
       vus: activeVUs,
-      duration: __ENV.K6_DURATION || '30s',
+      duration: __ENV.SCENARIO_DURATION || '30s',
       exec: 'activeBurst',
     },
   },
