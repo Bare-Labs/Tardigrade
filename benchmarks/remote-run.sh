@@ -101,6 +101,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# THREADS/CONNECTIONS/DURATION are interpolated unquoted into the remote SSH
+# command string below (as wrk's -t/-c/-d flags), unlike the sq()-quoted
+# path/URL/header values — a non-numeric value here would let its contents
+# execute as shell on the remote host. Reject anything that isn't a positive
+# integer before it ever reaches that string.
+require_positive_int() {
+    local name="$1" value="$2"
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Invalid --${name}: '${value}' (must be a positive integer)" >&2
+        exit 1
+    fi
+}
+require_positive_int "threads" "$THREADS"
+require_positive_int "connections" "$CONNECTIONS"
+require_positive_int "duration" "$DURATION"
+
 BASE_URL="http://${TARGET_HOST}:${TARGET_PORT}"
 
 # ── Verify connectivity ────────────────────────────────────────────────────────
