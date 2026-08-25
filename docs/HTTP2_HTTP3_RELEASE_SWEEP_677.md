@@ -65,6 +65,21 @@ This includes the PR-safe HTTP/3 resource-settle soaks:
 | `soak.h3.bounded_cancelled_requests` | `rss_kb=11568 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=16752 open_fds=15 tracked_connections=2 active_cid_routes=4 native_connections=2` | `rss_kb=13904 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` |
 
 ```sh
+zig build test-quic -Doptimize=ReleaseFast --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `18/18 steps succeeded; 984/984 tests
+passed`.
+
+ReleaseFast H3 soak observations:
+
+| Soak | Before | Peak/end sample | After settle |
+| --- | --- | --- | --- |
+| `soak.h3.bounded_repeated_connections` | `rss_kb=2096 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=25344 open_fds=17 tracked_connections=15 active_cid_routes=29 native_connections=15` | `rss_kb=14272 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` |
+| `soak.h3.bounded_resumed_reconnects` | `rss_kb=13328 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=21392 open_fds=15 tracked_connections=6 active_cid_routes=11 native_connections=6` | `rss_kb=9728 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0`; resumption cache `client=8 server=8`, both at configured limit `8` |
+| `soak.h3.bounded_cancelled_requests` | `rss_kb=8944 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=13632 open_fds=15 tracked_connections=2 active_cid_routes=4 native_connections=2` | `rss_kb=11568 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` |
+
+```sh
 zig build test --summary all --error-style verbose
 ```
 
@@ -134,6 +149,15 @@ Covered rows:
   behavior over HTTP/2
 - return-directive parity over HTTP/2
 - location streaming override failure behavior
+
+```sh
+zig build test-integration -Doptimize=ReleaseFast \
+  -Dintegration-test-filter='interop.h2.' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 21/21 tests
+passed`.
 
 ```sh
 zig build test-integration-resumption-interop --summary all --error-style verbose
@@ -351,11 +375,14 @@ Covered by this slice:
 - local Zig version and host identity recorded
 - required `zig build test` gate passed
 - required `zig build test-quic` gate passed
+- ReleaseFast `zig build test-quic` gate passed
 - HTTP/3 repeated connection, resumption, cancellation, and resource-settle
   soaks passed in the PR-safe profile
 - native TLS/H2 listener integration passed
 - OpenSSL H2 external-client rows passed
 - HTTP/2 malformed/proxy/flow-control filtered integration rows passed
+- ReleaseFast HTTP/2 malformed/proxy/flow-control filtered integration rows
+  passed
 - resumption/restart/rotation/soak filtered integration rows passed with
   documented skips
 - failure-mode chaos harness passed
