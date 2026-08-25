@@ -48,6 +48,12 @@ RESEARCH*
 # Local benchmark baselines (laptop-fallback runs, not canonical)
 benchmarks/results/baseline-pre-change/
 
+# Benchmark run output — large raw artifacts, not meant to live in git.
+# Summarize findings in the PR/issue instead of committing this tree.
+# (Individual report/combined-result files can still be force-added when a
+# run's findings are worth keeping — see benchmarks/results/2026-08-25-*/.)
+benchmarks/results/
+
 # Deployment symlink
 suite/
 blink/

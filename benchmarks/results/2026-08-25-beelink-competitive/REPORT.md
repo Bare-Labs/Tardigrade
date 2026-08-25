@@ -29,7 +29,7 @@ running concurrently.
 | Loopback | `lo`, MTU 65536 |
 | Zig | 0.16.0 (installed fresh for this run; host default was 0.14.1, which does not meet the repo's `minimum_zig_version = 0.16.0`) |
 | Tardigrade build | `zig build -Doptimize=ReleaseFast`, default `-Dtls-profile=general` |
-| Tardigrade commit | `efe0876` (`v0.6.2-8-gefe0876`) — includes the two harness fixes below, merged on top of #668 |
+| Tardigrade commit benchmarked | `efe0876` (`v0.6.2-8-gefe0876`) — the pre-rebase commit this binary was actually built from and benchmarked at. This branch was later rebased onto current `main` (dropping an unrelated commit per PR review), so `efe0876` itself is no longer reachable from this branch's history; its tree content is unchanged and now lives as this branch's `3de7fd7f` (k6 fix) on top of `e8e3f54f`/`ead6807e` (the harness-audit and HAProxy fixes) — same fixes, same benchmarked behavior, different commit hash. |
 | wrk | debian/4.1.0-4+b1 [epoll] |
 | k6 | v2.2.0 (commit 00a9a1b7f5) |
 | nginx | 1.26.3 (Debian package) |
@@ -167,10 +167,15 @@ rerun, but not attributed to a specific cause here.
   three (201.00%) while serving ~3.4x Tardigrade's and ~1.8x NGINX's
   req/s on this scenario — HAProxy is the clear CPU-efficiency leader on
   this workload on this host.
-- **RSS**: Tardigrade's RSS stayed consistently under 7 MiB across every
-  scenario — dramatically lower than NGINX (~28 MiB), HAProxy (~28–30 MiB),
-  and Caddy (~55–58 MiB). This is the most one-sided result in the whole
-  run and held across every scenario, not just one favorable case.
+- **RSS**: Tardigrade's RSS stayed under 7 MiB across every core
+  competitive-suite scenario (static/proxy/churn/idle-keepalive) — still
+  dramatically lower than NGINX (~28 MiB), HAProxy (~28–30 MiB), and Caddy
+  (~55–58 MiB). One upstream-pool-matrix row (`upstream-tls-handshake-reuse`,
+  8.89 MiB — TLS identity/session material) exceeds 7 MiB, so "under 7 MiB
+  across every scenario" is not literally true across the full matrix; the
+  qualified "core competitive-suite scenarios" claim above is. Even the
+  highest observed Tardigrade RSS (8.89 MiB) remains far below any
+  competitor's lowest observed RSS in this run.
 - **Static-file error rate — real Tardigrade defect, not noise**:
   Tardigrade's `static-tiny-http1`/`static-tiny-keepalive`/
   `static-large-http1` scenarios reproducibly show roughly a 1% wrk `read`
@@ -182,10 +187,22 @@ rerun, but not attributed to a specific cause here.
 
 From `upstream-pool-matrix.json` / the table in `competitive-summary.md`:
 
-- **Uneven route distribution**: route-a-hot (8244 req/s), route-b-warm
-  (8078 req/s), route-c-cold (6885 req/s) — reuse ratio ≥ 0.9998 on every
-  route; no evidence of one route starving another under this traffic
-  shape.
+- **Uneven route distribution — not concurrent-fairness evidence.**
+  route-a-hot (8244 req/s), route-b-warm (8078 req/s), route-c-cold (6885
+  req/s), each with reuse ratio ≥ 0.9998. **Important caveat found in PR
+  review:** `benchmarks/competitive/upstream-pool-matrix.sh` runs these
+  three routes as three separate, sequential `wrk` passes (route A
+  finishes entirely, then route B starts, then route C) with different
+  durations/concurrency per route, not as concurrent mixed traffic. The
+  routes never compete for the same worker pool at the same time, so this
+  does **not** exercise or validate uneven-route fairness/starvation the
+  way #149/#593 require — it only confirms each route works and reuses
+  connections well in isolation. Treat the per-route numbers above as
+  informational, not as fairness evidence, until the harness is changed to
+  drive all three routes concurrently. That harness gap is real,
+  independent of this run, and needs a dedicated fix — filed as
+  [#683](https://github.com/Bare-Systems/Tardigrade/issues/683), not
+  something to patch inline in a benchmark-execution PR.
 - **Many low-volume origins** (16 origins): even distribution, ~7.5 req/s
   per origin as configured, reuse ratio 1.0, 0 errors.
 - **Hot origin, many workers**: 8244 req/s, p99 7.16 ms, reuse ratio
@@ -194,6 +211,28 @@ From `upstream-pool-matrix.json` / the table in `competitive-summary.md`:
 - **Upstream TLS handshake/reuse**: 97.27 req/s, p99 330.8 ms (dominated by
   TLS handshake cost, as expected for a scenario specifically measuring
   that), reuse ratio 0.9973.
+- **Local vs. cross-worker reuse ratio** (`#593` explicitly asks for this):
+  of the connections Tardigrade reused rather than opening fresh, the
+  share served by a *different* worker than originally opened it
+  (`cross_worker_reuse_ratio`) was:
+
+  | Scenario | local_reuse | cross_worker_reuse | cross-worker share |
+  | --- | ---: | ---: | ---: |
+  | route-a-hot | 48,623 | 75,881 | 60.9% |
+  | route-b-warm | 6,577 | 9,583 | 59.3% |
+  | route-c-cold | 2,895 | 4,676 | 61.8% |
+  | many-origins-low-volume | 50 | 30 | 37.5% |
+  | hot-origin-many-workers | 48,623 | 75,881 | 60.9% |
+  | upstream-tls-handshake-reuse | 1,440 | 48 | 3.2% |
+
+  Across the higher-volume scenarios, roughly 59–62% of reused connections
+  crossed worker boundaries — the shared upstream pool is actively serving
+  most reuse across workers, not just within the worker that happened to
+  open the connection. The TLS-handshake scenario is the outlier (3.2%
+  cross-worker) — plausible given its far lower request volume (97 req/s)
+  giving each of the 4 workers fewer opportunities to hit another worker's
+  parked connection before its own becomes available, but not confirmed
+  further in this session.
 - **Pool-lock contention sweep** (1/2/4 workers): req/s scales
   6694 → 8064 → 8578 as worker count increases, and CPU-ms/request stays
   essentially flat (0.059 → 0.071 → 0.074 ms/req) rather than climbing —
@@ -211,8 +250,9 @@ From `upstream-pool-matrix.json` / the table in `competitive-summary.md`:
 
 ## Harness defects found and fixed during this run
 
-Two bugs in the benchmark harness itself were found and fixed while
-executing this suite — both are in `benchmarks/`, not in Tardigrade:
+Bugs in the benchmark harness itself were found and fixed while executing
+this suite and responding to PR review — all in `benchmarks/`, not in
+Tardigrade:
 
 1. **HAProxy reverse-proxy routes always 404'd**
    (`benchmarks/competitive/configs/haproxy.cfg.in`). HAProxy evaluates all
@@ -242,9 +282,36 @@ executing this suite — both are in `benchmarks/`, not in Tardigrade:
    renaming the script's env var to `SCENARIO_DURATION` and making
    `run_k6_scenario` surface k6's stderr and fail loudly on nonzero exit
    instead of fabricating a zero-valued result.
+3. **`remote-run.sh` could silently report `0 req/s, 0 errors` for a
+   failed remote run** (found in PR review, not exercised by this session's
+   loopback-only run). `run_wrk_remote` swallowed a nonzero SSH exit with
+   `|| true` and only counted `Non-2xx` HTTP errors, never wrk's `Socket
+   errors:` line — so a dropped SSH connection or a remote `wrk` crash
+   could produce a result indistinguishable from a real, clean, zero-load
+   pass. Fixed to fail loudly (print the raw output, exit nonzero) on a
+   failed SSH/wrk execution or unparseable output, and to count Non-2xx +
+   Socket errors together like `benchmarks/run.sh`'s own `wrk_error_count`
+   already does. Also fixed two smaller bugs found alongside it: the
+   documented `--remote SSH_HOST` flag had no parser arm at all (any use of
+   it exited as "Unknown option"), and `--help` used the GNU-only `head -n
+   -1` (crashes on macOS/BSD `head`).
 
-Both fixes are included in this branch/PR and were verified (manually, and
-via `test-report.sh`/`test-h3-benchmark.sh`) before this canonical run.
+All fixes above are included in this branch/PR and were verified (manually,
+and via `test-report.sh`/`test-h3-benchmark.sh`, plus new regression tests
+added in review response) before/alongside this canonical run.
+
+## Harness gap found, not fixed — deferred to #683
+
+The upstream-pool matrix's `uneven-route-distribution` scenario runs its
+three routes as sequential, non-competing `wrk` passes rather than
+concurrent mixed traffic, so it doesn't actually test the concurrent
+route-fairness question #149/#593 ask about. This is a real harness
+design gap (needs concurrent-process orchestration in
+`upstream-pool-matrix.sh`, not a one-line fix), found in PR review of this
+PR. Filed as [#683](https://github.com/Bare-Systems/Tardigrade/issues/683)
+rather than attempted inline here. See the "Uneven route distribution" bullet
+under [Upstream pool matrix](#upstream-pool-matrix-tardigrade-only) below
+for how this affects reading that scenario's numbers in this report.
 
 ## Real Tardigrade defect found during this run
 

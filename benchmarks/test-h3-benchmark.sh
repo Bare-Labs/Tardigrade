@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_SH="${SCRIPT_DIR}/run.sh"
+REMOTE_RUN_SH="${SCRIPT_DIR}/remote-run.sh"
 COMPETITIVE_DIR="${SCRIPT_DIR}/competitive"
 COMPETITIVE_RUN_SH="${COMPETITIVE_DIR}/run.sh"
 NETEM_SH="${COMPETITIVE_DIR}/netem-impair.sh"
@@ -819,6 +820,18 @@ check "open_fds_peak uses the run-to-run maximum (45), not a mean or the last sa
 check "errors sums across all runs (0+2+1=3), not just the last run" \
     '"errors": 3' "$MULTIRUN_METRICS_JSON"
 rm -f /tmp/tardi-multirun-metrics-test.json
+
+echo ""
+echo "==> Test 25: remote-run.sh's documented --remote flag is actually parsed, not an unknown option (PR #681 review)"
+# --help exits inside the arg-parsing loop before any SSH connectivity check
+# runs, so this is a side-effect-free way to prove --remote doesn't hit the
+# "Unknown option" branch — it must be consumed (and its value shifted away)
+# before --help is reached.
+REMOTE_FLAG_OUTPUT="$("$REMOTE_RUN_SH" --remote some-other-host --help 2>&1)"
+check_not "--remote is a recognized option, not rejected as unknown" \
+    "Unknown option: --remote" "$REMOTE_FLAG_OUTPUT"
+check "--remote --help still prints usage (proves the flag's value was consumed, not left for --help to misparse)" \
+    "Usage" "$REMOTE_FLAG_OUTPUT"
 
 echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"

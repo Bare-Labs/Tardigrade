@@ -96,7 +96,10 @@ while [[ $# -gt 0 ]]; do
         --threshold)      REGRESSION_THRESHOLD="$2";  shift 2 ;;
         --wrk-path)       WRK_PATH="$2";              shift 2 ;;
         --meta-file)      META_FILE="$2";             shift 2 ;;
-        --help)           sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
+        --remote)         REMOTE_HOST="$2";           shift 2 ;;
+        # `head -n -1` is a GNU extension BSD/macOS head doesn't support;
+        # `sed '$d'` (drop the last line) is the portable equivalent.
+        --help)           sed -n '/^# Usage/,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -152,6 +155,27 @@ add_result() {
 }
 
 # ── wrk runner (executes on remote host via SSH) ─────────────────────────────
+# wrk's combined error count: HTTP-level Non-2xx responses plus transport-
+# level Socket errors (connect/read/write/timeout). Counting only Non-2xx
+# (as this function used to) misses every connection-level failure — the
+# same class of gap #668 fixed in benchmarks/run.sh's wrk_error_count.
+_remote_wrk_error_count() {
+    awk '
+        /Non-2xx/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        /Socket errors:/ {
+            for (i = 1; i <= NF; i++) {
+                gsub(/,/, "", $i)
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        END { print total + 0 }
+    '
+}
+
 run_wrk_remote() {
     local url="$1" label="$2"
     local header_flags=""
@@ -159,22 +183,33 @@ run_wrk_remote() {
         header_flags="-H $(sq "Host: ${HOST_HEADER}")"
     fi
 
-    local raw
+    local raw ssh_status=0
     # shellcheck disable=SC2029 # sq() is meant to expand client-side, quoting each value for the remote shell
     raw=$(ssh "$REMOTE_HOST" \
         "$(sq "$WRK_PATH") -t${THREADS} -c${CONNECTIONS} -d${DURATION}s -L ${header_flags} $(sq "$url")" \
-        2>&1) || true
+        2>&1) || ssh_status=$?
+
+    if [[ $ssh_status -ne 0 ]]; then
+        echo "  ${label}: remote ssh/wrk exited ${ssh_status}, no valid result — not reporting a fabricated 0" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
 
     local rps p50 p99 errors
-    rps=$(echo "$raw" | grep -E "Requests/sec" | awk '{print $2}' | tr -d ',' || echo 0)
+    rps=$(echo "$raw" | grep -E "Requests/sec" | awk '{print $2}' | tr -d ',')
+    if [[ -z "$rps" ]]; then
+        echo "  ${label}: could not parse wrk output (ssh succeeded but no 'Requests/sec' line), no valid result — not reporting a fabricated 0" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
     # wrk prints latency with a ms/us/s suffix depending on magnitude (e.g.
     # "1.11s" for anything >= 1 second, exactly the slow-client/overload
     # scenarios this metric matters most for). ms/us must be checked before
     # the bare "s" suffix since both also end in "s".
-    p50=$(echo "$raw" | awk '/50%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}' || echo 0)
-    p99=$(echo "$raw" | awk '/99%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}' || echo 0)
-    errors=$(echo "$raw" | grep -E "Non-2xx" | grep -oE '[0-9]+' | head -1 || echo 0)
-    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    p50=$(echo "$raw" | awk '/50%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}')
+    p99=$(echo "$raw" | awk '/99%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}')
+    errors=$(printf '%s\n' "$raw" | _remote_wrk_error_count)
+    p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
     echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
     add_result "$label" "$rps" "$p50" "$p99" "$errors"
 }
