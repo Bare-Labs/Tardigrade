@@ -4,6 +4,19 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-25
+
+### Fixed
+- **Release/Docker builds now pin a portable CPU baseline** — the published
+  `v0.6.0` `linux-x86_64`/`linux-aarch64` archives and the Docker image were
+  built with a plain native `zig build`, which embeds the exact CPU feature
+  set of the GitHub Actions runner that built them rather than a portable
+  baseline. Confirmed on real (non-emulated) x86_64 and ARM64 hardware: the
+  `v0.6.0` binaries crash with `Illegal instruction` on hardware that
+  doesn't match the build runner's specific microarchitecture. `release.yml`
+  and the `Dockerfile` now build with `-Dcpu=baseline`, and CI asserts both
+  keep the flag.
+
 ## [0.6.0] - 2026-08-24
 
 ### Added
