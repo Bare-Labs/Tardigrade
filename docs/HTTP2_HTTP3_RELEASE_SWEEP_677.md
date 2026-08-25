@@ -80,6 +80,23 @@ ReleaseFast H3 soak observations:
 | `soak.h3.bounded_cancelled_requests` | `rss_kb=8944 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=13632 open_fds=15 tracked_connections=2 active_cid_routes=4 native_connections=2` | `rss_kb=11568 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` |
 
 ```sh
+TARDIGRADE_SOAK_HEAVY=1 \
+  zig build test-quic -Dquic-test-filter='soak.h3.' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `18/18 steps succeeded; 296/296 tests
+passed`.
+
+Heavy H3 soak observations:
+
+| Soak | Before | Peak/end sample | After settle |
+| --- | --- | --- | --- |
+| `soak.h3.bounded_repeated_connections` | `rss_kb=3632 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=40384 open_fds=17 tracked_connections=21 active_cid_routes=42 native_connections=21` | `rss_kb=24304 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` |
+| `soak.h3.bounded_resumed_reconnects` | `rss_kb=22208 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=36912 open_fds=15 tracked_connections=12 active_cid_routes=23 native_connections=12` | `rss_kb=26384 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0`; resumption cache `client=8 server=8`, both at configured limit `8` |
+| `soak.h3.bounded_cancelled_requests` | `rss_kb=24128 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` | up to `rss_kb=33008 open_fds=15 tracked_connections=2 active_cid_routes=4 native_connections=2` | `rss_kb=30432 open_fds=13 tracked_connections=0 active_cid_routes=0 native_connections=0` |
+
+```sh
 zig build test --summary all --error-style verbose
 ```
 
@@ -378,6 +395,7 @@ Covered by this slice:
 - ReleaseFast `zig build test-quic` gate passed
 - HTTP/3 repeated connection, resumption, cancellation, and resource-settle
   soaks passed in the PR-safe profile
+- heavy HTTP/3 soak profile passed for the filtered `soak.h3.` rows
 - native TLS/H2 listener integration passed
 - OpenSSL H2 external-client rows passed
 - HTTP/2 malformed/proxy/flow-control filtered integration rows passed
