@@ -159,6 +159,51 @@ These production H3 resumption/0-RTT external-peer rows require a built
 ngtcp2/GnuTLS `gtlsclient` configured through `H3_INTEROP_CLIENT_PATH`; that
 peer was not available on this host.
 
+```sh
+zig build test-failure --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 9/9 tests
+passed`.
+
+The run logged one expected broken-origin/client diagnostic,
+`upstream handler failed: error.ConnectionResetByPeer`, while the failure-mode
+harness itself passed.
+
+```sh
+zig build test-integration -Dintegration-test-filter='#170' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `8/8 steps succeeded; 9/9 tests
+passed`.
+
+Covered lifecycle rows:
+
+- location-block reload takes effect for new requests after SIGHUP
+- in-flight request completes safely across reload and new requests use the
+  new config
+- reload while serving short static requests
+- reload while proxying a long upstream response
+- reload while a client is uploading a request body
+- reload during active upstream health checks
+- parked keepalive connection survives reload
+- graceful shutdown drains an active in-flight request
+- graceful shutdown with a slow client connected
+- invalid reload leaves the previous config active
+
+```sh
+zig build test-quic -Dquic-test-filter='udp smoke: HTTP/3 runtime drain' \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `18/18 steps succeeded; 294/294 tests
+passed`.
+
+This filter includes the H3 UDP runtime drain smoke:
+`udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new
+work`.
+
 ## External HTTP/3 Interop Harness
 
 ```sh
@@ -313,6 +358,9 @@ Covered by this slice:
 - HTTP/2 malformed/proxy/flow-control filtered integration rows passed
 - resumption/restart/rotation/soak filtered integration rows passed with
   documented skips
+- failure-mode chaos harness passed
+- reload/shutdown lifecycle subset passed
+- H3 UDP runtime drain smoke passed
 - native H3 interop tool built
 - external H3 peer matrix reported explicit local skips
 - production `h3interop.quic.*` rows reported explicit local skips
