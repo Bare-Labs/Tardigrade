@@ -4,6 +4,20 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-25
+
+### Fixed
+- **Linux release/DEB/RPM builds now pin a portable glibc floor** — the
+  published `v0.6.1` `linux-x86_64`/`linux-aarch64` archives required
+  `GLIBC_2.36`, newer than several still-supported distros ship. Confirmed
+  on real hardware: the binaries failed to start on Ubuntu 22.04 LTS (glibc
+  2.35, including inside official Homebrew's own `homebrew/brew` container)
+  and Rocky Linux 9 (glibc 2.34). `release.yml`'s Linux matrix entries now
+  build with `-Dtarget=<arch>-linux-gnu.2.28`, matching the established
+  manylinux2014/RHEL8 portable-Linux-binary floor; Darwin builds and the
+  Docker image (which bundles its own glibc) are unaffected. CI now asserts
+  the floor stays pinned.
+
 ## [0.6.1] - 2026-08-25
 
 ### Fixed
