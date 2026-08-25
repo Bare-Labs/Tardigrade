@@ -170,7 +170,14 @@ jobs:
       - name: Build native release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
+        # -Dcpu=baseline: this is a native build (host arch == target arch),
+        # which by default has Zig auto-detect and embed the exact CPU
+        # features of this specific runner. A published release binary has
+        # to run on whatever real hardware a user has -- not just this
+        # runner's microarchitecture -- so pin the portable baseline
+        # instruction set explicitly rather than inheriting whatever this
+        # host happens to support.
+        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline "-Dversion=$VERSION"
 
       - name: Verify macOS binary architecture
         if: runner.os == 'macOS'

@@ -19,7 +19,12 @@ RUN sh ./scripts/install-zig.sh 0.16.0 /opt/zig \
 
 # Default "general" TLS profile: pure-Zig native (#649) — no OpenSSL/libcrypto
 # build dependency for Tardigrade itself (see docs/TLS_DEPENDENCY_POLICY.md).
-RUN zig build -Doptimize=ReleaseFast
+# -Dcpu=baseline: this is a native build (BuildKit runs it on whatever host
+# arch matches the image target), and Zig's default native build embeds the
+# exact CPU features of that build host. A published image has to run on
+# whatever host a user's container runtime lands on, not just the builder's
+# microarchitecture, so pin the portable baseline explicitly.
+RUN zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
 FROM debian@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
