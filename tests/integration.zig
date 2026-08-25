@@ -1466,10 +1466,12 @@ fn prepareBearClawFixture(
     defer allocator.free(config_text_cert);
     const config_text_key = try std.mem.replaceOwned(u8, allocator, config_text_cert, "/etc/tardigrade/tls/privkey.pem", server_key_abs);
     defer allocator.free(config_text_key);
+    const config_text_sn = try std.mem.replaceOwned(u8, allocator, config_text_key, "server_name api.example.com;", "server_name tardigrade.test;");
+    defer allocator.free(config_text_sn);
     const final_config_text = if (fixture_tls_enabled)
-        try allocator.dupe(u8, config_text_key)
+        try allocator.dupe(u8, config_text_sn)
     else blk: {
-        const without_ssl = try std.mem.replaceOwned(u8, allocator, config_text_key, "listen 443 ssl;", "listen 443;");
+        const without_ssl = try std.mem.replaceOwned(u8, allocator, config_text_sn, "listen 443 ssl;", "listen 443;");
         defer allocator.free(without_ssl);
         const without_cert = try std.mem.replaceOwned(u8, allocator, without_ssl, cert_line, "");
         defer allocator.free(without_cert);
@@ -2565,6 +2567,7 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
 const CurlRequestSpec = struct {
     method: []const u8 = "GET",
     scheme: []const u8 = "https",
+    host: []const u8 = test_host,
     path: []const u8,
     body: ?[]const u8 = null,
     headers: []const RequestHeader = &.{},
@@ -2642,8 +2645,14 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
         try argv.append("--tls-max");
         try argv.append(v);
     }
-    const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, test_host, port, spec.path });
-    defer allocator.free(url);
+    if (!std.mem.eql(u8, spec.host, test_host)) {
+        const resolve = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ spec.host, port, test_host });
+        try owned_args.append(resolve);
+        try argv.append("--resolve");
+        try argv.append(resolve);
+    }
+    const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, spec.host, port, spec.path });
+    try owned_args.append(url);
     try argv.append(url);
 
     const run_res = try std.process.run(allocator, compat.io(), .{
@@ -2709,7 +2718,13 @@ fn spawnCurlProcess(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSp
     if (spec.tls_earlydata) {
         try argv.append("--tls-earlydata");
     }
-    const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, test_host, port, spec.path });
+    if (!std.mem.eql(u8, spec.host, test_host)) {
+        const resolve = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ spec.host, port, test_host });
+        try owned_args.append(resolve);
+        try argv.append("--resolve");
+        try argv.append(resolve);
+    }
+    const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, spec.host, port, spec.path });
     try owned_args.append(url);
     try argv.append(url);
 
@@ -2725,8 +2740,14 @@ fn sendCurlRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpe
     var result = try runCurl(allocator, port, spec);
     errdefer result.deinit();
     switch (result.term) {
-        .exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .exited => |code| if (code != 0) {
+            std.debug.print("Curl failed with code {d}:\nstderr: {s}\nstdout: {s}\n", .{ code, result.stderr, result.stdout });
+            return error.CurlFailed;
+        },
+        else => {
+            std.debug.print("Curl failed with term {any}:\nstderr: {s}\nstdout: {s}\n", .{ result.term, result.stderr, result.stdout });
+            return error.CurlFailed;
+        },
     }
 
     allocator.free(result.stderr);
@@ -2737,6 +2758,34 @@ fn sendCurlRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpe
         .headers_raw = result.stdout[0 .. (std.mem.find(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 2],
         .body = result.stdout[(std.mem.find(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 4 ..],
     };
+}
+
+fn sendPureZigRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !HttpResponse {
+    const server_name = if (std.mem.eql(u8, spec.host, test_host)) null else spec.host;
+    const client = try PureZigTlsClient.createWithServerName(allocator, port, "http/1.1", server_name);
+    defer client.destroy();
+
+    var request = std.array_list.Managed(u8).init(allocator);
+    defer request.deinit();
+
+    try request.print("{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n", .{
+        spec.method, spec.path, spec.host,
+    });
+    for (spec.headers) |header| {
+        try request.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    if (spec.body) |body| {
+        try request.print("Content-Length: {d}\r\n", .{body.len});
+    }
+    try request.appendSlice("\r\n");
+    if (spec.body) |body| {
+        try request.appendSlice(body);
+    }
+    try client.writeAllPlain(request.items);
+
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    errdefer allocator.free(raw);
+    return httpResponseFromOwnedRaw(allocator, raw);
 }
 
 fn sendPureZigTlsHttp1Request(allocator: std.mem.Allocator, port: u16, path: []const u8) !HttpResponse {
@@ -11753,10 +11802,11 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
 
-    var upstream = try UpstreamServer.start(allocator, &.{.{
+    const mock_resp: UpstreamResponseSpec = .{
         .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}",
         .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-    }});
+    };
+    var upstream = try UpstreamServer.start(allocator, &.{ mock_resp, mock_resp, mock_resp, mock_resp, mock_resp });
     defer upstream.stop();
     try upstream.run();
 
@@ -11766,13 +11816,14 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     var tardigrade = try TardigradeProcess.start(allocator, options);
     defer tardigrade.stop();
 
-    var unauthorized = try sendCurlRequest(allocator, tardigrade.port, .{
+    var unauthorized = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/v1/chat",
         .method = "POST",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Content-Type", .value = "application/json" },
         },
         .insecure = true,
@@ -11780,13 +11831,14 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     defer unauthorized.deinit();
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
 
-    var authorized = try sendCurlRequest(allocator, tardigrade.port, .{
+    var authorized = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/v1/chat",
         .method = "POST",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
             .{ .name = "Content-Type", .value = "application/json" },
         },
@@ -11805,12 +11857,13 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     try assertContains(transcript, "\"route\":\"/v1/chat\"");
     try std.testing.expect(std.mem.find(u8, transcript, valid_bearer_token) == null);
 
-    var transcript_list = try sendCurlRequest(allocator, tardigrade.port, .{
+    var transcript_list = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/bearclaw/transcripts?limit=5",
         .method = "GET",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
         },
         .insecure = true,
@@ -11820,12 +11873,13 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     try assertContains(transcript_list.body, "\"transcripts\":[");
     try assertContains(transcript_list.body, "\"route\":\"/v1/chat\"");
 
-    var transcript_detail = try sendCurlRequest(allocator, tardigrade.port, .{
+    var transcript_detail = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/bearclaw/transcripts/1",
         .method = "GET",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
         },
         .insecure = true,
@@ -11840,10 +11894,11 @@ test "bearclaw transcript append path errors do not fail the request" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
 
-    var upstream = try UpstreamServer.start(allocator, &.{.{
+    const mock_resp: UpstreamResponseSpec = .{
         .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}",
         .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-    }});
+    };
+    var upstream = try UpstreamServer.start(allocator, &.{ mock_resp, mock_resp, mock_resp, mock_resp, mock_resp });
     defer upstream.stop();
     try upstream.run();
 
@@ -11856,13 +11911,14 @@ test "bearclaw transcript append path errors do not fail the request" {
     var tardigrade = try TardigradeProcess.start(allocator, options);
     defer tardigrade.stop();
 
-    var authorized = try sendCurlRequest(allocator, tardigrade.port, .{
+    var authorized = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/bearclaw/v1/chat",
         .method = "POST",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
             .{ .name = "Content-Type", .value = "application/json" },
         },
@@ -11878,10 +11934,15 @@ test "bearclaw edge prefix routes health without auth and enforces auth on v1 pa
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
 
-    var upstream = try UpstreamServer.start(allocator, &.{
-        .{ .body = "{\"status\":\"ok\",\"service\":\"bareclaw\"}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
-        .{ .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
-    });
+    const mock_resp_health: UpstreamResponseSpec = .{
+        .body = "{\"status\":\"ok\",\"service\":\"bareclaw\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    };
+    const mock_resp_api: UpstreamResponseSpec = .{
+        .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    };
+    var upstream = try UpstreamServer.start(allocator, &.{ mock_resp_health, mock_resp_api, mock_resp_api, mock_resp_api, mock_resp_api });
     defer upstream.stop();
     try upstream.run();
 
@@ -11892,11 +11953,12 @@ test "bearclaw edge prefix routes health without auth and enforces auth on v1 pa
     defer tardigrade.stop();
 
     // TC-TARDIGRADE-002: /bearclaw/health proxied without requiring auth.
-    var health_no_auth = try sendCurlRequest(allocator, tardigrade.port, .{
+    var health_no_auth = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/bearclaw/health",
         .method = "GET",
-        .headers = &.{.{ .name = "Host", .value = "api.example.com" }},
+        .headers = &.{.{ .name = "Host", .value = "tardigrade.test" }},
         .insecure = true,
     });
     defer health_no_auth.deinit();
@@ -11909,13 +11971,14 @@ test "bearclaw edge prefix routes health without auth and enforces auth on v1 pa
     try std.testing.expectEqualStrings("/health", health_path);
 
     // TC-TARDIGRADE-004: /bearclaw/v1/* requires auth — no token → 401.
-    var api_no_auth = try sendCurlRequest(allocator, tardigrade.port, .{
+    var api_no_auth = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/bearclaw/v1/chat",
         .method = "POST",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Content-Type", .value = "application/json" },
         },
         .insecure = true,
@@ -11925,13 +11988,14 @@ test "bearclaw edge prefix routes health without auth and enforces auth on v1 pa
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
     // TC-TARDIGRADE-004: malformed or invalid bearer → 403.
-    var api_invalid_auth = try sendCurlRequest(allocator, tardigrade.port, .{
+    var api_invalid_auth = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/bearclaw/v1/chat",
         .method = "POST",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Authorization", .value = "Bearer wrong-token" },
             .{ .name = "Content-Type", .value = "application/json" },
         },
@@ -11942,13 +12006,14 @@ test "bearclaw edge prefix routes health without auth and enforces auth on v1 pa
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
     // TC-TARDIGRADE-004: /bearclaw/v1/* with valid auth → proxied, 200.
-    var api_authorized = try sendCurlRequest(allocator, tardigrade.port, .{
+    var api_authorized = try sendPureZigRequest(allocator, tardigrade.port, .{
         .scheme = "https",
+        .host = "tardigrade.test",
         .path = "/bearclaw/v1/chat",
         .method = "POST",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Host", .value = "tardigrade.test" },
             .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
             .{ .name = "Content-Type", .value = "application/json" },
         },
