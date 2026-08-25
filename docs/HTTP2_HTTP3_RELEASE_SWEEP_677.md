@@ -212,6 +212,26 @@ The run logged one expected broken-origin/client diagnostic,
 harness itself passed.
 
 ```sh
+zig build test-security-corpus --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `3/3 steps succeeded; 3/3 tests
+passed`.
+
+This is request-parser malformed-input/security corpus coverage, including
+checked-in hostile parser vectors.
+
+```sh
+zig build test-quic-h3-driver --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `3/3 steps succeeded; 23/23 tests
+passed`.
+
+This is deterministic native QUIC/H3 driver coverage for protocol-level
+scenarios that do not require external peers.
+
+```sh
 zig build test-integration -Dintegration-test-filter='#170' \
   --summary all --error-style verbose
 ```
@@ -404,6 +424,8 @@ Covered by this slice:
 - resumption/restart/rotation/soak filtered integration rows passed with
   documented skips
 - failure-mode chaos harness passed
+- request parser security corpus passed
+- deterministic QUIC/H3 driver scenarios passed
 - reload/shutdown lifecycle subset passed
 - H3 UDP runtime drain smoke passed
 - native H3 interop tool built
