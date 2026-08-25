@@ -115,6 +115,35 @@ Result: passed. Build summary reported `3/3 steps succeeded`; the native
 `h3_interop_tool` executable was built.
 
 ```sh
+zig build test-tls-interop-matrix --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `3/3 steps succeeded; 16/16 tests
+passed`.
+
+```sh
+zig build build-tls-interop --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `3/3 steps succeeded`; the shared TLS
+interop tool was built.
+
+```sh
+scripts/interop/run-tls-interop.sh --profile ci
+```
+
+Result: passed. Summary reported `pass=86 fail=0 skip=0`.
+
+Relevant #677-adjacent rows included:
+
+- record transport positive TLS 1.3 tuples against OpenSSL and GnuTLS
+- `record/server/openssl/http2_entrypoint` with ALPN `h2`
+- record transport HRR and KeyUpdate rows
+- record transport negative ALPN/cipher/group/signature/SNI/certificate rows
+- server certificate selection rows
+- QUIC loopback tuples with ALPN `h3`
+
+```sh
 zig build test-integration-native-tls --summary all --error-style verbose
 ```
 
@@ -417,6 +446,8 @@ Covered by this slice:
   soaks passed in the PR-safe profile
 - heavy HTTP/3 soak profile passed for the filtered `soak.h3.` rows
 - native TLS/H2 listener integration passed
+- TLS interop CI profile passed with OpenSSL/GnuTLS record rows, an explicit
+  OpenSSL `h2` ALPN entrypoint, and QUIC loopback `h3` tuples
 - OpenSSL H2 external-client rows passed
 - HTTP/2 malformed/proxy/flow-control filtered integration rows passed
 - ReleaseFast HTTP/2 malformed/proxy/flow-control filtered integration rows
