@@ -1,6 +1,6 @@
 # Tardigrade Homebrew Formula
 
-This directory contains the preparatory Homebrew formula source and renderer.
+This directory contains the Homebrew formula source and renderer.
 Tardigrade owns formula generation; `Bare-Systems/homebrew-tap` owns the public
 tap documentation.
 
@@ -36,10 +36,9 @@ Release publication flow:
    support policy or install instructions change.
 
 The renderer only emits platform/architecture branches whose archive names are
-present in the release's checksum manifest and asset list. The current public
-`v0.5.0` release predates the native cutover and must not be rendered into the
-tap formula. Darwin branches must wait for a release manifest containing
-`tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`.
+present in the release's checksum manifest and asset list — a release missing
+`tardigrade-darwin-x86_64.tar.gz`/`tardigrade-darwin-arm64.tar.gz` simply omits
+the `on_macos` branch rather than failing.
 
 The formula installs `tardi` and the packaged `tardigrade` compatibility alias.
 It intentionally declares no `openssl@3` dependency; native release artifacts

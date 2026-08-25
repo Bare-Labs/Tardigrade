@@ -8,9 +8,23 @@ alias, but examples on this page use `tardi`.
 
 ## Install
 
-Build from source for this walkthrough. The latest published release
-(`v0.5.0`) predates `tardi init <profile>` and the `./tardigrade.conf`
-default this guide relies on, so it can't run the commands below yet:
+The official install script works for this guide:
+
+```bash
+curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+tardi version
+```
+
+This installs `tardi` (with a `tardigrade` compatibility alias) into
+`$HOME/.local/bin`; the `export` above puts that directory on `PATH` for
+the current shell. The published release uses the native Zig shipping
+profile — no OpenSSL runtime required for Tardigrade — and provides Linux
+x86_64/aarch64 plus Intel and Apple Silicon macOS archives. See
+[packaging/README.md](../packaging/README.md) for other install paths
+(Homebrew, DEB/RPM, Docker) and exact current platform/release status.
+
+To build from source instead:
 
 ```bash
 git clone https://github.com/Bare-Systems/Tardigrade.git
@@ -23,25 +37,6 @@ tardi version
 The build above requires [Zig](https://ziglang.org/) 0.16.0 and does not
 require OpenSSL to compile or run Tardigrade — the default `general` TLS
 profile is pure-Zig native.
-
-Once a release that includes `tardi init` is published, the official
-install script will also work for this guide:
-
-```bash
-curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-tardi version
-```
-
-This installs `tardi` (with a `tardigrade` compatibility alias) into
-`$HOME/.local/bin`; the `export` above puts that directory on `PATH` for
-the current shell. The currently published `v0.5.0` release predates the
-native shipping cutover and Darwin archive work, so it still uses the
-transitional OpenSSL-backed artifact and provides Linux x86_64/aarch64
-archives only. Releases containing #476 use the native Zig shipping profile,
-require no OpenSSL runtime for Tardigrade, and add Intel and Apple Silicon
-macOS archives. See [packaging/README.md](../packaging/README.md) for other
-install paths and exact current platform/release status.
 
 ## Static-site happy path
 
