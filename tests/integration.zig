@@ -2740,14 +2740,19 @@ fn sendCurlRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpe
 }
 
 fn sendPureZigTlsHttp1Request(allocator: std.mem.Allocator, port: u16, path: []const u8) !HttpResponse {
-    const client = try PureZigTlsClient.create(allocator, port, "http/1.1");
+    return sendPureZigTlsHttp1RequestWithServerName(allocator, port, path, null);
+}
+
+fn sendPureZigTlsHttp1RequestWithServerName(allocator: std.mem.Allocator, port: u16, path: []const u8, server_name: ?[]const u8) !HttpResponse {
+    const client = try PureZigTlsClient.createWithServerName(allocator, port, "http/1.1", server_name);
     defer client.destroy();
 
+    const host = server_name orelse "127.0.0.1";
     var request = std.array_list.Managed(u8).init(allocator);
     defer request.deinit();
     try request.print(
-        "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        .{path},
+        "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+        .{ path, host },
     );
     try client.writeAllPlain(request.items);
 
@@ -2793,36 +2798,64 @@ fn sendHttp3CurlRequest(allocator: std.mem.Allocator, port: u16, path: []const u
 }
 
 fn opensslPresentedSubject(allocator: std.mem.Allocator, port: u16, servername: []const u8) ![]u8 {
-    const cmd = try std.fmt.allocPrint(
-        allocator,
-        // `-nameopt compat`: forces the stable, space-free "CN=value" subject
-        // rendering across OpenSSL versions/distros, rather than whatever
-        // the locally-linked OpenSSL's default `-nameopt` (which varies
-        // between "CN=value" and "CN = value") happens to produce.
-        "openssl s_client -connect {s}:{d} -servername {s} -alpn http/1.1 -showcerts </dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | openssl x509 -noout -subject -nameopt compat",
-        .{ test_host, port, servername },
-    );
-    defer allocator.free(cmd);
+    const connect_arg = try opensslConnectArg(allocator, port);
+    defer allocator.free(connect_arg);
 
-    const run_res = try std.process.run(std.heap.page_allocator, compat.io(), .{
-        .argv = &.{ "sh", "-lc", cmd },
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer std.heap.page_allocator.free(run_res.stderr);
+    for (0..20) |attempt| {
+        var s_client = try bounded_process.run(allocator, .{
+            .argv = &.{
+                "openssl", "s_client", "-connect",   connect_arg, "-servername", servername,
+                "-alpn",   "http/1.1", "-showcerts",
+            },
+            .stdin = "",
+            .stdout_limit = 1024 * 1024,
+            .stderr_limit = 1024 * 1024,
+            .deadline_ms = 5_000,
+            .accepted_exit_codes = &.{ 0, 1 },
+        });
 
-    switch (run_res.term) {
-        .exited => |code| if (code != 0) {
-            std.heap.page_allocator.free(run_res.stdout);
-            return error.OpensslFailed;
-        },
-        else => {
-            std.heap.page_allocator.free(run_res.stdout);
-            return error.OpensslFailed;
-        },
+        if (std.meta.activeTag(s_client.outcome) == .normal_exit) {
+            const cert_begin = std.mem.indexOf(u8, s_client.stdout, "-----BEGIN CERTIFICATE-----");
+            const cert_end_start = std.mem.indexOf(u8, s_client.stdout, "-----END CERTIFICATE-----");
+            if (cert_begin != null and cert_end_start != null and cert_end_start.? >= cert_begin.?) {
+                const cert_end = cert_end_start.? + "-----END CERTIFICATE-----".len;
+                var x509 = try bounded_process.run(allocator, .{
+                    .argv = &.{
+                        "openssl",
+                        "x509",
+                        "-noout",
+                        "-subject",
+                        // Forces the stable, space-free "CN=value" subject
+                        // rendering across OpenSSL versions/distros.
+                        "-nameopt",
+                        "compat",
+                    },
+                    .stdin = s_client.stdout[cert_begin.?..cert_end],
+                    .stdout_limit = 1024 * 1024,
+                    .stderr_limit = 1024 * 1024,
+                    .deadline_ms = 5_000,
+                });
+                if (std.meta.activeTag(x509.outcome) == .normal_exit and x509.outcome.normal_exit == 0) {
+                    const subject = allocator.dupe(u8, x509.stdout) catch |err| {
+                        x509.deinit(allocator);
+                        s_client.deinit(allocator);
+                        return err;
+                    };
+                    x509.deinit(allocator);
+                    s_client.deinit(allocator);
+                    return subject;
+                }
+                x509.deinit(allocator);
+            }
+        }
+
+        s_client.deinit(allocator);
+        if (attempt + 1 < 20) {
+            compat.sleepNs(100 * std.time.ns_per_ms);
+        }
     }
-    defer std.heap.page_allocator.free(run_res.stdout);
-    return allocator.dupe(u8, run_res.stdout);
+
+    return error.OpensslFailed;
 }
 
 fn parseStatusCode(raw: []const u8) !u16 {
@@ -9553,7 +9586,7 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     defer allocator.free(subject_before);
     try assertContains(subject_before, quic_interop_server_name);
 
-    var first_response = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/dynamic/test", .insecure = true });
+    var first_response = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/dynamic/test", quic_interop_server_name);
     defer first_response.deinit();
     try assertContains(first_response.body, "first-location");
 
@@ -9603,12 +9636,12 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     // rejects the entire SIGHUP atomically, so the bundled unrelated field
     // change never takes effect either (#649: single shared credential
     // owner, no partial-apply path left).
-    var status = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/tardigrade/reload/status", .insecure = true });
+    var status = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/tardigrade/reload/status", quic_interop_server_name);
     defer status.deinit();
     try assertContains(status.body, "\"ok\":false");
     try assertContains(status.body, "native TLS credential reload failed");
 
-    var second_response = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/dynamic/test", .insecure = true });
+    var second_response = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/dynamic/test", quic_interop_server_name);
     defer second_response.deinit();
     try assertContains(second_response.body, "first-location");
 

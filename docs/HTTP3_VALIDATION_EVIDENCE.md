@@ -13,6 +13,8 @@ transport implementation. Use the existing owners:
 - production rollout, drain, GOAWAY, UDP sizing, PLPMTUD, ECN, and socket
   diagnostics: [HTTP3_ROLLOUT.md](HTTP3_ROLLOUT.md)
 - external peer matrix: [scripts/interop/README.md](../scripts/interop/README.md)
+- local HTTP/2/HTTP/3 #677 release-sweep slice:
+  [HTTP2_HTTP3_RELEASE_SWEEP_677.md](HTTP2_HTTP3_RELEASE_SWEEP_677.md)
 - H3 benchmark harness and result schema:
   [benchmarks/README.md](../benchmarks/README.md) and
   [benchmarks/competitive/README.md](../benchmarks/competitive/README.md)
