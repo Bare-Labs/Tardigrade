@@ -18300,12 +18300,25 @@ test "native upstream h2 (best-effort, not CI-gated): negotiates h2 and complete
     // real failure.
     var attempt: usize = 0;
     var response: HttpResponse = while (attempt < 20) : (attempt += 1) {
-        var candidate = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        var candidate = sendRequestWithTimeout(allocator, tardigrade.port, .{
             .method = "GET",
             .path = "/secure/h2-upstream",
             .body = null,
             .headers = &.{},
-        }, 10_000);
+        }, 10_000) catch |err| switch (err) {
+            // The upstream listener's just-completed TLS readiness probe can
+            // still be tearing down its prior connection when an attempt
+            // lands, producing a raw connection-level failure instead of a
+            // clean response with a non-200 status. Retry those exactly like
+            // a non-200 -- previously these propagated straight out of the
+            // retry loop via `try`, so the very first race lost the whole
+            // test instead of being absorbed by the retry budget below.
+            error.InvalidHttpResponse, error.ConnectionResetByPeer, error.SocketUnconnected => {
+                compat.sleepNs(100 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
         if (candidate.status_code == 200) break candidate;
         candidate.deinit();
         compat.sleepNs(100 * std.time.ns_per_ms);
