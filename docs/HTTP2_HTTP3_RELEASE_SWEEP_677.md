@@ -19,6 +19,34 @@ can be completed.
 - h2load: `nghttp2/1.69.0`
 - OpenSSL: `3.6.3`
 
+## Local Artifact Identity
+
+This slice used the source-tree build output, not an installed release
+candidate. To get closer to #677's artifact rule, a ReleaseFast local binary
+was built and identified:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dversion=issue-677-local-5e88d4a \
+  --summary all --error-style verbose
+```
+
+Result: passed. Build summary reported `4/4 steps succeeded`.
+
+```sh
+./zig-out/bin/tardi version
+shasum -a 256 ./zig-out/bin/tardi
+file ./zig-out/bin/tardi
+ls -lh ./zig-out/bin/tardi
+```
+
+Observed identity:
+
+- `tardi version`: `issue-677-local-5e88d4a (tls-profile=general, tls-backend=native)`
+- binary SHA-256:
+  `4ef83313bebf415bfcdd5af1684fb58788ccc70d5cec07dd51c61e061609d71a`
+- file type: `Mach-O 64-bit executable arm64`
+- size: `4.6M`
+
 ## Passed Local Gates
 
 ```sh
@@ -119,6 +147,18 @@ Additional visible soak output:
 - `soak.reconnect_resumption: iterations=40 accepted=40 executions=80 heavy=false`
 - `soak.persistent.multi_process_nonce_safety: heavy=false rounds=2 samples_per_process=8 lease_width=1000000 final_generation=3 tuples=52`
 
+```sh
+zig build test-integration -Dintegration-test-filter='h3interop.quic.' \
+  --summary all --error-style verbose
+```
+
+Result: completed with skips. Build summary reported `8/8 steps succeeded;
+0/4 tests passed (4 skipped)`.
+
+These production H3 resumption/0-RTT external-peer rows require a built
+ngtcp2/GnuTLS `gtlsclient` configured through `H3_INTEROP_CLIENT_PATH`; that
+peer was not available on this host.
+
 ## External HTTP/3 Interop Harness
 
 ```sh
@@ -148,6 +188,63 @@ Skipped rows:
 This proves only that the native interop tool builds and that the harness
 reports missing peers explicitly. It does not satisfy #677's real-QUIC proof
 rule.
+
+## External HTTP/3 Peer Build Attempt
+
+The canonical peer dependency installer,
+`scripts/interop/install-h3-peer-deps-ci.sh`, is Debian/Ubuntu-specific and
+uses `apt-get`, so it is not directly runnable on this macOS host.
+
+The peer build script was attempted with a temporary `PATH` containing
+`clang-19`/`clang++-19` wrapper scripts that exec this host's system
+`clang`/`clang++`. The host compiler passed a direct C++23 `<print>` smoke
+test, and GnuTLS was available:
+
+- `gnutls-cli 3.8.13`
+- `pkg-config --modversion gnutls` reported `3.8.13`
+
+First attempt:
+
+```sh
+PATH=<symlink-wrapper-dir>:$PATH \
+  H3_PEER_WORKDIR=/tmp/tardigrade-h3-peer-macos \
+  scripts/interop/build-h3-peer-ci.sh
+```
+
+Result: failed during ngtcp2 client CMake compiler probing because Apple tool
+lookup treated the symlink name `clang-19` as an Xcode tool name:
+`xcode-select: Failed to locate 'clang-19'`.
+
+Second attempt:
+
+```sh
+PATH=<exec-wrapper-dir>:$PATH \
+  H3_PEER_WORKDIR=/tmp/tardigrade-h3-peer-macos2 \
+  scripts/interop/build-h3-peer-ci.sh
+```
+
+Result: partially built the pinned nghttp3 peer library and configured the
+pinned ngtcp2 client, then failed while compiling `gtlsclient`.
+
+Observed versions:
+
+- nghttp3 checkout: `v1.18.0`
+- ngtcp2 checkout: `v1.25.0`
+- generated prefix header: `NGHTTP3_VERSION "1.18.0"`
+- Homebrew global header: `NGHTTP3_VERSION "1.15.0"`
+
+Failure shape:
+
+- `gtlsclient` compile failed on `NGHTTP3_STREAM_CLOSE_FLAG_NONE`,
+  `NGHTTP3_STREAM_CLOSE_FLAG_RX_APP_ERROR_CODE_SET`,
+  `NGHTTP3_STREAM_CLOSE_FLAG_TX_APP_ERROR_CODE_SET`, and
+  `nghttp3_conn_close_stream2`
+- those symbols exist in the freshly built `/tmp/.../prefix/include` header
+- CMake placed `/opt/homebrew/include` before `/tmp/.../prefix/include`, so
+  the compile picked up Homebrew's older nghttp3 `1.15.0` headers
+
+This is a local macOS peer-build environment issue, not a Tardigrade protocol
+result. The deterministic H3 external-peer rows remain unproven in this slice.
 
 ## Failed Local Gate
 
@@ -218,6 +315,9 @@ Covered by this slice:
   documented skips
 - native H3 interop tool built
 - external H3 peer matrix reported explicit local skips
+- production `h3interop.quic.*` rows reported explicit local skips
+- canonical H3 peer build was attempted and failed for a documented macOS
+  include-path/tooling reason before any Tardigrade H3 exchange could run
 - required `zig build test-integration` gate was run and produced concrete
   failures for triage
 
