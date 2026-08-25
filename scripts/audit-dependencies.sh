@@ -158,7 +158,7 @@ resolve_build_sources() {
 
 is_nonproduction_file() {
     case "$1" in
-    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh | scripts/profile.sh) return 0 ;;
+    .git/* | .zig/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh | scripts/profile.sh) return 0 ;;
     scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
@@ -166,7 +166,7 @@ is_nonproduction_file() {
 
 is_nonproduction_zig_file() {
     case "$1" in
-    .git/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
+    .git/* | .zig/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
     scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
@@ -300,7 +300,7 @@ scan_source_ffi() {
                 fail "foreign/product C header imported from production source $rel: $include_expr"
             fi
         done <<<"$include_exprs"
-    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
 scan_runtime_loading() {
@@ -315,7 +315,7 @@ scan_runtime_loading() {
                 fail "production runtime dynamic loading boundary in $rel: $line"
             done <<<"$matches"
         fi
-    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
 resolve_relative_import() {
@@ -359,7 +359,7 @@ scan_nonproduction_zig_imports() {
                 fail "production Zig source imports non-production source root $target from $rel"
             fi
         done < <(stripped "$zigfile" | tr '\n' ' ' | grep -oE '@import[[:space:]]*\([[:space:]]*[^)]*\)' || true)
-    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
 scan_build_production_graph() {
@@ -601,7 +601,7 @@ scan_build_graph() {
         case "$rel" in
         *.c | *.cc | *.cpp | *.cxx | *.m | *.mm) fail "vendored foreign implementation source in production scope: $rel" ;;
         esac
-    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -type f -print | sort 2>/dev/null || true)
+    done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -type f -print | sort 2>/dev/null || true)
 }
 
 approved_manifest_dependency() {
@@ -719,7 +719,7 @@ scan_metadata() {
         *) scan_files+=("$f") ;;
         esac
     done < <(find "$REPO_ROOT/scripts" -type f 2>/dev/null | sort)
-    while IFS= read -r f; do scan_files+=("$f"); done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o \( -name 'Dockerfile*' -o -name 'compose.yaml' -o -name 'compose.yml' \) -type f -print | sort)
+    while IFS= read -r f; do scan_files+=("$f"); done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.zig" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o \( -name 'Dockerfile*' -o -name 'compose.yaml' -o -name 'compose.yml' \) -type f -print | sort)
 
     for f in "${scan_files[@]}"; do
         [ -f "$f" ] || continue
@@ -1412,6 +1412,16 @@ EOF
 }
 EOF
         ;;
+    pass-toolchain-install-dir)
+        # scripts/install-zig.sh installs the toolchain into ./.zig by
+        # default, and release.yml's "Install Zig" step runs before the
+        # audit. The toolchain's own vendored compiler-rt/libtsan/libunwind
+        # C/C++ runtime sources must not be mistaken for a production
+        # vendored implementation.
+        mkdir -p "$root/.zig/0.16.0/zig-x86_64-linux-0.16.0/lib/libtsan/sanitizer_common"
+        printf 'int not_our_code(void) { return 1; }\n' \
+            >"$root/.zig/0.16.0/zig-x86_64-linux-0.16.0/lib/libtsan/sanitizer_common/sanitizer_common.cpp"
+        ;;
     esac
 }
 
@@ -1427,7 +1437,7 @@ run_self_test() {
             return 1
         fi
     done
-    for kind in pass-platform pass-platform-split-cimport pass-test-peer pass-isolated-nonproduction-zig pass-pure-zig; do
+    for kind in pass-platform pass-platform-split-cimport pass-test-peer pass-isolated-nonproduction-zig pass-pure-zig pass-toolchain-install-dir; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if ! "$0" --root "$tmp/$kind" >/dev/null; then
             rc=$?
