@@ -180,6 +180,10 @@ HOSTILE_SCENARIOS = {
     "upgrade_101_attempt": (
         b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
     ),
+    # RFC 9110 §15 defines valid status codes as 100..599; three decimal
+    # digits alone also admits 000..099 and 600..999 (#673 review round 6).
+    "status_code_too_low": b"HTTP/1.1 099 Weird\r\nContent-Length: 2\r\n\r\nok",
+    "status_code_too_high": b"HTTP/1.1 600 Weird\r\nContent-Length: 2\r\n\r\nok",
 }
 
 # #673 review: a hostile upstream can send just a bodiless response's header

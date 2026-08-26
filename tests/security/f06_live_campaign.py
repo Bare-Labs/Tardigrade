@@ -777,6 +777,9 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         "duplicate_te",
         "chunk_not_crlf_terminated",
         "upgrade_101_attempt",
+        # #673 review round 6: RFC 9110 §15 status-code range enforcement.
+        "status_code_too_low",
+        "status_code_too_high",
     ]
     for scenario in core_scenarios:
         up.reset()
@@ -911,7 +914,7 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     # representative pair against /hostile-streaming to prove the fix
     # actually reaches this path too, not just the buffered one the rest of
     # this suite exercises by default.
-    for scenario in ["duplicate_te", "upgrade_101_attempt"]:
+    for scenario in ["duplicate_te", "upgrade_101_attempt", "status_code_too_low", "status_code_too_high"]:
         up.reset()
         raw = send_raw(port, hostile(scenario, "/hostile-streaming"))
         followup = send_raw(port, req("GET", "/health", []))

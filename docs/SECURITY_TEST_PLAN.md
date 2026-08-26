@@ -146,7 +146,7 @@ client got a 4xx -- and every smuggling-shaped framing probe additionally
 appends a unique pipelined marker request to prove it is never dispatched,
 not just that the malformed probe itself was rejected.
 
-Coverage (140 live cases):
+Coverage (148 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
   oversized token, malformed/invalid-signature JWT, comma-joined
   `Authorization`, NUL/CR injection attempts), including a strict deny for
@@ -206,9 +206,13 @@ Coverage (140 live cases):
 - a status 101 upstream response is rejected outright rather than either
   being treated as a skippable 1xx interim response or relayed to the
   client as an ordinary bodiless final response, on both the buffered and
+  streaming paths;
+- an upstream status code outside RFC 9110 §15's valid `100..599` range
+  (e.g. `099`, `600`) is rejected outright rather than reformatted back out
+  to the client as an invalid status line, on both the buffered and
   streaming paths.
 
-The campaign found and fixed seventeen real defects, all now covered by
+The campaign found and fixed eighteen real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -383,6 +387,17 @@ deterministic regression tests:
     the connection reusable, validating the trailing CRLF literally, and
     using checked arithmetic that surfaces overflow as
     `error.UpstreamProtocolError` instead of a panic.
+18. `parseStrictStatusLine()` required exactly three decimal digits but
+    never checked they fell inside RFC 9110 §15's valid `100..599` status
+    code range, so a value like `099` or `600` parsed successfully. On the
+    buffered path the numeric status is later reformatted straight back
+    out to the client with `{d}`, so an unrejected `099` upstream status
+    became an invalid `HTTP/1.1 99 ...` downstream response line rather
+    than the safe `error.UpstreamProtocolError`/502 path; an out-of-range
+    high value is likewise not a status any caller downstream of the
+    parser is prepared to handle. Fixed by rejecting any status code
+    outside `100..599` in the shared `parseStrictStatusLine()`, covering
+    both the buffered and streaming paths from the single call site.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
@@ -392,7 +407,7 @@ forced-streaming `/hostile-streaming` twin -- plus a symlink and an
 `tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
 results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials
 are synthetic and local-only; no production secrets or traffic were used.
-140/140 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
+148/148 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
 script for current evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference

@@ -5,7 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Seventeen auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Eighteen auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
   hostile one, on both the buffered and a forced-streaming proxy route) and
@@ -88,8 +88,14 @@ All notable user-facing changes to Tardigrade are documented here.
     they were a literal CRLF, and computed chunk boundaries with unchecked
     arithmetic a maliciously oversized hex chunk-size could overflow into
     a safety-checked panic.
+  - The shared status-line parser required exactly three decimal digits
+    but never checked they fell inside RFC 9110 §15's valid `100..599`
+    status code range, so a value like `099` or `600` parsed successfully
+    -- and on the buffered path, an unrejected `099` was later reformatted
+    straight back out to the client as the invalid response line
+    `HTTP/1.1 99 ...`.
 
-  All seventeen fixed with regression coverage in `gateway_proxy_headers.zig`,
+  All eighteen fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
   and `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the
   full campaign writeup.

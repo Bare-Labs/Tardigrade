@@ -350,6 +350,12 @@ path). All three status-line-parsing call sites (`detectResponseFraming()`,
 implementation, `parseStrictStatusLine()`, so this validation cannot drift
 out of sync between them (#673).
 
+A "parseable" status code must also fall inside RFC 9110 §15's valid
+`100..599` range, not merely be three decimal digits (#673): a value like
+`099` or `600` is rejected rather than accepted and, on the buffered path,
+reformatted straight back out to the client as an invalid status line
+(e.g. `HTTP/1.1 99 ...`).
+
 A chunked upstream response body's connection is only marked reusable when
 the decoder consumed *exactly* the bytes read — through and including the
 terminating `0\r\n\r\n` chunk's trailer section — mirroring the

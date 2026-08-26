@@ -1767,6 +1767,12 @@ fn parseStrictStatusLine(header_block: []const u8) !ParsedStatusLine {
         if (!std.ascii.isDigit(c)) return error.UpstreamProtocolError;
     }
     const status_code = std.fmt.parseInt(u16, status_digits, 10) catch return error.UpstreamProtocolError;
+    // RFC 9110 §15 defines valid status codes as 100..599; three decimal
+    // digits alone admits 000..099 and 600..999, which downstream code
+    // assumes never occur (e.g. the buffered path reformats `status_code`
+    // straight back out with `{d}`, so an unrejected `099` would become an
+    // invalid `HTTP/1.1 99 ...` response line to the client) (#673 review).
+    if (status_code < 100 or status_code > 599) return error.UpstreamProtocolError;
 
     var reason: []const u8 = "";
     if (rest.len > 3) {
@@ -3805,6 +3811,62 @@ test "exchange rejects a chunk whose data is not terminated by CRLF (#673 review
         "GET",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhelloXX0\r\n\r\n",
     ));
+}
+
+test "exchange rejects an upstream status code below 100 (#673 review)" {
+    // RFC 9110 §15 defines valid status codes as 100..599; three decimal
+    // digits alone also admits 000..099. Unchecked, the buffered path
+    // reformats `status_code` straight back out to the client with `{d}`,
+    // so an unrejected "099" would become an invalid "HTTP/1.1 99 ..."
+    // downstream response line.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UpstreamProtocolError, exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 099 Weird\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    ));
+}
+
+test "exchange rejects an upstream status code above 599 (#673 review)" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UpstreamProtocolError, exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 600 Weird\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    ));
+    try std.testing.expectError(error.UpstreamProtocolError, exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 999 Weird\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    ));
+}
+
+test "readUpstreamHead rejects an upstream status code outside 100..599 (#673 review)" {
+    // Same rationale as the buffered-path equivalents, on the streaming
+    // path's shared call into parseStrictStatusLine().
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        "HTTP/1.1 099 Weird\r\nContent-Length: 2\r\n\r\nok",
+        "HTTP/1.1 600 Weird\r\nContent-Length: 2\r\n\r\nok",
+    }) |response| {
+        const fds = try makeBlockingSocketpair();
+        const client_fd = fds[0];
+        const peer_fd = fds[1];
+        defer _ = std.c.close(client_fd);
+        defer _ = std.c.close(peer_fd);
+        _ = std.c.write(peer_fd, response.ptr, response.len);
+
+        var read_storage: [4096]u8 = undefined;
+        var rb = StreamReadBuf{ .buf = &read_storage };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const transport = compat.netStreamFromFd(client_fd);
+
+        try std.testing.expectError(
+            error.UpstreamProtocolError,
+            readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET"),
+        );
+    }
 }
 
 /// A capturing downstream writer for the streaming-relay tests: satisfies the
