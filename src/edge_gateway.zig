@@ -1269,8 +1269,15 @@ fn serveOneRequestWithConfig(
         header_timeout_ms;
     setConnTimeouts(conn, header_timeout_ms, write_timeout_ms);
 
+    const max_requests_per_connection = cfg.max_requests_per_connection;
+    // This is the last request the server will allow on this physical
+    // connection: handleConnection must send `Connection: close` on its
+    // response rather than `keep-alive`, or the client will reuse a
+    // connection the server is about to tear down and lose its next request.
+    const is_last_allowed_request = max_requests_per_connection > 0 and served.* + 1 >= max_requests_per_connection;
+
     var keep_alive = false;
-    handleConnection(conn, session, cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol) catch |err| {
+    handleConnection(conn, session, cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request) catch |err| {
         if (isBenignDisconnect(err)) {
             ctx.state.logger.debug(null, "keepalive connection closed by peer: {}", .{err});
         } else {
@@ -1279,7 +1286,6 @@ fn serveOneRequestWithConfig(
         return .close;
     };
     served.* += 1;
-    const max_requests_per_connection = cfg.max_requests_per_connection;
 
     if (!keep_alive or http.shutdown.isShutdownRequested()) return .close;
     if (max_requests_per_connection > 0 and served.* >= max_requests_per_connection) return .close;
@@ -3731,7 +3737,7 @@ fn setConnTimeouts(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) v
     }
 }
 
-fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool) !void {
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -3881,6 +3887,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     keep_alive = request.keepAlive();
     if (streaming_request_body != null) keep_alive = false;
     if (http.shutdown.isShutdownRequested()) keep_alive = false;
+    // Tell the client this is the last response on this connection (RFC
+    // 7230 §6.6) instead of closing the socket after promising keep-alive.
+    if (is_last_allowed_request) keep_alive = false;
 
     // --- Correlation ID ---
     const correlation_id = try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
