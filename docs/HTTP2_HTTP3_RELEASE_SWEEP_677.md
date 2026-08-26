@@ -68,10 +68,12 @@ TARDI_BIN="$PWD/zig-out/bin/tardi" \
 
 The script records `tardi version`, the source SHA, executable path, SHA-256,
 OS/architecture, Zig, curl, nghttp, h2load, OpenSSL, GnuTLS, and configured H3
-peer paths into `.zig-cache/http-release-sweep-677/metadata.txt`, then runs
-the focused H2/H3 deterministic rows with `-Dtardigrade-bin-path` so
+peer path metadata into `.zig-cache/http-release-sweep-677/metadata.txt`, then
+runs the focused H2/H3 deterministic rows with `-Dtardigrade-bin-path` so
 integration tests exercise the selected artifact instead of silently using the
-freshly built debug binary.
+freshly built debug binary. The external H3 peer matrix remains owned by the
+dedicated interop runner and should be executed separately when peer paths are
+available.
 
 ## Passed Local Gates
 

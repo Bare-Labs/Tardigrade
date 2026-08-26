@@ -80,8 +80,12 @@ metadata="$evidence_dir/metadata.txt"
   gnutls-cli --version 2>&1 | head -n 1 || true
   if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ]; then
     printf 'ngtcp2_examples_dir=%s\n' "$NGTCP2_EXAMPLES_DIR"
-    [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ] && "$NGTCP2_EXAMPLES_DIR/gtlsclient" --version 2>&1 | sed 's/^/gtlsclient=/' || true
-    [ -x "$NGTCP2_EXAMPLES_DIR/gtlsserver" ] && "$NGTCP2_EXAMPLES_DIR/gtlsserver" --version 2>&1 | sed 's/^/gtlsserver=/' || true
+    if [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
+      "$NGTCP2_EXAMPLES_DIR/gtlsclient" --version 2>&1 | sed 's/^/gtlsclient=/'
+    fi
+    if [ -x "$NGTCP2_EXAMPLES_DIR/gtlsserver" ]; then
+      "$NGTCP2_EXAMPLES_DIR/gtlsserver" --version 2>&1 | sed 's/^/gtlsserver=/'
+    fi
   fi
   [ -n "${QUICHE_EXAMPLES_DIR:-}" ] && printf 'quiche_examples_dir=%s\n' "$QUICHE_EXAMPLES_DIR"
   [ -n "${AIOQUIC_PYTHON:-}" ] && printf 'aioquic_python=%s\n' "$AIOQUIC_PYTHON"
@@ -118,14 +122,9 @@ fi
 run_step "native HTTP/3 interop tool build" \
   zig build build-h3-interop --summary all --error-style verbose
 
-if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] || [ -n "${QUICHE_EXAMPLES_DIR:-}" ] || [ -n "${AIOQUIC_PYTHON:-}" ]; then
-  run_step "external HTTP/3 peer matrix" \
-    scripts/interop/run-interop.sh
-else
-  say ""
-  say "==> external HTTP/3 peer matrix"
-  say "SKIP: set NGTCP2_EXAMPLES_DIR, QUICHE_EXAMPLES_DIR, or AIOQUIC_PYTHON to run external peers."
-fi
+say ""
+say "==> external HTTP/3 peer matrix"
+say "SKIP: run the dedicated interop matrix separately with configured peer paths."
 
 say ""
 say "release sweep completed"
