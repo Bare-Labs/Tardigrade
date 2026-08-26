@@ -2390,6 +2390,15 @@ fn h2ResetStreamState(
     h2RemoveReadyStream(ready_streams, stream_id);
 }
 
+fn h2EncodedHeaderBlockLimit(cfg: *const edge_config.EdgeConfig, buffered_request_bytes: usize) usize {
+    var limit = cfg.request_limits.effectiveMaxHeadersTotalSize();
+    if (cfg.max_connection_memory_bytes > 0) {
+        const remaining_connection_memory = cfg.max_connection_memory_bytes -| buffered_request_bytes;
+        limit = @min(limit, remaining_connection_memory);
+    }
+    return limit;
+}
+
 fn h2ProcessHeaderBlock(
     allocator: std.mem.Allocator,
     decoder: *http.hpack.Decoder,
@@ -2644,10 +2653,6 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     var continuation_transport_early = false;
     var continuation_block = std.array_list.Managed(u8).init(allocator);
     defer continuation_block.deinit();
-    const max_encoded_header_block_bytes = if (cfg.max_connection_memory_bytes > 0)
-        @min(cfg.request_limits.effectiveMaxHeadersTotalSize(), cfg.max_connection_memory_bytes)
-    else
-        cfg.request_limits.effectiveMaxHeadersTotalSize();
     defer {
         var it = pending.iterator();
         while (it.next()) |entry| {
@@ -2785,10 +2790,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 }
                 if ((frame.flags & http.http2_frame.Flags.END_HEADERS) == 0) {
                     const fragment = frame.payload[payload_offset..];
-                    if (fragment.len > max_encoded_header_block_bytes) {
-                        try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
-                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
-                        continue;
+                    if (fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
+                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                        return error.Http2CompressionError;
                     }
                     continuation_stream_id = frame.stream_id;
                     continuation_end_stream = (frame.flags & http.http2_frame.Flags.END_STREAM) != 0;
@@ -2797,10 +2801,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try continuation_block.appendSlice(fragment);
                     continue;
                 }
-                if (frame.payload[payload_offset..].len > max_encoded_header_block_bytes) {
-                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
-                    h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
-                    continue;
+                if (frame.payload[payload_offset..].len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                    return error.Http2CompressionError;
                 }
                 try h2ProcessHeaderBlock(
                     allocator,
@@ -2931,15 +2934,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 goaway_received = true;
             },
             .continuation => {
-                if (continuation_block.items.len +| frame.payload.len > max_encoded_header_block_bytes) {
-                    const stream_id = continuation_stream_id orelse return error.InvalidHttp2FrameSequence;
-                    try http.http2_frame.writeRstStream(conn.writer(), stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
-                    h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, stream_id);
-                    continuation_block.clearRetainingCapacity();
-                    continuation_stream_id = null;
-                    continuation_end_stream = false;
-                    continuation_transport_early = false;
-                    continue;
+                if (continuation_block.items.len +| frame.payload.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                    return error.Http2CompressionError;
                 }
                 continuation_block.appendSlice(frame.payload) catch {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.internal_error.value());

@@ -5668,32 +5668,19 @@ test "interop.h2.valid_headers_continuation_block_dispatches_after_end_headers" 
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
-test "interop.h2.continuation_header_block_limit_resets_stream_without_dispatch" {
+test "interop.h2.continuation_header_block_limit_sends_compression_goaway" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
-    var upstream = try UpstreamServer.start(allocator, &.{
-        .{ .body = "continuation-limit-stream3-ok", .connection_header = "close" },
-    });
-    defer upstream.stop();
-    try upstream.run();
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location = /healthz {{
-        \\    return 200 alive;
-        \\}}
-        \\
-        \\location = /h2-continuation-limit {{
-        \\    proxy_pass http://{s}:{d}/h2-continuation-limit;
-        \\}}
-    , .{ test_host, upstream.port() });
-    defer allocator.free(config_text);
-
     var tardigrade = try TardigradeProcess.start(allocator, .{
-        .config_text = config_text,
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
         .ready_https_insecure = true,
         .ready_path = "/healthz",
         .extra_env = &.{
@@ -5705,7 +5692,6 @@ test "interop.h2.continuation_header_block_limit_resets_stream_without_dispatch"
         },
     });
     defer tardigrade.stop();
-    try upstream.resetCapture();
 
     const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
     defer client.destroy();
@@ -5721,39 +5707,67 @@ test "interop.h2.continuation_header_block_limit_resets_stream_without_dispatch"
     @memset(continuation_fragment, 0);
     try client.writeHttp2Frame(0x9, 0, 1, continuation_fragment);
     try client.writeHttp2Frame(0x9, 0, 1, continuation_fragment);
-    try expectH2RstStream(client, allocator, 1, 0xb); // ENHANCE_YOUR_CALM
+    try expectH2Goaway(client, allocator, 0x9); // COMPRESSION_ERROR
+}
 
-    const headers3 = [_]hpack.HeaderField{
-        .{ .name = ":method", .value = "GET" },
-        .{ .name = ":path", .value = "/h2-continuation-limit" },
+test "interop.h2.continuation_header_block_limit_counts_buffered_request_memory" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "2000" },
+            .{ .name = "TARDIGRADE_MAX_HEADERS_TOTAL_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", .value = "1200" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    const headers1 = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/healthz" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "tardigrade.test" },
     };
-    const request_block3 = try hpack.encodeLiteralHeaderBlock(allocator, headers3[0..]);
-    defer allocator.free(request_block3);
-    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 3, request_block3);
+    const request_block1 = try hpack.encodeLiteralHeaderBlock(allocator, headers1[0..]);
+    defer allocator.free(request_block1);
+    try client.writeHttp2Frame(0x1, 0x4, 1, request_block1); // END_HEADERS only, body follows
 
-    var body = std.array_list.Managed(u8).init(allocator);
-    defer body.deinit();
-    var done = false;
-    var frame_count: usize = 0;
-    while (frame_count < 16 and !done) : (frame_count += 1) {
-        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
-        defer frame.deinit(allocator);
-        switch (frame.typ) {
-            0x0 => {
-                if (frame.stream_id == 3) {
-                    try body.appendSlice(frame.payload);
-                    if ((frame.flags & 0x1) != 0) done = true;
-                }
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(done);
-    try assertContains(body.items, "continuation-limit-stream3-ok");
-    try waitForUpstreamCount(&upstream, 1, 2_000);
-    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    const body_fragment = try allocator.alloc(u8, 1000);
+    defer allocator.free(body_fragment);
+    @memset(body_fragment, 'x');
+    try client.writeHttp2Frame(0x0, 0, 1, body_fragment);
+
+    const first_fragment = try allocator.alloc(u8, 100);
+    defer allocator.free(first_fragment);
+    @memset(first_fragment, 0);
+    try client.writeHttp2Frame(0x1, 0x1, 3, first_fragment); // END_STREAM, no END_HEADERS
+
+    const continuation_fragment = try allocator.alloc(u8, 101);
+    defer allocator.free(continuation_fragment);
+    @memset(continuation_fragment, 0);
+    try client.writeHttp2Frame(0x9, 0, 3, continuation_fragment);
+    try expectH2Goaway(client, allocator, 0x9); // COMPRESSION_ERROR
 }
 
 test "interop.h2.malformed_hpack_block_sends_compression_goaway" {
