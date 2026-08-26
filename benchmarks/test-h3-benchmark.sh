@@ -893,6 +893,58 @@ check_not "run_wrk_remote does not exit 0 on unparseable wrk output" \
     "status=0" "status=${UNPARSEABLE_STATUS}"
 
 echo ""
+echo "==> Test 29: write_combined_outputs preserves explicit supported:false/covered:false through actual CSV/Markdown rendering (PR #681 round-4 review)"
+# Runs the real write_combined_outputs, not a copied jq expression, so a
+# future reintroduction of the `// true`-style false-coercion bug this round
+# found and fixed would fail this test even if nothing else changed.
+FIXTURE_DIR="$(mktemp -d /tmp/tardi-competitive-render-XXXX)"
+cat > "${FIXTURE_DIR}/haproxy.json" <<'JSON'
+{
+  "_meta": {"competitive_server":"haproxy"},
+  "static-large-http1": {"supported":false,"reason":"fixture unsupported"}
+}
+JSON
+cat > "${FIXTURE_DIR}/upstream-pool-matrix.json" <<'JSON'
+{
+  "scenarios": {
+    "uneven-route-distribution": {
+      "covered": false,
+      "reason": "fixture uncovered",
+      "routes": {}
+    },
+    "many-origins-low-volume": {"measurements":[]},
+    "pool-contention": {"measurements":[]}
+  }
+}
+JSON
+(
+    # shellcheck disable=SC2034 # read by write_combined_outputs, sourced via eval below — shellcheck can't see across that
+    OUT_DIR="$FIXTURE_DIR"
+    # shellcheck disable=SC2034 # read by write_combined_outputs, sourced via eval below
+    TOOL=wrk
+    # shellcheck disable=SC2034
+    DURATION=1
+    # shellcheck disable=SC2034
+    CONNECTIONS=1
+    # shellcheck disable=SC2034
+    THREADS=1
+    # shellcheck disable=SC2329 # called indirectly by write_combined_outputs, sourced via eval below
+    host_metadata_json() { printf '{}'; }
+    eval "$(source_functions "$COMPETITIVE_RUN_SH" write_combined_outputs)"
+    write_combined_outputs >/dev/null
+)
+FIXTURE_CSV="$(cat "${FIXTURE_DIR}/competitive-results.csv")"
+FIXTURE_MD="$(cat "${FIXTURE_DIR}/competitive-summary.md")"
+check "server supported:false survives real CSV rendering (not reverted to true)" \
+    '"haproxy","static-large-http1",false' "$FIXTURE_CSV"
+check "upstream covered:false survives real CSV rendering (not reverted to true)" \
+    '"tardigrade","upstream-pool/uneven-route-distribution",false' "$FIXTURE_CSV"
+# shellcheck disable=SC2016 # backticks are literal Markdown code-fence syntax, not command substitution
+check "upstream covered:false survives real Markdown rendering (not reverted to true)" \
+    '| `uneven-route-distribution` | false |' "$FIXTURE_MD"
+rm -rf "$FIXTURE_DIR"
+
+echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"
 HELP_OUTPUT="$("$RUN_SH" --help 2>&1)"
 check "static-http1 still documented"   "static-http1" "$HELP_OUTPUT"
