@@ -323,7 +323,11 @@ pub fn build(b: *std.Build) void {
     allocation_regression_step.dependOn(&run_allocation_regression.step);
 
     const integration_options = b.addOptions();
-    integration_options.addOption([]const u8, "tardigrade_bin_path", b.getInstallPath(.bin, "tardi"));
+    integration_options.addOption(
+        []const u8,
+        "tardigrade_bin_path",
+        b.option([]const u8, "tardigrade-bin-path", "Path to the tardi executable used by integration tests") orelse b.getInstallPath(.bin, "tardi"),
+    );
 
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),

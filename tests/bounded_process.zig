@@ -168,17 +168,29 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         }
     } else |err| switch (err) {
         error.EndOfStream => {},
-        error.Timeout => return killedResult(
-            allocator,
-            &child,
-            pgid,
-            &reaped,
-            &multi_reader,
-            &reader_active,
-            .timeout,
-            options.stdout_limit,
-            options.stderr_limit,
-        ),
+        error.Timeout => {
+            if (reapExitedChild(&child, pgid)) |term| {
+                reaped = true;
+                return resultForTerm(
+                    allocator,
+                    &multi_reader,
+                    &reader_active,
+                    term,
+                    options.accepted_exit_codes,
+                );
+            }
+            return killedResult(
+                allocator,
+                &child,
+                pgid,
+                &reaped,
+                &multi_reader,
+                &reader_active,
+                .timeout,
+                options.stdout_limit,
+                options.stderr_limit,
+            );
+        },
         else => return killedResult(
             allocator,
             &child,
@@ -236,29 +248,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
     );
     reaped = true;
 
-    const outcome: Outcome = switch (term) {
-        .exited => |code| if (isAcceptedExit(code, options.accepted_exit_codes))
-            .{ .normal_exit = code }
-        else
-            .{ .unexpected_exit_code = code },
-        .signal => |sig| .{ .signal = sig },
-        .stopped => |sig| .{ .signal = sig },
-        .unknown => .launch_failure,
-    };
-
-    const stdout = try multi_reader.toOwnedSlice(0);
-    errdefer allocator.free(stdout);
-    const stderr = try multi_reader.toOwnedSlice(1);
-    errdefer allocator.free(stderr);
-    reader_active = false;
-    multi_reader.deinit();
-
-    return .{
-        .outcome = outcome,
-        .stdout = stdout,
-        .stderr = stderr,
-        .diagnostic = try diagnosticFor(allocator, outcome, stdout, stderr),
-    };
+    return resultForTerm(allocator, &multi_reader, &reader_active, term, options.accepted_exit_codes);
 }
 
 fn waitForExit(
@@ -290,6 +280,20 @@ fn waitForExit(
     }
 }
 
+fn reapExitedChild(child: *std.process.Child, pgid: std.posix.pid_t) ?std.process.Child.Term {
+    const pid = child.id orelse return null;
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    const waited = waitPidNoHang(pid, &status) catch |err| switch (err) {
+        error.Interrupted => return null,
+        else => return null,
+    };
+    if (waited != pid) return null;
+    child.id = null;
+    closeChildPipes(child);
+    terminateProcessGroup(pgid);
+    return statusToTerm(@bitCast(status));
+}
+
 fn waitPidNoHang(
     pid: std.posix.pid_t,
     status: *if (builtin.link_libc) c_int else u32,
@@ -311,6 +315,40 @@ fn statusToTerm(status: u32) std.process.Child.Term {
         .{ .stopped = std.posix.W.STOPSIG(status) }
     else
         .{ .unknown = status };
+}
+
+fn outcomeForTerm(term: std.process.Child.Term, accepted_exit_codes: []const u8) Outcome {
+    return switch (term) {
+        .exited => |code| if (isAcceptedExit(code, accepted_exit_codes))
+            .{ .normal_exit = code }
+        else
+            .{ .unexpected_exit_code = code },
+        .signal => |sig| .{ .signal = sig },
+        .stopped => |sig| .{ .signal = sig },
+        .unknown => .launch_failure,
+    };
+}
+
+fn resultForTerm(
+    allocator: std.mem.Allocator,
+    multi_reader: *std.Io.File.MultiReader,
+    reader_active: *bool,
+    term: std.process.Child.Term,
+    accepted_exit_codes: []const u8,
+) std.mem.Allocator.Error!Result {
+    const outcome = outcomeForTerm(term, accepted_exit_codes);
+    const stdout = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    errdefer allocator.free(stderr);
+    reader_active.* = false;
+    multi_reader.deinit();
+    return .{
+        .outcome = outcome,
+        .stdout = stdout,
+        .stderr = stderr,
+        .diagnostic = try diagnosticFor(allocator, outcome, stdout, stderr),
+    };
 }
 
 fn closeChildPipes(child: *std.process.Child) void {

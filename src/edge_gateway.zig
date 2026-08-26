@@ -2357,6 +2357,94 @@ fn h2AppendReadyStream(ready_streams: *std.array_list.Managed(u31), sid: u31) !v
     try ready_streams.append(sid);
 }
 
+fn h2RemoveReadyStream(ready_streams: *std.array_list.Managed(u31), sid: u31) void {
+    var idx: usize = 0;
+    while (idx < ready_streams.items.len) {
+        if (ready_streams.items[idx] == sid) {
+            _ = ready_streams.swapRemove(idx);
+            continue;
+        }
+        idx += 1;
+    }
+}
+
+fn h2ResetStreamState(
+    allocator: std.mem.Allocator,
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    pending: *std.AutoHashMap(u31, Http2PendingStream),
+    pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
+    ready_streams: *std.array_list.Managed(u31),
+    buffered_request_bytes: *usize,
+    stream_id: u31,
+) void {
+    _ = streams.remove(stream_id);
+    if (pending.fetchRemove(stream_id)) |removed| {
+        var tmp = removed.value;
+        buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.body.items.len);
+        tmp.deinit(allocator);
+    }
+    if (pending_responses.fetchRemove(stream_id)) |removed| {
+        var tmp = removed.value;
+        tmp.deinit(allocator);
+    }
+    h2RemoveReadyStream(ready_streams, stream_id);
+}
+
+fn h2EncodedHeaderBlockLimit(cfg: *const edge_config.EdgeConfig, buffered_request_bytes: usize) usize {
+    var limit = cfg.request_limits.effectiveMaxHeadersTotalSize();
+    if (cfg.max_connection_memory_bytes > 0) {
+        const remaining_connection_memory = cfg.max_connection_memory_bytes -| buffered_request_bytes;
+        limit = @min(limit, remaining_connection_memory);
+    }
+    return limit;
+}
+
+fn h2ProcessHeaderBlock(
+    allocator: std.mem.Allocator,
+    decoder: *http.hpack.Decoder,
+    pending: *std.AutoHashMap(u31, Http2PendingStream),
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    ready_streams: *std.array_list.Managed(u31),
+    stream_id: u31,
+    header_block: []const u8,
+    end_stream: bool,
+    transport_early: bool,
+    writer: anytype,
+    last_client_stream_id: u31,
+) !void {
+    var decoded = decoder.decode(allocator, header_block) catch {
+        try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+        return error.Http2CompressionError;
+    };
+    defer http.hpack.deinitDecoded(allocator, &decoded);
+
+    var ps = pending.get(stream_id) orelse Http2PendingStream.init(allocator);
+    var committed = false;
+    errdefer if (!committed) ps.deinit(allocator);
+    ps.transport_early = ps.transport_early or transport_early;
+    if (streams.get(stream_id)) |s| ps.priority_weight = s.priority_weight;
+    for (decoded.headers) |h| {
+        if (std.mem.eql(u8, h.name, ":method")) {
+            if (ps.method) |m| allocator.free(m);
+            ps.method = try allocator.dupe(u8, h.value);
+        } else if (std.mem.eql(u8, h.name, ":path")) {
+            if (ps.path) |p| allocator.free(p);
+            ps.path = try allocator.dupe(u8, h.value);
+        } else if (std.mem.eql(u8, h.name, ":authority")) {
+            if (ps.authority) |a| allocator.free(a);
+            ps.authority = try allocator.dupe(u8, h.value);
+        } else if (h.name.len > 0 and h.name[0] != ':') {
+            try ps.headers.append(h.name, h.value);
+        }
+    }
+    try pending.put(stream_id, ps);
+    committed = true;
+    if (end_stream) {
+        if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
+        try h2AppendReadyStream(ready_streams, stream_id);
+    }
+}
+
 /// Outbound response body parked on a stream while HTTP/2 send credit is
 /// exhausted. Ownership of `body_alloc` (when set) transfers here from
 /// `respondHttp2Stream`; `deinit` is idempotent so it is safe to call from
@@ -2560,6 +2648,11 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     var buffered_request_bytes: usize = 0;
     var last_client_stream_id: u31 = 0;
     var goaway_received = false;
+    var continuation_stream_id: ?u31 = null;
+    var continuation_end_stream = false;
+    var continuation_transport_early = false;
+    var continuation_block = std.array_list.Managed(u8).init(allocator);
+    defer continuation_block.deinit();
     defer {
         var it = pending.iterator();
         while (it.next()) |entry| {
@@ -2613,12 +2706,34 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         defer http.http2_frame.deinitFrame(allocator, &frame);
         const frame_transport_early = h2LastReadTransportEarly(conn);
 
+        if (continuation_stream_id) |expected_stream_id| {
+            if (frame.typ != .continuation or frame.stream_id != expected_stream_id) {
+                try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                return error.InvalidHttp2FrameSequence;
+            }
+        } else if (frame.typ == .continuation) {
+            try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+            return error.InvalidHttp2FrameSequence;
+        }
+
         switch (frame.typ) {
             .settings => {
+                if (frame.stream_id != 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
+                if ((frame.flags & http.http2_frame.Flags.ACK) != 0 and frame.payload.len != 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidSettingsFrame;
+                }
                 if ((frame.flags & http.http2_frame.Flags.ACK) == 0) {
-                    const new_initial_window = http.http2_frame.parseSettingsInitialWindowSize(frame.payload) catch {
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
-                        return error.Http2FlowControlError;
+                    const new_initial_window = http.http2_frame.parseSettingsInitialWindowSize(frame.payload) catch |err| {
+                        const code = switch (err) {
+                            error.Http2FlowControlError => http.http2_stream.ErrorCode.flow_control_error,
+                            else => http.http2_stream.ErrorCode.frame_size_error,
+                        };
+                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, code.value());
+                        return err;
                     };
                     if (new_initial_window) |new_window| {
                         const delta: i64 = @as(i64, new_window) - @as(i64, peer_initial_window);
@@ -2655,7 +2770,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(conn.writer(), frame.payload);
             },
             .headers => {
-                if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
+                if (frame.stream_id == 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
+                if (frame.stream_id <= last_client_stream_id and !streams.contains(frame.stream_id)) {
+                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.stream_closed.value());
+                    continue;
+                }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
                 if (!streams.contains(frame.stream_id)) {
                     try streams.put(frame.stream_id, http.http2_stream.Stream.init(frame.stream_id, @intCast(peer_initial_window)));
@@ -2666,36 +2788,42 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = pr.weight;
                     payload_offset = 5;
                 }
-                var decoded = decoder.decode(allocator, frame.payload[payload_offset..]) catch {
+                if ((frame.flags & http.http2_frame.Flags.END_HEADERS) == 0) {
+                    const fragment = frame.payload[payload_offset..];
+                    if (fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
+                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                        return error.Http2CompressionError;
+                    }
+                    continuation_stream_id = frame.stream_id;
+                    continuation_end_stream = (frame.flags & http.http2_frame.Flags.END_STREAM) != 0;
+                    continuation_transport_early = frame_transport_early;
+                    continuation_block.clearRetainingCapacity();
+                    try continuation_block.appendSlice(fragment);
+                    continue;
+                }
+                if (frame.payload[payload_offset..].len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                     return error.Http2CompressionError;
-                };
-                defer http.hpack.deinitDecoded(allocator, &decoded);
-                var ps = pending.get(frame.stream_id) orelse Http2PendingStream.init(allocator);
-                ps.transport_early = ps.transport_early or frame_transport_early;
-                if (streams.get(frame.stream_id)) |s| ps.priority_weight = s.priority_weight;
-                for (decoded.headers) |h| {
-                    if (std.mem.eql(u8, h.name, ":method")) {
-                        if (ps.method) |m| allocator.free(m);
-                        ps.method = try allocator.dupe(u8, h.value);
-                    } else if (std.mem.eql(u8, h.name, ":path")) {
-                        if (ps.path) |p| allocator.free(p);
-                        ps.path = try allocator.dupe(u8, h.value);
-                    } else if (std.mem.eql(u8, h.name, ":authority")) {
-                        if (ps.authority) |a| allocator.free(a);
-                        ps.authority = try allocator.dupe(u8, h.value);
-                    } else if (h.name.len > 0 and h.name[0] != ':') {
-                        try ps.headers.append(h.name, h.value);
-                    }
                 }
-                try pending.put(frame.stream_id, ps);
-                if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
-                    if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
-                    try h2AppendReadyStream(&ready_streams, frame.stream_id);
-                }
+                try h2ProcessHeaderBlock(
+                    allocator,
+                    &decoder,
+                    &pending,
+                    &streams,
+                    &ready_streams,
+                    frame.stream_id,
+                    frame.payload[payload_offset..],
+                    (frame.flags & http.http2_frame.Flags.END_STREAM) != 0,
+                    frame_transport_early,
+                    conn.writer(),
+                    last_client_stream_id,
+                );
             },
             .data => {
-                if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
+                if (frame.stream_id == 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
                 if (pending.getPtr(frame.stream_id)) |ps| {
                     ps.transport_early = ps.transport_early or frame_transport_early;
                     const max_body = cfg.request_limits.effectiveMaxBodySize();
@@ -2736,12 +2864,31 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 }
             },
             .priority => {
+                if (frame.stream_id == 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
                 const pr = try http.http2_frame.parsePriority(frame.payload);
                 if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = pr.weight;
                 if (pending.getPtr(frame.stream_id)) |ps| ps.priority_weight = pr.weight;
             },
             .window_update => {
-                const inc = try http.http2_frame.parseWindowUpdateIncrement(frame.payload);
+                if (frame.payload.len != 4) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidWindowUpdateFrame;
+                }
+                const raw_inc = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFF_FFFF;
+                if (raw_inc == 0) {
+                    if (frame.stream_id == 0) {
+                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                        return error.InvalidWindowUpdateFrame;
+                    } else {
+                        try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
+                    }
+                    continue;
+                }
+                const inc: u31 = @intCast(raw_inc);
                 // RFC 9113 §6.9.1: a legal 31-bit increment can still push
                 // the resulting window past 2^31-1, which must be treated
                 // as FLOW_CONTROL_ERROR rather than left to wrap/trap in
@@ -2757,16 +2904,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     const new_window: i64 = @as(i64, s.send_window) + @as(i64, inc);
                     if (new_window > std.math.maxInt(i32)) {
                         try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
-                        _ = streams.remove(frame.stream_id);
-                        if (pending.fetchRemove(frame.stream_id)) |removed| {
-                            var tmp = removed.value;
-                            buffered_request_bytes -= @min(buffered_request_bytes, tmp.body.items.len);
-                            tmp.deinit(allocator);
-                        }
-                        if (pending_responses.fetchRemove(frame.stream_id)) |removed| {
-                            var tmp = removed.value;
-                            tmp.deinit(allocator);
-                        }
+                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
                     } else {
                         s.send_window = @intCast(new_window);
                     }
@@ -2778,29 +2916,57 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 try h2FlushPendingHttp2Responses(conn, allocator, state, &pending_responses, &streams, &conn_send_window);
             },
             .rst_stream => {
-                if (pending.fetchRemove(frame.stream_id)) |removed| {
-                    var tmp = removed.value;
-                    buffered_request_bytes -= @min(buffered_request_bytes, tmp.body.items.len);
-                    tmp.deinit(allocator);
+                if (frame.stream_id == 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
                 }
-                if (pending_responses.fetchRemove(frame.stream_id)) |removed| {
-                    var tmp = removed.value;
-                    tmp.deinit(allocator);
+                if (frame.payload.len != 4) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidRstStreamFrame;
                 }
-                _ = streams.remove(frame.stream_id);
-                var idx: usize = 0;
-                while (idx < ready_streams.items.len) {
-                    if (ready_streams.items[idx] == frame.stream_id) {
-                        _ = ready_streams.swapRemove(idx);
-                        continue;
-                    }
-                    idx += 1;
-                }
+                h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
             },
             .goaway => {
+                if (frame.stream_id != 0 or frame.payload.len < 8) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidGoawayFrame;
+                }
                 goaway_received = true;
             },
-            .continuation, .push_promise => {},
+            .continuation => {
+                if (continuation_block.items.len +| frame.payload.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                    return error.Http2CompressionError;
+                }
+                continuation_block.appendSlice(frame.payload) catch {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.internal_error.value());
+                    return error.OutOfMemory;
+                };
+                if ((frame.flags & http.http2_frame.Flags.END_HEADERS) != 0) {
+                    const stream_id = continuation_stream_id orelse return error.InvalidHttp2FrameSequence;
+                    try h2ProcessHeaderBlock(
+                        allocator,
+                        &decoder,
+                        &pending,
+                        &streams,
+                        &ready_streams,
+                        stream_id,
+                        continuation_block.items,
+                        continuation_end_stream,
+                        continuation_transport_early,
+                        conn.writer(),
+                        last_client_stream_id,
+                    );
+                    continuation_block.clearRetainingCapacity();
+                    continuation_stream_id = null;
+                    continuation_end_stream = false;
+                    continuation_transport_early = false;
+                }
+            },
+            .push_promise => {
+                try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                return error.InvalidHttp2FrameSequence;
+            },
         }
 
         try h2DispatchReadyStreams(
