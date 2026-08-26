@@ -100,14 +100,18 @@ in addition to `Connection` itself. The same holds symmetrically for an
 upstream response that sends `Connection: X-Foo` alongside `X-Foo: ...`.
 
 If `Connection` is itself repeated as multiple header fields, every field's
-tokens are unioned (#673): a nomination hiding in a second or later
-`Connection` field is honored exactly like one in the first, in both
+tokens are honored (#673): a nomination hiding in a second or later
+`Connection` field is treated exactly like one in the first, in both
 directions. RFC 7230 §3.2.2 treats duplicate fields with the same name as
 semantically equivalent to one comma-joined field, and the filtering logic
-must not silently fall back to only the first occurrence.
+must not silently fall back to only the first occurrence. Each occurrence's
+own value is scanned directly rather than pre-joined into a fixed-size
+buffer -- an earlier version of this fix joined every occurrence into a
+`[4096]u8` buffer and silently truncated on overflow, which was itself
+bypassable by padding earlier fields past the buffer boundary.
 
-Implementation: `joinHeaderValuesInList()` / `joinRawHeaderValues()` in
-`src/gateway_proxy_headers.zig`.
+Implementation: `anyConnectionHeaderReferencesHeader()` /
+`anyRawConnectionHeaderReferencesHeader()` in `src/gateway_proxy_headers.zig`.
 
 ## 3. Transfer-Encoding vs Content-Length Conflict
 
@@ -278,6 +282,14 @@ to recover or guess at partial responses.
 
 Upstream hop-by-hop and technology-disclosure headers are stripped from all
 responses regardless of status code, including 5xx error responses.
+
+An upstream `1xx`, `204`, or `304` response is bodiless by definition (RFC
+7230 §3.3, RFC 7231 §6.3.5/§6.5.5), regardless of any `Content-Length` the
+upstream sends. Tardigrade discards any trailing bytes on those responses
+rather than forwarding them as a body: a downstream client honors the
+bodiless rule and would otherwise treat the illegal bytes as the start of
+the next response on the connection, making a naive pass-through a
+response-splitting vector (#673).
 
 Implementation: `parseBufferedUpstreamResponse()` in `src/gateway_proxy.zig`.
 

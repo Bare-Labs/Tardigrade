@@ -348,7 +348,6 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
     // misleading here).  Callers synthesise a 502 Bad Gateway for this case.
     const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.UpstreamProtocolError;
     const headers_raw = raw[0..header_end];
-    const resp_body = raw[header_end + 4 ..];
 
     const first_line_end = std.mem.findScalar(u8, headers_raw, '\n') orelse return error.UpstreamProtocolError;
     const first_line = compat.trimRight(u8, headers_raw[0..first_line_end], "\r");
@@ -358,8 +357,15 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
     const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
     const reason = line_parts.rest();
 
-    var connection_header_buf: [4096]u8 = undefined;
-    const connection_header = gph.joinRawHeaderValues(headers_raw, "connection", &connection_header_buf);
+    // RFC 7230 §3.3 / RFC 7231 §6.3.5, §6.5.5: 1xx, 204, and 304 responses
+    // are defined as bodiless *regardless of any Content-Length the
+    // upstream sent*. A downstream client or intermediary honors that rule
+    // and will treat any trailing bytes as the start of the next response
+    // on the connection -- so blindly forwarding a hostile/misbehaving
+    // upstream's illegal body here is itself a response-splitting vector,
+    // not just an RFC nicety (#673 review). Discard any trailing bytes
+    // rather than treating them as this response's body.
+    const resp_body = if (responseStatusIsBodiless(status_code)) "" else raw[header_end + 4 ..];
 
     var resp_headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
@@ -379,7 +385,8 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         if (!http.headers.isValidHeaderName(hname) or !http.headers.isValidHeaderValue(hval)) {
             return error.UpstreamProtocolError;
         }
-        if (gph.shouldSkipUpstreamResponseHeader(hname, connection_header)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(hname, null)) continue;
+        if (gph.anyRawConnectionHeaderReferencesHeader(headers_raw, hname)) continue;
         try resp_headers.append(.{
             .name = try metadata_allocator.dupe(u8, hname),
             .value = try metadata_allocator.dupe(u8, hval),
@@ -2122,9 +2129,6 @@ fn readUpstreamHead(
     const status_code = std.fmt.parseInt(u16, sp.next() orelse "0", 10) catch 0;
     const reason = try arena.dupe(u8, sp.rest());
 
-    var connection_header_buf: [4096]u8 = undefined;
-    const connection_header = gph.joinRawHeaderValues(header_block, "connection", &connection_header_buf);
-
     var headers = std.array_list.Managed(UpstreamHeader).init(arena);
     var connection_close = false;
     var lines = std.mem.splitSequence(u8, header_block[@min(first_line_end + 2, header_block.len)..], "\r\n");
@@ -2146,7 +2150,8 @@ fn readUpstreamHead(
         if (!http.headers.isValidHeaderName(name) or !http.headers.isValidHeaderValue(value)) {
             return error.UpstreamProtocolError;
         }
-        if (gph.shouldSkipUpstreamResponseHeader(name, connection_header)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(name, null)) continue;
+        if (gph.anyRawConnectionHeaderReferencesHeader(header_block, name)) continue;
         try headers.append(.{ .name = try arena.dupe(u8, name), .value = try arena.dupe(u8, value) });
     }
     const framing = detectResponseFraming(header_block, method);
@@ -2962,6 +2967,47 @@ test "parseBufferedUpstreamResponse handles response with no body" {
     try std.testing.expectEqualStrings("No Content", parsed.reason);
     try std.testing.expectEqualStrings("", parsed.body);
     try std.testing.expectEqualStrings("no", parsed.headerValue("X-Accel-Buffering").?);
+}
+
+test "parseBufferedUpstreamResponse discards an illegal body on 204/304/1xx regardless of upstream Content-Length (#673 review)" {
+    // RFC 7230 §3.3 / RFC 7231 §6.3.5, §6.5.5: 1xx, 204, and 304 responses
+    // are bodiless by definition, regardless of any Content-Length the
+    // upstream sends. A downstream client honors that rule and treats any
+    // trailing bytes as the START OF THE NEXT RESPONSE on the connection --
+    // so a hostile/misbehaving upstream sending `204 No Content` with
+    // `Content-Length: 5\r\n\r\nnope!` must not have "nope!" forwarded to
+    // the client as this response's body; that is a response-splitting
+    // vector, not just an RFC nicety.
+    const testing = std.testing;
+
+    var parsed_204 = try parseBufferedUpstreamResponse(
+        testing.allocator,
+        "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\nnope!",
+    );
+    defer parsed_204.deinit(testing.allocator);
+    try testing.expectEqualStrings("", parsed_204.body);
+
+    var parsed_304 = try parseBufferedUpstreamResponse(
+        testing.allocator,
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\nnope!",
+    );
+    defer parsed_304.deinit(testing.allocator);
+    try testing.expectEqualStrings("", parsed_304.body);
+
+    var parsed_1xx = try parseBufferedUpstreamResponse(
+        testing.allocator,
+        "HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\nnope!",
+    );
+    defer parsed_1xx.deinit(testing.allocator);
+    try testing.expectEqualStrings("", parsed_1xx.body);
+
+    // A normal 200 with a body is unaffected.
+    var parsed_200 = try parseBufferedUpstreamResponse(
+        testing.allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    );
+    defer parsed_200.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", parsed_200.body);
 }
 
 test "parseBufferedUpstreamResponse strips hop-by-hop headers from upstream 5xx responses" {

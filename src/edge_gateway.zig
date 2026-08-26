@@ -3524,10 +3524,9 @@ fn appendHttp2UpstreamResponseHeaders(
     owned_values: *std.array_list.Managed([]u8),
     response: *const gp.BufferedUpstreamResponse,
 ) !void {
-    var connection_header_buf: [4096]u8 = undefined;
-    const connection_header = gph.joinHeaderValuesInList(response.headers, "connection", &connection_header_buf);
     for (response.headers) |header| {
-        if (gph.shouldSkipUpstreamResponseHeader(header.name, connection_header)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
+        if (gph.anyConnectionHeaderReferencesHeader(response.headers, header.name)) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         const name = try lowercaseName(allocator, lowered_names, header.name);
         const value = try allocator.dupe(u8, header.value);

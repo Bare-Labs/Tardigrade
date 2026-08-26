@@ -220,26 +220,44 @@ def framing_marker_case(up: Upstream, name: str, cat: str, port: int, build_raw)
     up.reset()
     resp = send_raw(port, raw_request, read_timeout=1.3)
     hits = up.hits()
-    smuggled = any(marker_path in h["path"] for h in hits)
+    # Diagnostic only: the pass/fail gate below is `len(hits) == 0`, which
+    # does not depend on the exact forwarded path shape (proxy_pass may
+    # rewrite the location prefix, e.g. inserting a "/"). Match on the
+    # unique case name rather than the full marker_path so this stays
+    # accurate regardless of that rewrite.
+    smuggled = any(name in h["path"] for h in hits)
     status = first_status_code(resp)
-    ok = len(hits) == 0 and not smuggled
+    ok = len(hits) == 0
     record(name, cat, ok, f"status={status} hits={len(hits)} smuggled={smuggled}")
+
+
+# Scenarios whose HEALTHY first response legitimately contains more than
+# one "HTTP/1." status line (e.g. 1xx interim responses correctly relayed
+# ahead of the final response) -- everything else must produce exactly one.
+SCENARIOS_WITH_MULTI_STATUS_LINE_FIRST_RESPONSE = frozenset({"unusual_1xx_chain"})
 
 
 def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scenario: str) -> None:
     """
-    Same-downstream-connection desync proof (#673 review): open ONE TCP
-    connection to tardi, send the hostile-upstream probe, then -- on that
-    SAME socket, without reconnecting -- send a second, ordinary request
-    and inspect what comes back. Two outcomes are accepted as safe:
-      (a) tardi closed the connection after the first response (the
-          strictest possible mitigation -- no reuse risk at all); or
+    Same-downstream-connection desync proof (#673 review, both passes): open
+    ONE TCP connection to tardi, send the hostile-upstream probe, then --
+    on that SAME socket, without reconnecting -- send a second, ordinary
+    request and inspect what comes back.
+
+    Critically, the FIRST response is validated too (a prior version of
+    this helper only inspected `second`, so a hostile upstream that
+    corrupted Tardigrade's very first reply to the client -- e.g. leaking
+    the ghost marker or splitting into more than one apparent response --
+    would pass as long as the connection then happened to close). A dirty
+    first response is an immediate fail regardless of what happens next.
+
+    Given a clean first response, two outcomes for the second request are
+    accepted as safe:
+      (a) tardi closed the connection afterward (the strictest possible
+          mitigation -- no reuse risk at all); or
       (b) tardi kept it open and the second response is a single,
           well-formed response that contains none of the first (hostile)
           response's distinguishing bytes.
-    More than one apparent status line in the second read, or leakage of
-    the hostile scenario's distinguishing content, is a downstream desync
-    and fails.
     """
     up.reset()
     leak_marker = SCENARIO_LEAK_MARKERS.get(scenario, b"")
@@ -260,6 +278,25 @@ def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scen
                 first += chunk
         except (socket.timeout, ConnectionResetError):
             pass
+
+        first_status_lines = first.count(b"HTTP/1.")
+        # unusual_1xx_chain's leak marker ("Early Hints") is the standard
+        # 103 reason phrase -- it is *expected* to appear in a correctly
+        # relayed first response for that scenario specifically, so only
+        # check it there against the SECOND response below, not the first.
+        first_leaked = (
+            scenario not in SCENARIOS_WITH_MULTI_STATUS_LINE_FIRST_RESPONSE
+            and bool(leak_marker)
+            and leak_marker in first
+        )
+        first_ghosted = GHOST_MARKER.encode() in first
+        max_expected_first_lines = 99 if scenario in SCENARIOS_WITH_MULTI_STATUS_LINE_FIRST_RESPONSE else 1
+        first_corrupted = first_status_lines > max_expected_first_lines or first_leaked or first_ghosted
+        if first_corrupted:
+            record(name, cat, False,
+                   f"first response already corrupted: status_lines={first_status_lines} "
+                   f"leaked={first_leaked} ghosted={first_ghosted} first_head={first[:150]!r}")
+            return
 
         second_send_failed = False
         try:
@@ -282,13 +319,15 @@ def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scen
         s.close()
 
     if second_send_failed or not second:
-        record(name, cat, True, "connection closed after first response (no reuse -- safe)")
+        record(name, cat, True, "connection closed after a clean first response (no reuse -- safe)")
         return
 
     status_line_count = second.count(b"HTTP/1.")
     leaked = bool(leak_marker) and leak_marker in second
-    ok = status_line_count == 1 and not leaked
-    record(name, cat, ok, f"status_lines_in_second={status_line_count} leaked={leaked} first_len={len(first)}")
+    ghosted = GHOST_MARKER.encode() in second
+    ok = status_line_count == 1 and not leaked and not ghosted
+    record(name, cat, ok,
+           f"status_lines_in_second={status_line_count} leaked={leaked} ghosted={ghosted} first_len={len(first)}")
 
 
 # --- case builders ----------------------------------------------------
@@ -739,12 +778,18 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     record("hostile_upstream_x_powered_by_stripped", cat, ok, f"headers={list(headers.keys())}")
 
     up.reset()
-    _ = send_raw(port, hostile("extra_bytes_after_response"))
+    first = send_raw(port, hostile("extra_bytes_after_response"))
     followup = send_raw(port, hostile(""))
-    leaked = GHOST_MARKER.encode() in followup
-    ok = not leaked
+    # #673 review point 3: the ghost marker must be checked against the
+    # FIRST response too, not just the follow-up -- a prior version of this
+    # test discarded `first` entirely, so a Tardigrade bug that immediately
+    # forwarded the ghost bytes as part of its own first response would
+    # have passed silently.
+    leaked_first = GHOST_MARKER.encode() in first
+    leaked_followup = GHOST_MARKER.encode() in followup
+    ok = not leaked_first and not leaked_followup
     record("hostile_upstream_extra_bytes_do_not_leak_into_next_response", cat, ok,
-           f"leaked={leaked} followup_head={followup[:100]!r}")
+           f"leaked_first={leaked_first} leaked_followup={leaked_followup} followup_head={followup[:100]!r}")
     hostile_same_socket_reuse(up, "hostile_upstream_extra_bytes_same_connection_reuse_is_clean", cat, port, "extra_bytes_after_response")
 
     for scenario in ["unusual_1xx_chain", "invalid_204_with_body", "invalid_304_with_body"]:

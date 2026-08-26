@@ -183,7 +183,7 @@ Coverage (116 live cases):
   "ghost" second response smuggled by the hostile upstream never leaks into
   a later, unrelated proxied response over a reused upstream connection.
 
-The campaign found and fixed five real defects, all now covered by
+The campaign found and fixed six real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -196,9 +196,14 @@ deterministic regression tests:
    upstream header forwarding in `edge_gateway.zig`).
 2. That same nomination check only consulted the *first* `Connection` field
    when a header was duplicated, in both directions (`Headers.get()`
-   returns only the first match). Fixed by unioning every occurrence
-   (`joinHeaderValuesInList()` / `joinRawHeaderValues()` in
-   `gateway_proxy_headers.zig`) rather than reading a single value.
+   returns only the first match). A first attempt at fixing this by joining
+   every occurrence into a fixed `[4096]u8` buffer was itself bypassable:
+   padding earlier `Connection` field(s) with enough benign tokens pushes a
+   real nomination past byte 4096, where it silently drops out of the
+   truncated joined value. Fixed by scanning each occurrence's own
+   (unbounded) value directly instead -- `anyConnectionHeaderReferencesHeader()`
+   / `anyRawConnectionHeaderReferencesHeader()` in `gateway_proxy_headers.zig` --
+   which has no size limit to bypass.
 3. Duplicate `Authorization` header fields were accepted whenever the
    *first* field (whichever the reading code path happened to consult) was
    a valid credential, silently ignoring a second, malformed field. Fixed
@@ -229,6 +234,18 @@ deterministic regression tests:
    rejecting the response as `error.UpstreamProtocolError` (502) if either
    fails, at both the buffered (`parseBufferedUpstreamResponse()`) and
    streamed (`readUpstreamHead()`) parse sites in `gateway_proxy.zig`.
+6. The buffered proxy path forwarded a body for upstream `204`/`304`/`1xx`
+   responses whenever the upstream included one, even though RFC 7230 §3.3 /
+   RFC 7231 §6.3.5, §6.5.5 define those statuses as bodiless *regardless of
+   any `Content-Length` sent* -- an RFC-compliant downstream client honors
+   that rule and treats the illegal trailing bytes as the start of the next
+   response on the connection, so this was a real response-splitting vector
+   from a hostile/misbehaving upstream, not just an RFC nicety. The
+   streamed proxy path already handled this correctly
+   (`detectResponseFraming()` already treated these statuses as bodiless);
+   only the buffered path (`parseBufferedUpstreamResponse()`) was affected.
+   Fixed by discarding any trailing bytes for bodiless statuses before they
+   are stored as the response body.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,

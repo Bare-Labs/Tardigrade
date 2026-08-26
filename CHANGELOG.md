@@ -5,7 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Five auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Six auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
   hostile one) and found:
@@ -15,7 +15,9 @@ All notable user-facing changes to Tardigrade are documented here.
     the client. The request direction already honored client-nominated
     hop-by-hop headers (RFC 7230 §6.1); the response direction did not.
   - That same nomination check only consulted the first `Connection` field
-    when the header was duplicated, in both directions.
+    when the header was duplicated, in both directions -- and a first fix
+    attempt that joined every occurrence into a fixed 4 KiB buffer was
+    itself bypassable by padding earlier fields past the buffer boundary.
   - Duplicate `Authorization` fields were accepted whenever the field a
     given code path happened to read first was valid, silently ignoring a
     second, malformed field.
@@ -27,6 +29,12 @@ All notable user-facing changes to Tardigrade are documented here.
     control-character validation at all, unlike client request headers,
     letting a hostile/compromised upstream inject a bare CR or NUL into a
     header value the client received.
+  - The buffered proxy path forwarded an illegal body for upstream
+    `204`/`304`/`1xx` responses whenever the upstream included one, even
+    though those statuses are bodiless by definition regardless of
+    `Content-Length` -- a real response-splitting vector, since a
+    downstream client would treat the illegal bytes as the start of the
+    next response on the connection.
 
   All five fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
