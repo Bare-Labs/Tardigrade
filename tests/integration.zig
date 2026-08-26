@@ -5403,7 +5403,7 @@ test "interop.h2.window_update_zero_increment_connection_goaway_and_stream_rst" 
 
         var inc_zero: [4]u8 = .{ 0, 0, 0, 0 };
         try client.writeHttp2Frame(0x8, 0, 0, inc_zero[0..]);
-        try expectH2Goaway(client, allocator, 0x3); // FLOW_CONTROL_ERROR
+        try expectH2Goaway(client, allocator, 0x1); // PROTOCOL_ERROR
     }
 
     {
@@ -5425,7 +5425,7 @@ test "interop.h2.window_update_zero_increment_connection_goaway_and_stream_rst" 
 
         var inc_zero: [4]u8 = .{ 0, 0, 0, 0 };
         try client.writeHttp2Frame(0x8, 0, 1, inc_zero[0..]);
-        try expectH2RstStream(client, allocator, 1, 0x3); // FLOW_CONTROL_ERROR
+        try expectH2RstStream(client, allocator, 1, 0x1); // PROTOCOL_ERROR
 
         const headers3 = [_]hpack.HeaderField{
             .{ .name = ":method", .value = "GET" },
@@ -5457,6 +5457,40 @@ test "interop.h2.window_update_zero_increment_connection_goaway_and_stream_rst" 
         try std.testing.expect(done);
         try assertContains(body.items, "zero-window-stream-ok");
     }
+}
+
+test "interop.h2.invalid_window_update_length_sends_connection_goaway" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    try client.writeHttp2Frame(0x8, 0, 1, &.{ 0, 0, 1 });
+    try expectH2Goaway(client, allocator, 0x6); // FRAME_SIZE_ERROR
 }
 
 test "interop.h2.illegal_stream_zero_headers_sends_goaway" {
@@ -5547,6 +5581,86 @@ test "interop.h2.illegal_headers_continuation_sequence_sends_goaway" {
         try client.writeHttp2Frame(0x0, 0x1, 1, &.{}); // DATA before required CONTINUATION
         try expectH2Goaway(client, allocator, 0x1); // PROTOCOL_ERROR
     }
+}
+
+test "interop.h2.valid_headers_continuation_block_dispatches_after_end_headers" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "fragmented-h2-headers-ok", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-fragmented-headers {{
+        \\    proxy_pass http://{s}:{d}/h2-fragmented-headers;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-fragmented-headers" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const request_block = try hpack.encodeLiteralHeaderBlock(allocator, headers[0..]);
+    defer allocator.free(request_block);
+    try std.testing.expect(request_block.len > 1);
+    const split = request_block.len / 2;
+    try client.writeHttp2Frame(0x1, 0x1, 1, request_block[0..split]); // END_STREAM, more header block follows
+    try client.writeHttp2Frame(0x9, 0x4, 1, request_block[split..]); // END_HEADERS
+
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    var done = false;
+    var frame_count: usize = 0;
+    while (frame_count < 16 and !done) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x0 => {
+                if (frame.stream_id == 1) {
+                    try body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) done = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(done);
+    try assertContains(body.items, "fragmented-h2-headers-ok");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "interop.h2.malformed_hpack_block_sends_compression_goaway" {

@@ -49,7 +49,7 @@ Observed identity:
 
 ## Repeatable Release-Artifact Sweep Path
 
-this PR adds a reusable sweep entrypoint that can target an installed or
+This PR adds a reusable sweep entrypoint that can target an installed or
 release-candidate binary directly:
 
 ```sh
@@ -69,11 +69,13 @@ TARDI_BIN="$PWD/zig-out/bin/tardi" \
 The script records `tardi version`, the source SHA, executable path, SHA-256,
 OS/architecture, Zig, curl, nghttp, h2load, OpenSSL, GnuTLS, and configured H3
 peer path metadata into `.zig-cache/http-release-sweep-677/metadata.txt`, then
-runs the focused H2/H3 deterministic rows with `-Dtardigrade-bin-path` so
-integration tests exercise the selected artifact instead of silently using the
-freshly built debug binary. The external H3 peer matrix remains owned by the
-dedicated interop runner and should be executed separately when peer paths are
-available.
+runs the focused H2 and native TLS integration rows with
+`-Dtardigrade-bin-path` so those rows exercise the selected artifact instead
+of silently using the freshly built debug binary. Its QUIC/H3 unit and
+interop-tool steps remain source-tree regression evidence until a black-box H3
+artifact row launches the selected `tardi` binary over UDP. The external H3
+peer matrix remains owned by the dedicated interop runner and should be
+executed separately when peer paths are available.
 
 ## Passed Local Gates
 
@@ -532,7 +534,7 @@ diagnostic context; it is not an outstanding #677 product defect.
 
 ## Additional Malformed H2 Coverage From This PR
 
-this PR extends the downstream H2 frame loop and integration tests with direct
+This PR extends the downstream H2 frame loop and integration tests with direct
 failure-scope assertions for malformed rows that were still only partially
 covered:
 
@@ -540,15 +542,20 @@ covered:
   `FRAME_SIZE_ERROR`.
 - invalid SETTINGS payload length now returns connection-scope `GOAWAY` with
   `FRAME_SIZE_ERROR`.
+- WINDOW_UPDATE with an invalid payload length now returns connection-scope
+  `GOAWAY` with `FRAME_SIZE_ERROR`.
 - connection-level WINDOW_UPDATE increment zero now returns connection-scope
-  `GOAWAY` with `FLOW_CONTROL_ERROR`.
+  `GOAWAY` with `PROTOCOL_ERROR`.
 - stream-level WINDOW_UPDATE increment zero now returns stream-scope
-  `RST_STREAM` with `FLOW_CONTROL_ERROR`, and a later unrelated stream on the
+  `RST_STREAM` with `PROTOCOL_ERROR`, and a later unrelated stream on the
   same connection remains usable.
 - HEADERS on stream 0 now returns connection-scope `GOAWAY` with
   `PROTOCOL_ERROR`.
 - stray CONTINUATION and DATA interleaved while CONTINUATION is required now
   return connection-scope `GOAWAY` with `PROTOCOL_ERROR`.
+- valid fragmented HEADERS/CONTINUATION blocks are buffered, decoded once
+  `END_HEADERS` arrives, and dispatched only after the complete field section
+  is available.
 - malformed/truncated HPACK integer encoding now returns connection-scope
   `GOAWAY` with `COMPRESSION_ERROR`.
 
@@ -560,7 +567,7 @@ zig build test-integration -Dintegration-test-filter='interop.h2.' \
 ```
 
 Result on 2026-08-25: passed. Build summary reported `8/8 steps succeeded;
-27/27 tests passed`.
+29/29 tests passed`.
 
 ## Independent H2 Client Attempts
 
@@ -620,14 +627,17 @@ Not covered by this slice:
 
 - execution against an actual installed/Homebrew release-candidate `tardi`
   artifact; the repeatable `TARDI_BIN=... scripts/run-http-release-sweep.sh`
-  path exists, and local ReleaseFast fallback validation is acceptable only
-  when no installed candidate is available
+  path exists for H2/native TLS integration rows, and local ReleaseFast
+  fallback validation is acceptable only when no installed candidate is
+  available
 - independent HTTP/2 TLS/ALPN/application exchange using `nghttp` specifically
 - malformed/truncated H2 frame-header and declared-payload-shorter-than-frame
   rows where the peer cannot send a complete frame; these are currently
   connection-close/read-boundary cases rather than GOAWAY-proven protocol rows
 - browser protocol attempts
 - real external HTTP/3 peer proof with quiche or aioquic
+- black-box H3 proof that launches the selected `TARDI_BIN`; current H3 rows
+  in the wrapper are source-tree regression evidence
 - H3 Alt-Svc proof against a usable advertised endpoint
 - controlled-host resource sweep beyond the existing PR-safe soaks
 - final #389 stable-promotion evidence

@@ -1,10 +1,12 @@
 #!/bin/bash
-# Repeatable HTTP/2 + HTTP/3 release-artifact sweep for #677.
+# Repeatable HTTP release-artifact sweep for #677.
 #
 # By default this targets the first `tardi` on PATH. Set TARDI_BIN to exercise
 # an installed release candidate, Homebrew package, or a local ReleaseFast
-# binary without silently substituting the source-tree debug executable.
-set -u
+# binary for integration rows without silently substituting the source-tree
+# debug executable. QUIC/H3 unit and interop-tool rows remain source-tree
+# regression evidence until a black-box H3 artifact row is added.
+set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
@@ -107,7 +109,7 @@ run_step "native TLS/H2 listener rows" \
   zig build test-integration-native-tls -Dtardigrade-bin-path="$tardi_bin" \
     --summary all --error-style verbose
 
-run_step "HTTP/3 deterministic QUIC/H3 rows and PR-safe resource soaks" \
+run_step "HTTP/3 source-tree QUIC/H3 regression rows and PR-safe resource soaks" \
   zig build test-quic --summary all --error-style verbose
 
 if enabled "${HTTP_SWEEP_FULL_GATES:-}"; then
