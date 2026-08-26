@@ -295,6 +295,20 @@ Tardigrade:
    documented `--remote SSH_HOST` flag had no parser arm at all (any use of
    it exited as "Unknown option"), and `--help` used the GNU-only `head -n
    -1` (crashes on macOS/BSD `head`).
+4. **`covered`/`supported: false` silently rendered as `true` in the
+   retained JSON/CSV/Markdown** (`benchmarks/competitive/run.sh`, found
+   fixing item 2 of this round's review). Every `X // Y // true`-style jq
+   fallback used to render these fields treats jq's `//` operator as
+   "use the right side if the left side is `null` *or* `false`" — so any
+   scenario explicitly marked `covered: false` or `supported: false`
+   rendered as `true` anyway. This silently affected every previously
+   "unsupported" row in this suite too (HAProxy's `static-large-http1`, the
+   H3 rows) in the CSV export specifically — the Markdown table happened to
+   use a direct `== false` check for those and rendered correctly, but the
+   CSV did not. Fixed every occurrence to distinguish `false` from `null`
+   explicitly, and added a "Reason" column to the Upstream Pool Matrix
+   Markdown table so a `false`/uncovered row's explanation is visible
+   inline, not just in the machine-readable JSON.
 
 All fixes above are included in this branch/PR and were verified (manually,
 and via `test-report.sh`/`test-h3-benchmark.sh`, plus new regression tests
@@ -410,4 +424,13 @@ zig build -Doptimize=ReleaseFast   # Zig 0.16.0
   --out-dir benchmarks/competitive/results/2026-08-25-beelink-competitive
 ```
 
-Tardigrade commit: `efe0876` (this branch, `claude/pr-593-implementation-84d51b`).
+Tardigrade commit benchmarked: `efe0876` — a **pre-rebase** SHA no longer
+reachable from this branch's history (see the "Tardigrade commit
+benchmarked" row in [Test environment](#test-environment) above for the
+post-rebase provenance mapping). The branch has since gained further
+review-response commits on top of that fix set, including a
+`competitive/run.sh` fix to how `covered`/`supported` booleans render in
+the retained JSON/CSV/Markdown (this file). That fix changes how existing
+data is *displayed* — it does not touch how `wrk`/`k6` are invoked against
+the servers under test, so it does not affect any recorded throughput,
+latency, CPU, RSS, or error number in this report.

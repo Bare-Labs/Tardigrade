@@ -42,13 +42,13 @@ Generated: 2026-08-25T20:46:17Z
 
 ## Upstream Pool Matrix
 
-| Scenario | Covered | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | New conn/s | Reuse ratio | Lock wait ns/req | Sharding | Errors |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
-| `uneven-route-distribution` | true | - | - | - | - | - | - | - | - | - | - | 0 |
-| `many-origins-low-volume` | true | 120.120 | - | - | 4.33 | 0.3604728604728604 | 6.12 | 0 | 1 | - | - | 0 |
-| `hot-origin-many-workers` | true | 8243.63 | 7.160 | 9.185759179999998 | 63.18 | 0.07664099431925014 | 6.04 | 0.19841269841269843 | 0.9999759049691985 | - | - | 0 |
-| `upstream-tls-handshake-reuse` | true | 97.27 | 330.826 | 330.92033190999996 | 1.73 | 0.1778554538912306 | 8.89 | 0.2661698163428267 | 0.9973190348525469 | - | - | 0 |
-| `pool-contention` | true | - | - | - | - | - | - | - | - | - | - | - |
+| Scenario | Covered | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | New conn/s | Reuse ratio | Lock wait ns/req | Sharding | Errors | Reason |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |
+| `uneven-route-distribution` | false | - | - | - | - | - | - | - | - | - | - | 0 | route-a/b/c run as three sequential wrk passes, not concurrent mixed traffic — they never compete for the shared worker/connection pool at the same time, so this does not exercise or validate route-fairness under concurrent uneven traffic as #149/#593 require. Per-route numbers below are real, informational single-route measurements, not fairness evidence. See https://github.com/Bare-Systems/Tardigrade/issues/683. |
+| `many-origins-low-volume` | true | 120.120 | - | - | 4.33 | 0.3604728604728604 | 6.12 | 0 | 1 | - | - | 0 | - |
+| `hot-origin-many-workers` | true | 8243.63 | 7.160 | 9.185759179999998 | 63.18 | 0.07664099431925014 | 6.04 | 0.19841269841269843 | 0.9999759049691985 | - | - | 0 | - |
+| `upstream-tls-handshake-reuse` | true | 97.27 | 330.826 | 330.92033190999996 | 1.73 | 0.1778554538912306 | 8.89 | 0.2661698163428267 | 0.9973190348525469 | - | - | 0 | - |
+| `pool-contention` | true | - | - | - | - | - | - | - | - | - | - | - | Derived from opt-in shared upstream-pool mutex wait counters correlated on the same worker-count row with throughput regression from the lower-core peak. |
 
 ### Upstream Pool Detail Rows
 

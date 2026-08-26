@@ -744,7 +744,7 @@
     },
     "scenarios": {
       "uneven-route-distribution": {
-        "covered": true,
+        "covered": false,
         "routes": {
           "route-a-hot": {
             "covered": true,
@@ -822,7 +822,8 @@
             "requested_weight": 5
           }
         },
-        "errors": 0
+        "errors": 0,
+        "reason": "route-a/b/c run as three sequential wrk passes, not concurrent mixed traffic — they never compete for the shared worker/connection pool at the same time, so this does not exercise or validate route-fairness under concurrent uneven traffic as #149/#593 require. Per-route numbers below are real, informational single-route measurements, not fairness evidence. See https://github.com/Bare-Systems/Tardigrade/issues/683."
       },
       "many-origins-low-volume": {
         "covered": true,
