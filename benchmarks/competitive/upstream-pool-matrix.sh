@@ -528,7 +528,8 @@ jq -n \
         },
         scenarios: {
             "uneven-route-distribution": {
-                covered: true,
+                covered: false,
+                reason: "route-a/b/c run as three sequential wrk passes, not concurrent mixed traffic — they never compete for the shared worker/connection pool at the same time, so this does not exercise or validate route-fairness under concurrent uneven traffic as #149/#593 require. Per-route numbers below are real, informational single-route measurements, not fairness evidence. See https://github.com/Bare-Systems/Tardigrade/issues/683.",
                 routes: {
                     "route-a-hot": ($route_a + {requested_weight: 80}),
                     "route-b-warm": ($route_b + {requested_weight: 15}),
