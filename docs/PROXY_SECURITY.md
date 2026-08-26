@@ -426,15 +426,29 @@ boundary is legitimately marked reusable — but a hostile or misbehaving
 origin can still send a "ghost" response *asynchronously*, any time after
 release, with no relationship to any request Tardigrade ever sent on that
 connection; nothing at release time can observe bytes that have not
-arrived yet. `UpstreamPool.checkout()` now polls each idle connection's raw
-fd (zero-timeout, watching for `POLLIN`/`POLLHUP`/`POLLERR`) immediately
-before handing it to the next, unrelated caller (#673 review round 7):
-anything already pending — an unsolicited byte, or the peer having closed
-the connection — discards that connection instead of reusing it, the same
-way an aged-out idle connection is discarded. A poll failure fails closed
-(treated as stale) rather than risking a false "clean" result. This closes
-the gap for `Content-Length`/chunked responses the same way the
+arrived yet. `UpstreamPool.checkout()` now checks each idle connection for
+exactly this immediately before handing it to the next, unrelated caller
+(#673 review round 7): anything already pending — an unsolicited byte, or
+the peer having closed the connection — discards that connection instead
+of reusing it, the same way an aged-out idle connection is discarded. This
+closes the gap for `Content-Length`/chunked responses the same way the
 bodiless-never-reusable rule above closes it for bodiless ones.
+
+The check differs by transport. A **plain** connection uses a zero-timeout
+`poll()` on the raw fd (`POLLIN`/`POLLHUP`/`POLLERR`): every byte on a
+plain connection's raw fd is necessarily application-layer, so any of
+these unambiguously means "do not reuse", and a poll failure fails closed
+(treated as stale) rather than risking a false "clean" result. A **TLS**
+connection cannot use the same raw-fd poll: real TLS 1.3 servers routinely
+send a `NewSessionTicket` (or other post-handshake, record-layer-only
+message) asynchronously right after the handshake, with no relationship to
+application data — that ciphertext shows up as immediately readable on the
+raw fd regardless, which would flag essentially every freshly-pooled TLS
+connection as stale and defeat TLS connection pooling outright. TLS
+connections instead check `UpstreamTlsConn.readReady()`: already-decrypted
+buffered plaintext, or a completed clean TLS shutdown — signals that
+distinguish genuine leftover application data from ordinary protocol
+chatter.
 
 Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `parseBufferedUpstreamResponse()`, `detectResponseFraming()`,
@@ -442,7 +456,8 @@ Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `readUpstreamHead()`/`streamProxyOverTransport()`/`relayUpstreamBody()`
 (the streaming path's equivalents) in `src/gateway_proxy.zig`;
 `UpstreamPool.checkout()`/`hasUnexpectedReadableBytes()` in
-`src/http/upstream_pool.zig`.
+`src/http/upstream_pool.zig`; `UpstreamTlsConn.readReady()`/`pending()` in
+`src/http/upstream_tls.zig`.
 
 ## 12. Directory Traversal — Static File Serving
 

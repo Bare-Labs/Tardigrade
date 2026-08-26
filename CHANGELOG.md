@@ -129,7 +129,12 @@ All notable user-facing changes to Tardigrade are documented here.
     -- so a "ghost" response delayed until after release, on a
     `Content-Length`/chunked response that legitimately landed on its
     declared boundary (not just the already-covered bodiless case), could
-    still poison a later, unrelated request over the same connection.
+    still poison a later, unrelated request over the same connection. Fixed
+    with a transport-aware staleness check: a raw-fd poll for plain
+    connections, and `UpstreamTlsConn.readReady()` for TLS ones (a raw-fd
+    poll on TLS connections flagged routine post-handshake protocol chatter,
+    e.g. session tickets, as staleness and broke TLS connection pooling
+    outright -- caught before merge by the native-TLS integration suite).
 
   All twenty-five fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,

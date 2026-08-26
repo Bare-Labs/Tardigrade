@@ -488,10 +488,22 @@ deterministic regression tests:
     still send a "ghost" response *asynchronously*, any time after release,
     with no relationship to any request Tardigrade ever sent on that
     connection. Nothing at release time can observe that; only a check at
-    the next checkout can. Fixed by polling each idle connection's raw fd
-    (zero-timeout, `POLLIN`/`POLLHUP`/`POLLERR`) before handing it out,
-    discarding it instead of reusing it if anything is already pending --
-    failing closed on a poll error too.
+    the next checkout can. Fixed by checking each idle connection before
+    handing it out, discarding it instead of reusing it if anything is
+    already pending -- for a plain connection, a zero-timeout `poll()` on
+    the raw fd (`POLLIN`/`POLLHUP`/`POLLERR`), failing closed on a poll
+    error too. **Self-caught regression before landing**: the first version
+    of this fix used the same raw-fd `poll()` for TLS-wrapped connections
+    too, which broke TLS connection pooling outright -- real TLS 1.3
+    servers routinely send a `NewSessionTicket` asynchronously right after
+    the handshake, and that ciphertext is immediately readable on the raw
+    fd regardless of whether any application data was ever sent, flagging
+    essentially every freshly-pooled TLS connection as stale (caught by
+    `zig build test-integration-native-tls`'s pooled-TLS-reuse assertion
+    failing in CI). Fixed by using `UpstreamTlsConn.readReady()` for TLS
+    connections instead -- already-decrypted buffered plaintext or a clean
+    TLS shutdown, which distinguishes genuine leftover application data
+    from ordinary post-handshake protocol chatter.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,

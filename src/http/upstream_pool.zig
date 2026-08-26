@@ -344,16 +344,35 @@ pub const UpstreamPool = struct {
     /// Without this, that caller sends its request and then reads the
     /// stale ghost bytes as if they were its own response.
     ///
-    /// A zero-timeout `poll()` is a conservative test: `POLLIN` means bytes
-    /// are already queued, `POLLHUP`/`POLLERR` mean the peer is gone either
-    /// way. A poll failure fails closed (treated as stale) rather than
-    /// risking a false "clean" on an unexpected error. This applies equally
-    /// to TLS-wrapped connections: any bytes already queued on the raw fd —
-    /// encrypted application data or a spontaneous post-handshake message —
-    /// mean something arrived that this exchange never asked for, which is
-    /// exactly the condition worth failing closed on, at the cost of
-    /// occasionally discarding a still-healthy connection.
+    /// A zero-timeout `poll()` is a conservative test for a **plain**
+    /// connection: `POLLIN` means bytes are already queued, `POLLHUP`/
+    /// `POLLERR` mean the peer is gone either way, and every byte on a
+    /// plain connection's raw fd is necessarily application-layer, so any
+    /// of these unambiguously means "do not reuse". A poll failure fails
+    /// closed (treated as stale) rather than risking a false "clean" on an
+    /// unexpected error.
+    ///
+    /// A **TLS** connection cannot use the same raw-fd poll: real TLS 1.3
+    /// servers routinely send a `NewSessionTicket` (or other post-handshake,
+    /// record-layer-only message) asynchronously right after the handshake,
+    /// with no relationship to application data at all. That ciphertext
+    /// shows up as `POLLIN` on the raw fd immediately, which would flag
+    /// essentially every freshly-pooled TLS connection as "stale" and
+    /// defeat TLS connection pooling outright (caught by an integration
+    /// test asserting a second proxied HTTPS request reuses the pooled
+    /// connection). Use `UpstreamTlsConn.readReady()` instead: it reports
+    /// only already-decrypted, buffered plaintext the record layer has
+    /// promoted to application data (`pending() > 0`), or a completed
+    /// clean TLS shutdown (`close_notify`) — genuine signals that this
+    /// connection actually has something an unrelated caller should not
+    /// see, without decoding the mere presence of encrypted bytes as
+    /// staleness. This does not catch every conceivable timing of a
+    /// hostile TLS origin's ghost bytes (raw ciphertext that has arrived
+    /// but not yet been fed through the record layer looks the same as
+    /// "nothing pending" here), but it is a strict improvement over the
+    /// prior behavior of never checking a TLS pooled connection at all.
     fn hasUnexpectedReadableBytes(conn: PooledConn) bool {
+        if (conn.tls) |tls| return tls.readReady();
         var pfds = [_]std.posix.pollfd{.{
             .fd = conn.stream.handle,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
