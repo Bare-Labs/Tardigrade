@@ -124,10 +124,19 @@ values) are rejected: the parser returns `error.ConflictingHeaders` which the
 gateway maps to `400 Bad Request`.
 
 Upstream responses with conflicting framing headers are also treated as
-`error.UpstreamProtocolError`, causing a synthetic `502 Bad Gateway`.
+`error.UpstreamProtocolError`, causing a synthetic `502 Bad Gateway`. This
+now applies symmetrically to the response direction (#673): a response
+carrying both `Transfer-Encoding: chunked` and `Content-Length` is rejected
+outright rather than letting `Transfer-Encoding` silently take precedence,
+a duplicated `Transfer-Encoding` field is rejected the same way a
+duplicated `Content-Length` field is, and the `Transfer-Encoding` value
+itself must equal `chunked` exactly — a coding list such as
+`chunked, gzip` is rejected rather than treated as plain chunked framing
+with the unrecognized coding silently dropped.
 
 Implementation: `src/http/request.zig`, function `Request.parse()`, lines
-that set `error.ConflictingHeaders`.
+that set `error.ConflictingHeaders`; the response-direction equivalent in
+`detectResponseFraming()` in `src/gateway_proxy.zig`.
 
 ## 4. Duplicate Content-Length
 
@@ -308,12 +317,20 @@ HTTP/1 proxy paths, which have separate implementations of the rule.
 
 An upstream `1xx` interim response (`100 Continue`, `103 Early Hints`, etc.)
 does not end the exchange, on either the buffered or the streaming HTTP/1
-proxy path. Tardigrade discards each interim response — `101 Switching
-Protocols` excepted, since it completes a protocol switch rather than
-signaling more to come — and keeps reading until the actual final, non-1xx
-response arrives; only that final response is returned to the client.
-Interim responses are not currently relayed to the downstream client
-separately.
+proxy path. Tardigrade discards each interim response and keeps reading
+until the actual final, non-1xx response arrives; only that final response
+is returned to the client. Interim responses are not currently relayed to
+the downstream client separately.
+
+An upstream `101 Switching Protocols` response is rejected outright
+(`error.UpstreamProtocolError`, `502 Bad Gateway`) rather than either
+being treated as a skippable 1xx interim response or forwarded as an
+ordinary bodiless final response (#673). `101` is terminal — it hands the
+connection off to a different protocol entirely — and this generic
+reverse-proxy path has no actual protocol-tunnel support to hand it off
+to; forwarding it verbatim would leave the client believing the
+connection had switched protocols while Tardigrade still parses it as
+HTTP/1.1 request/response framing, a client-visible desync.
 
 A duplicate upstream `Content-Length` — conflicting values, matching
 values, or either field order — is rejected the same way a duplicate
@@ -328,12 +345,27 @@ line — including one nominated via `Connection` — merge with the status
 line text and either evade the `Connection`-nomination scanner (buffered
 path) or be written verbatim into the reason phrase sent to the downstream
 client, which may treat the embedded LF as its own line terminator (streaming
-path).
+path). All three status-line-parsing call sites (`detectResponseFraming()`,
+`parseBufferedUpstreamResponse()`, `readUpstreamHead()`) share one
+implementation, `parseStrictStatusLine()`, so this validation cannot drift
+out of sync between them (#673).
+
+A chunked upstream response body's connection is only marked reusable when
+the decoder consumed *exactly* the bytes read — through and including the
+terminating `0\r\n\r\n` chunk's trailer section — mirroring the
+Content-Length case above. Extra or ghost bytes already sitting past the
+terminator in the same read leave the connection un-pooled rather than
+reusable, on both proxy paths (#673). Each chunk's data must also be
+followed by a literal CRLF, not merely two arbitrary bytes the decoder
+skips past, and chunk-size arithmetic uses checked addition so a
+maliciously oversized hex chunk-size is rejected as a protocol error
+instead of overflowing.
 
 Implementation: `exchangeBoundedBufferedHttpRequest()`,
-`parseBufferedUpstreamResponse()`, `detectResponseFraming()`, and
-`readUpstreamHead()`/`streamProxyOverTransport()` (the streaming path's
-equivalents) in `src/gateway_proxy.zig`.
+`parseBufferedUpstreamResponse()`, `detectResponseFraming()`,
+`decodeChunkedBody()`, `parseStrictStatusLine()`, and
+`readUpstreamHead()`/`streamProxyOverTransport()`/`relayUpstreamBody()`
+(the streaming path's equivalents) in `src/gateway_proxy.zig`.
 
 ## 12. Directory Traversal — Static File Serving
 

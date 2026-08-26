@@ -5,7 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Twelve auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Seventeen auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
   hostile one, on both the buffered and a forced-streaming proxy route) and
@@ -61,8 +61,35 @@ All notable user-facing changes to Tardigrade are documented here.
     phrase and re-emitted to the client with the embedded LF intact
     (streaming path), and an unparseable status code silently defaulted to
     `200`/`0` instead of being rejected.
+  - Even after the fix above, all three status-line-parsing call sites each
+    kept their own independent boundary-finding logic that merely happened
+    to agree; consolidated into one shared `parseStrictStatusLine()`.
+  - Upstream `Transfer-Encoding` matching accepted any comma-separated list
+    containing a `chunked` token (e.g. `chunked, gzip`) as plain chunked
+    framing, silently discarding the unrecognized coding, and never
+    rejected a duplicated `Transfer-Encoding` field the way duplicate
+    `Content-Length` already was.
+  - An upstream response carrying both `Transfer-Encoding: chunked` and
+    `Content-Length` was deliberately allowed through with
+    `Transfer-Encoding` given precedence -- the classic smuggling
+    ambiguity RFC 7230 §3.3.3 says to reject outright, not resolve.
+  - An upstream `101 Switching Protocols` response fell through to being
+    re-serialized to the client as an ordinary bodiless final response by
+    a generic reverse-proxy path with no actual protocol-tunnel support,
+    leaving the client believing the connection had switched protocols
+    while Tardigrade still parsed it as HTTP/1.1.
+  - The buffered path's chunked-body decoder reported only the decoded
+    payload, not how many input bytes it consumed, so the exchange loop
+    marked the upstream connection reusable unconditionally the instant
+    decoding succeeded -- even with extra/ghost bytes already sitting past
+    the terminating chunk's trailer section in the same read (the
+    chunked-body counterpart of the bodiless pool-poisoning fix above). It
+    also skipped the two bytes after each chunk's data without checking
+    they were a literal CRLF, and computed chunk boundaries with unchecked
+    arithmetic a maliciously oversized hex chunk-size could overflow into
+    a safety-checked panic.
 
-  All twelve fixed with regression coverage in `gateway_proxy_headers.zig`,
+  All seventeen fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
   and `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the
   full campaign writeup.

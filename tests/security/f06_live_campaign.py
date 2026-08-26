@@ -68,6 +68,7 @@ SCENARIO_LEAK_MARKERS: dict[str, bytes] = {
     "unusual_1xx_chain": b"Early Hints",
     "invalid_204_with_body": b"nope!",
     "invalid_304_with_body": b"nope!",
+    "upgrade_101_attempt": b"websocket",
 }
 
 
@@ -770,6 +771,12 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         "malformed_status_line",
         "ctl_and_bare_cr_in_header_value",
         "truncated_body",
+        # #673 review round 5: TE strictness, chunk-terminator validation,
+        # and outright 101 rejection.
+        "te_list_not_exactly_chunked",
+        "duplicate_te",
+        "chunk_not_crlf_terminated",
+        "upgrade_101_attempt",
     ]
     for scenario in core_scenarios:
         up.reset()
@@ -841,6 +848,21 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
            f"leaked_first={leaked_first} leaked_followup={leaked_followup} followup_head={followup[:100]!r}")
     hostile_same_socket_reuse(up, "hostile_upstream_extra_bytes_same_connection_reuse_is_clean", cat, port, "extra_bytes_after_response")
 
+    # The chunked-framing twin of the above (#673 review round 5): a ghost
+    # response appended right after a chunked body's "0\r\n\r\n" terminator
+    # must not leak into either the first response or a later one over a
+    # reused connection.
+    up.reset()
+    first = send_raw(port, hostile("chunked_extra_bytes_after_terminator"))
+    followup = send_raw(port, hostile(""))
+    leaked_first = GHOST_MARKER.encode() in first
+    leaked_followup = GHOST_MARKER.encode() in followup
+    ok = not leaked_first and not leaked_followup
+    record("hostile_upstream_chunked_extra_bytes_do_not_leak_into_next_response", cat, ok,
+           f"leaked_first={leaked_first} leaked_followup={leaked_followup} followup_head={followup[:100]!r}")
+    hostile_same_socket_reuse(up, "hostile_upstream_chunked_extra_bytes_same_connection_reuse_is_clean",
+                               cat, port, "chunked_extra_bytes_after_terminator")
+
     hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile",
                                                 "hostile_upstream_delayed_ghost_after_bodiless_does_not_poison_pool")
     hostile_1xx_chain_returns_final_response(up, cat, port, "/hostile",
@@ -882,6 +904,22 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     ok = "x-hostile-secret" not in headers
     record("hostile_upstream_streaming_bare_lf_hides_connection_nomination_stripped", cat, ok,
            f"status={first_status_code(raw)} headers={list(headers.keys())}")
+
+    # #673 review round 5: TE strictness and 101 rejection both live in
+    # `detectResponseFraming`, which `readUpstreamHead` (streaming) now
+    # shares with the buffered path via `parseStrictStatusLine` -- replay a
+    # representative pair against /hostile-streaming to prove the fix
+    # actually reaches this path too, not just the buffered one the rest of
+    # this suite exercises by default.
+    for scenario in ["duplicate_te", "upgrade_101_attempt"]:
+        up.reset()
+        raw = send_raw(port, hostile(scenario, "/hostile-streaming"))
+        followup = send_raw(port, req("GET", "/health", []))
+        ok = first_status_code(followup) == 200
+        record(f"hostile_upstream_streaming_{scenario}_does_not_hang_or_break_edge", cat, ok,
+               f"status={first_status_code(raw)} followup_status={first_status_code(followup)}")
+        hostile_same_socket_reuse(up, f"hostile_upstream_streaming_{scenario}_same_connection_reuse_is_clean",
+                                   cat, port, scenario, path="/hostile-streaming")
 
 
 def main() -> int:

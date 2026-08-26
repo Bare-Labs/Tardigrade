@@ -142,6 +142,44 @@ HOSTILE_SCENARIOS = {
     ),
     "invalid_204_with_body": b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\nnope!",
     "invalid_304_with_body": b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\nnope!",
+    # #673 review round 5: Transfer-Encoding must name exactly "chunked" --
+    # a coding *list* (which RFC 7230 §3.3.1 permits in principle) is
+    # unsupported and must not be treated as if it were plain chunked
+    # framing, since Tardigrade would then decode a body whose actual wire
+    # encoding it does not understand.
+    "te_list_not_exactly_chunked": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+    ),
+    # A second Transfer-Encoding occurrence is the same singleton-header
+    # ambiguity as duplicate Content-Length, just for the other framing
+    # header (#673 review round 5).
+    "duplicate_te": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"2\r\nok\r\n0\r\n\r\n"
+    ),
+    # The two bytes immediately after a chunk's data are not a literal
+    # CRLF -- a decoder that just skips two bytes here would silently
+    # resync onto attacker-chosen bytes instead of rejecting the malformed
+    # terminator (#673 review round 5).
+    "chunk_not_crlf_terminated": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nokXX0\r\n\r\n"
+    ),
+    # A full ghost response appended right after a *chunked* body's
+    # terminator, the chunked-framing twin of "extra_bytes_after_response"
+    # above (#673 review round 5) -- proves the buffered exchange loop's
+    # chunked-body reuse decision is based on exactly how many bytes
+    # decoding consumed, not just "decoding succeeded".
+    "chunked_extra_bytes_after_terminator": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+        b"HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\nF06_UPSTREAM_GHOST_MARKER"
+    ),
+    # 101 is terminal and hands the connection to a different protocol
+    # entirely (RFC 7230 §6.7); it must never be treated as a skippable
+    # 1xx interim response, nor forwarded as an ordinary bodiless one
+    # (#673 review round 5).
+    "upgrade_101_attempt": (
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    ),
 }
 
 # #673 review: a hostile upstream can send just a bodiless response's header

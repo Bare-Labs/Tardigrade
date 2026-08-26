@@ -146,7 +146,7 @@ client got a 4xx -- and every smuggling-shaped framing probe additionally
 appends a unique pipelined marker request to prove it is never dispatched,
 not just that the malformed probe itself was rejected.
 
-Coverage (126 live cases):
+Coverage (140 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
   oversized token, malformed/invalid-signature JWT, comma-joined
   `Authorization`, NUL/CR injection attempts), including a strict deny for
@@ -195,9 +195,20 @@ Coverage (126 live cases):
   handling is replayed against a forced-streaming twin route
   (`/hostile-streaming`, `proxy_streaming response;`), since the streaming
   proxy path (`streamProxyOverTransport()`/`readUpstreamHead()`) has its
-  own, separately-fixed copies of that logic and is off by default.
+  own, separately-fixed copies of that logic and is off by default;
+- a `Transfer-Encoding` value that names anything other than exactly
+  `chunked` (e.g. a coding list like `chunked, gzip`) and a duplicated
+  `Transfer-Encoding` field are both rejected rather than tolerated; a
+  chunked body's terminating chunk followed by extra/ghost bytes never
+  leaves the connection reusable, on a fresh connection, the same
+  downstream connection as the hostile probe, and (for a representative
+  pair of cases) the forced-streaming twin route.
+- a status 101 upstream response is rejected outright rather than either
+  being treated as a skippable 1xx interim response or relayed to the
+  client as an ordinary bodiless final response, on both the buffered and
+  streaming paths.
 
-The campaign found and fixed twelve real defects, all now covered by
+The campaign found and fixed seventeen real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -319,6 +330,59 @@ deterministic regression tests:
     (starting after the status line) rather than the whole raw block from
     byte 0. Also rejects a status line whose status code doesn't parse,
     rather than silently defaulting to `200`/`0`.
+13. Even after defect 12 made all three status-line/header-boundary sites
+    (`detectResponseFraming()`, `parseBufferedUpstreamResponse()`,
+    `readUpstreamHead()`) individually strict, each still computed the
+    boundary with its own independent logic -- three implementations that
+    happened to agree rather than one that could not disagree. Consolidated
+    into a single shared `parseStrictStatusLine()` in `gateway_proxy.zig`
+    that all three now call, removing the risk of the same class of drift
+    defect 12 fixed from silently reopening in only one of the three sites
+    during a future change.
+14. `detectResponseFraming()` matched `Transfer-Encoding` by splitting the
+    value on commas and accepting the response as chunked if *any* token in
+    the list equaled `chunked` (e.g. `Transfer-Encoding: chunked, gzip`
+    would be treated as plain chunked framing, silently discarding the
+    `gzip` coding Tardigrade has no way to apply). It also never rejected a
+    duplicated `Transfer-Encoding` field the way duplicate `Content-Length`
+    already was. Fixed by requiring the field to equal `chunked` exactly
+    and rejecting a second occurrence outright, matching the
+    duplicate-`Content-Length` policy.
+15. `detectResponseFraming()` deliberately let a response carry both a valid
+    `Transfer-Encoding: chunked` and a `Content-Length` together, giving
+    `Transfer-Encoding` precedence per a comment citing RFC 7230 §3.3.3 --
+    but §3.3.3 actually directs a recipient to treat this combination as an
+    error indicating possible request smuggling, not to pick a winner. The
+    existing live `te_and_cl` probe only proved the edge did not hang when
+    sent this combination, not that the framing choice was safe. Fixed by
+    rejecting the response outright (`error.UpstreamProtocolError`) when
+    both are present, regardless of order.
+16. A status `101` upstream response was excluded from the loop that
+    discards `1xx` interim responses, but had no dedicated handling either
+    -- so it fell through and was re-serialized to the client as an
+    ordinary bodiless *final* response by a generic reverse-proxy relay
+    with no actual protocol-tunnel support, leaving the client believing
+    the connection had switched to a new protocol while Tardigrade still
+    treated it as HTTP/1.1 request/response framing. Fixed by rejecting
+    status `101` outright at the shared framing-detection layer
+    (`detectResponseFraming()`), before either the buffered or streaming
+    path can act on it.
+17. The buffered path's chunked-body decoder (`decodeChunkedBody()`)
+    returned only the decoded payload, not how many bytes of the read
+    buffer it had actually consumed, so the exchange loop marked the
+    upstream connection reusable unconditionally the instant decoding
+    succeeded -- even when extra/ghost bytes already sat past the
+    terminating chunk's trailer section in the same read, the chunked-body
+    counterpart of defect 7. It also advanced past the two bytes following
+    each chunk's data without checking they were a literal CRLF, and
+    computed chunk boundaries with unchecked `usize` arithmetic that a
+    maliciously oversized hex chunk-size could overflow, crashing the
+    process via a safety-checked panic instead of failing the request.
+    Fixed by having `decodeChunkedBody()` report a consumed-byte offset
+    that the caller compares against the full amount read before marking
+    the connection reusable, validating the trailing CRLF literally, and
+    using checked arithmetic that surfaces overflow as
+    `error.UpstreamProtocolError` instead of a panic.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
@@ -328,7 +392,7 @@ forced-streaming `/hostile-streaming` twin -- plus a symlink and an
 `tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
 results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials
 are synthetic and local-only; no production secrets or traffic were used.
-126/126 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
+140/140 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
 script for current evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference
