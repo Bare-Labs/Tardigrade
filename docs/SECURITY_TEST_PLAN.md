@@ -146,7 +146,7 @@ client got a 4xx -- and every smuggling-shaped framing probe additionally
 appends a unique pipelined marker request to prove it is never dispatched,
 not just that the malformed probe itself was rejected.
 
-Coverage (116 live cases):
+Coverage (118 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
   oversized token, malformed/invalid-signature JWT, comma-joined
   `Authorization`, NUL/CR injection attempts), including a strict deny for
@@ -179,11 +179,18 @@ Coverage (116 live cases):
   `Trailer`/`Upgrade`/`Server`/`X-Powered-By`, truncated body, extra bytes
   after the framed response, unusual 1xx chain, invalid 204/304 framing),
   each checked both on a fresh connection and on the *same* downstream
-  connection used for the hostile probe, plus a dedicated check that a
-  "ghost" second response smuggled by the hostile upstream never leaks into
-  a later, unrelated proxied response over a reused upstream connection.
+  connection used for the hostile probe (with the first response's own
+  framing validated, not just what follows it), plus a dedicated check that
+  a "ghost" second response smuggled by the hostile upstream never leaks
+  into a later, unrelated proxied response over a reused upstream
+  connection -- including when the hostile upstream deliberately delays
+  sending the ghost bytes until after Tardigrade would have returned the
+  connection to the idle pool;
+- the client-visible result of an upstream `103 → 103 → 200` interim-response
+  chain is exactly the real final response, not a bare 103 with the 200
+  silently dropped.
 
-The campaign found and fixed six real defects, all now covered by
+The campaign found and fixed eight real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -235,6 +242,30 @@ deterministic regression tests:
    fails, at both the buffered (`parseBufferedUpstreamResponse()`) and
    streamed (`readUpstreamHead()`) parse sites in `gateway_proxy.zig`.
 6. The buffered proxy path forwarded a body for upstream `204`/`304`/`1xx`
+   responses whenever the upstream included one, even though those statuses
+   are bodiless by definition regardless of `Content-Length` -- a real
+   response-splitting vector, since a downstream client would treat the
+   illegal bytes as the start of the next response on the connection.
+7. Both the buffered and streamed proxy paths could still return a bodiless
+   (`204`/`304`/`1xx`/`HEAD`) upstream connection to the idle pool for reuse
+   whenever nothing had trailed the header block *at the instant it was
+   parsed*. That cannot prove a malicious/misbehaving upstream won't send
+   an illegal body or a full ghost response moments later, after the
+   connection is already pooled -- those delayed bytes would then become
+   part of whatever unrelated request next checks the connection out,
+   poisoning it. Fixed by never marking a bodiless response's upstream
+   connection reusable, in `exchangeBoundedBufferedHttpRequest()` and
+   `relayUpstreamBody()` in `gateway_proxy.zig`.
+8. `detectResponseFraming()` maps every `1xx` status to bodiless framing,
+   which the buffered exchange loop treated as "the response is complete" --
+   so the *first* interim `1xx` response (e.g. `103 Early Hints`) was
+   wrongly returned to the caller as if it were the final response, and
+   whatever actually followed (including the real final response) was
+   silently discarded. Fixed by having the buffered exchange loop discard
+   1xx interim responses (other than `101`, which completes a protocol
+   switch rather than signaling more to come) and keep reading until the
+   real final response arrives, in `exchangeBoundedBufferedHttpRequest()`
+   in `gateway_proxy.zig`.
    responses whenever the upstream included one, even though RFC 7230 §3.3 /
    RFC 7231 §6.3.5, §6.5.5 define those statuses as bodiless *regardless of
    any `Content-Length` sent* -- an RFC-compliant downstream client honors
@@ -253,7 +284,7 @@ the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
 runs the probe engine in `tests/security/f06_live_campaign.py`, writing
 evidence (metadata, raw results, process logs) to
 `.zig-cache/f06-campaign-673/`. All credentials are synthetic and
-local-only; no production secrets or traffic were used. 116/116 probes pass
+local-only; no production secrets or traffic were used. 118/118 probes pass
 after the fixes (Zig 0.16.0, macOS arm64; rerun the script for current
 evidence -- results are not committed).
 

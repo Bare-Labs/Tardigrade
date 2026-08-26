@@ -52,6 +52,11 @@ JWT_SECRET = "f06-jwt-secret-do-not-use-in-prod-4c1a"
 TRAVERSAL_CANARY = "F06_TRAVERSAL_CANARY_SHOULD_NEVER_BE_SERVED"
 ALIAS_ROOT_CANARY = "F06_ALIAS_ROOT_OK"
 GHOST_MARKER = "F06_UPSTREAM_GHOST_MARKER"
+# Must match tests/security/fixtures/f06_upstream.py's DELAYED_GHOST_SCENARIO
+# / DELAYED_GHOST_DELAY_SECONDS -- the fixture runs as a separate process, so
+# these can't be shared via import.
+DELAYED_GHOST_SCENARIO = "delayed_ghost_after_bodiless"
+DELAYED_GHOST_DELAY_SECONDS = 0.35
 
 # Distinctive bytes for each hostile-upstream scenario that must never
 # appear verbatim in a later, unrelated response if the downstream
@@ -231,12 +236,6 @@ def framing_marker_case(up: Upstream, name: str, cat: str, port: int, build_raw)
     record(name, cat, ok, f"status={status} hits={len(hits)} smuggled={smuggled}")
 
 
-# Scenarios whose HEALTHY first response legitimately contains more than
-# one "HTTP/1." status line (e.g. 1xx interim responses correctly relayed
-# ahead of the final response) -- everything else must produce exactly one.
-SCENARIOS_WITH_MULTI_STATUS_LINE_FIRST_RESPONSE = frozenset({"unusual_1xx_chain"})
-
-
 def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scenario: str) -> None:
     """
     Same-downstream-connection desync proof (#673 review, both passes): open
@@ -279,19 +278,14 @@ def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scen
         except (socket.timeout, ConnectionResetError):
             pass
 
+        # Tardigrade consumes 1xx interim responses internally and forwards
+        # only the actual final response (#673 review), so every scenario's
+        # healthy first response -- unusual_1xx_chain included -- is exactly
+        # one status line; anything else is a corrupted/split response.
         first_status_lines = first.count(b"HTTP/1.")
-        # unusual_1xx_chain's leak marker ("Early Hints") is the standard
-        # 103 reason phrase -- it is *expected* to appear in a correctly
-        # relayed first response for that scenario specifically, so only
-        # check it there against the SECOND response below, not the first.
-        first_leaked = (
-            scenario not in SCENARIOS_WITH_MULTI_STATUS_LINE_FIRST_RESPONSE
-            and bool(leak_marker)
-            and leak_marker in first
-        )
+        first_leaked = bool(leak_marker) and leak_marker in first
         first_ghosted = GHOST_MARKER.encode() in first
-        max_expected_first_lines = 99 if scenario in SCENARIOS_WITH_MULTI_STATUS_LINE_FIRST_RESPONSE else 1
-        first_corrupted = first_status_lines > max_expected_first_lines or first_leaked or first_ghosted
+        first_corrupted = first_status_lines > 1 or first_leaked or first_ghosted
         if first_corrupted:
             record(name, cat, False,
                    f"first response already corrupted: status_lines={first_status_lines} "
@@ -791,6 +785,43 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     record("hostile_upstream_extra_bytes_do_not_leak_into_next_response", cat, ok,
            f"leaked_first={leaked_first} leaked_followup={leaked_followup} followup_head={followup[:100]!r}")
     hostile_same_socket_reuse(up, "hostile_upstream_extra_bytes_same_connection_reuse_is_clean", cat, port, "extra_bytes_after_response")
+
+    # #673 review: a hostile upstream can send just a bodiless response's
+    # headers, flush, and only send an illegal body / full ghost response
+    # AFTER Tardigrade has already decided the connection is idle and
+    # returned it to the upstream connection pool -- those delayed bytes
+    # would then poison whatever unrelated request checks the connection
+    # out next. `parseBufferedUpstreamResponse()`'s in-memory truncation
+    # fix cannot catch this by itself; it requires bodiless responses to
+    # never be pooled for reuse at all (verified directly in
+    # gateway_proxy.zig; this is the live, timing-based confirmation).
+    up.reset()
+    first = send_raw(port, hostile(DELAYED_GHOST_SCENARIO), read_timeout=0.6)
+    # Give the fixture's delayed tail write time to land on the upstream
+    # socket before probing -- comfortably longer than its own delay.
+    time.sleep(DELAYED_GHOST_DELAY_SECONDS * 2)
+    leaked_followup = False
+    for _ in range(5):
+        followup = send_raw(port, hostile(""), read_timeout=1.0)
+        if GHOST_MARKER.encode() in followup:
+            leaked_followup = True
+            break
+    leaked_first = GHOST_MARKER.encode() in first
+    ok = not leaked_first and not leaked_followup
+    record("hostile_upstream_delayed_ghost_after_bodiless_does_not_poison_pool", cat, ok,
+           f"leaked_first={leaked_first} leaked_followup={leaked_followup}")
+
+    # Now that Tardigrade correctly consumes 1xx interim responses instead
+    # of wrongly treating the first one as final (#673 review), assert the
+    # client-visible result directly: exactly the real final response,
+    # not a bare 103 with the 200 silently dropped.
+    up.reset()
+    raw = send_raw(port, hostile("unusual_1xx_chain"))
+    status = first_status_code(raw)
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    ok = status == 200 and body == b"ok"
+    record("hostile_upstream_unusual_1xx_chain_returns_actual_final_response", cat, ok,
+           f"status={status} body={body!r}")
 
     for scenario in ["unusual_1xx_chain", "invalid_204_with_body", "invalid_304_with_body"]:
         up.reset()

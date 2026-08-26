@@ -1550,21 +1550,50 @@ fn exchangeBoundedBufferedHttpRequest(
     var read_buf: [8192]u8 = undefined;
     var header_end: ?usize = null;
     var framing: ResponseFraming = .close;
+    // Start of the response currently being parsed. Advances past each
+    // consumed 1xx interim response (#673 review): this bounded buffered
+    // path has no mechanism to relay interim responses to the downstream
+    // client separately from the final one, so 1xx responses (other than
+    // 101, which completes a protocol switch rather than signaling "more
+    // to come") are discarded here and the loop keeps reading until the
+    // actual final, non-1xx response arrives. Before this fix, the FIRST
+    // 1xx was wrongly treated as a complete response: the exchange would
+    // return that 1xx to the caller as if it were final and abandon
+    // whatever followed, silently dropping the real response.
+    var response_start: usize = 0;
     while (true) {
         if (header_end == null) {
-            if (std.mem.find(u8, resp_raw.items, "\r\n\r\n")) |he| {
+            if (std.mem.find(u8, resp_raw.items[response_start..], "\r\n\r\n")) |rel_he| {
+                const he = response_start + rel_he;
                 header_end = he;
-                framing = detectResponseFraming(resp_raw.items[0..he], method);
+                framing = detectResponseFraming(resp_raw.items[response_start..he], method);
             }
         }
         if (header_end) |he| {
-            const headers_block = resp_raw.items[0..he];
+            const headers_block = resp_raw.items[response_start..he];
             const body_start = he + 4;
             const resp_body = resp_raw.items[body_start..];
             switch (framing) {
                 .none => {
-                    // Bodiless: reusable only if nothing trailed the headers.
-                    setReusable(reusable, keep_alive, headers_block, resp_body.len == 0);
+                    const status = statusCodeFromHeaderBlock(headers_block);
+                    if (status >= 100 and status < 200 and status != 101) {
+                        // Interim informational response: discard it and keep
+                        // reading for the actual final response.
+                        response_start = body_start;
+                        header_end = null;
+                        continue;
+                    }
+                    // Bodiless final response (204/304/101/HEAD): never
+                    // reusable, even if nothing has trailed the headers
+                    // *yet*. A malicious/misbehaving upstream can send just
+                    // the header block, flush, wait until Tardigrade returns
+                    // this socket to the idle pool, and only then send an
+                    // illegal body or a full ghost response -- those bytes
+                    // would become part of whatever unrelated request next
+                    // checks the connection out of the pool (#673 review).
+                    // `resp_body.len == 0` only proves nothing had arrived
+                    // *by this instant*; it cannot prove nothing ever will.
+                    setReusable(reusable, keep_alive, headers_block, false);
                     break;
                 },
                 .length => |content_length| {
@@ -1584,7 +1613,7 @@ fn exchangeBoundedBufferedHttpRequest(
                         setReusable(reusable, keep_alive, headers_block, true);
                         var rebuilt = std.array_list.Managed(u8).init(allocator);
                         defer rebuilt.deinit();
-                        try rebuilt.appendSlice(resp_raw.items[0..body_start]);
+                        try rebuilt.appendSlice(resp_raw.items[response_start..body_start]);
                         try rebuilt.appendSlice(decoded);
                         return parseBufferedUpstreamResponse(allocator, rebuilt.items);
                     }
@@ -1616,12 +1645,13 @@ fn exchangeBoundedBufferedHttpRequest(
         if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
 
-    // A reused keep-alive connection the origin closed while idle yields zero
-    // bytes here; surface it distinctly so the caller can retry on a fresh
-    // connection (the request was never delivered).
-    if (resp_raw.items.len == 0) return error.UpstreamConnectionClosed;
+    // A reused keep-alive connection the origin closed while idle (or one
+    // that closed after only ever sending 1xx interim responses) yields
+    // nothing beyond `response_start` here; surface it distinctly so the
+    // caller can retry on a fresh connection.
+    if (resp_raw.items.len == response_start) return error.UpstreamConnectionClosed;
 
-    return parseBufferedUpstreamResponse(allocator, resp_raw.items);
+    return parseBufferedUpstreamResponse(allocator, resp_raw.items[response_start..]);
 }
 
 /// Set the caller's reusability flag: a connection may be reused only when we
@@ -1665,17 +1695,24 @@ fn responseStatusIsBodiless(status: u16) bool {
     return (status >= 100 and status < 200) or status == 204 or status == 304;
 }
 
-/// Determine response framing from the header block (excluding the trailing
-/// CRLFCRLF), the request method, and the status line.
-fn detectResponseFraming(header_block: []const u8, method: []const u8) ResponseFraming {
+/// Parses the status code from a response header block (excluding the
+/// trailing CRLFCRLF). Returns 0 if the status line is malformed.
+fn statusCodeFromHeaderBlock(header_block: []const u8) u16 {
     const first_line_end = std.mem.find(u8, header_block, "\r\n") orelse header_block.len;
     var status_parts = std.mem.splitScalar(u8, header_block[0..first_line_end], ' ');
     _ = status_parts.next();
-    const status = std.fmt.parseInt(u16, status_parts.next() orelse "0", 10) catch 0;
+    return std.fmt.parseInt(u16, status_parts.next() orelse "0", 10) catch 0;
+}
+
+/// Determine response framing from the header block (excluding the trailing
+/// CRLFCRLF), the request method, and the status line.
+fn detectResponseFraming(header_block: []const u8, method: []const u8) ResponseFraming {
+    const status = statusCodeFromHeaderBlock(header_block);
 
     if (std.ascii.eqlIgnoreCase(method, "HEAD")) return .none;
     if (responseStatusIsBodiless(status)) return .none;
 
+    const first_line_end = std.mem.find(u8, header_block, "\r\n") orelse header_block.len;
     var content_length: ?usize = null;
     var chunked = false;
     var lines = std.mem.splitSequence(u8, header_block[@min(first_line_end + 2, header_block.len)..], "\r\n");
@@ -2221,8 +2258,15 @@ fn relayUpstreamBody(
 ) !RelayOutcome {
     var total: usize = 0;
     switch (framing) {
-        // Bodiless (HEAD/204/304/1xx): reusable only if nothing trailed the head.
-        .none => return .{ .body_bytes = 0, .aborted = false, .reusable = rb.available().len == 0 },
+        // Bodiless (HEAD/204/304/1xx): never reusable, even if nothing has
+        // trailed the head *yet*. A malicious/misbehaving upstream can send
+        // just the header block, flush, wait until Tardigrade returns this
+        // socket to the idle pool, and only then send an illegal body or a
+        // full ghost response -- those bytes would become part of whatever
+        // unrelated request next checks the connection out of the pool
+        // (#673 review). `rb.available().len == 0` only proves nothing had
+        // arrived *by this instant*; it cannot prove nothing ever will.
+        .none => return .{ .body_bytes = 0, .aborted = false, .reusable = false },
         .length => |content_length| {
             var remaining = content_length;
             while (remaining > 0) {
@@ -3320,6 +3364,63 @@ test "exchange treats a HEAD response as bodiless despite Content-Length" {
     try std.testing.expectEqual(@as(usize, 0), resp.body.len);
 }
 
+test "exchange consumes a 1xx interim chain and returns the actual final response (#673 review)" {
+    // Before this fix, the FIRST 1xx response was wrongly treated as a
+    // complete exchange: the caller would receive a bare 103 with no body
+    // and the real 200 (plus its body) would be silently discarded.
+    const allocator = std.testing.allocator;
+    var resp = try exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n" ++
+            "HTTP/1.1 103 Early Hints\r\nLink: </style2.css>\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    );
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("ok", resp.body);
+}
+
+test "exchange never marks a keep-alive connection reusable after a bodiless response, even with nothing trailing yet (#673 review)" {
+    // A prior version of this fix marked the connection reusable whenever
+    // `resp_body.len == 0` *at the instant the header block was parsed*.
+    // That cannot prove a malicious/misbehaving upstream won't send an
+    // illegal body or a full ghost response moments later, after
+    // Tardigrade has already returned the socket to the idle pool -- those
+    // delayed bytes would then poison whatever unrelated request checks
+    // the connection out next. Bodiless responses must never be pooled.
+    const allocator = std.testing.allocator;
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    const response = "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n";
+    _ = std.c.write(peer_fd, response.ptr, response.len);
+
+    const uri = try std.Uri.parse("http://localhost/");
+    var reusable: bool = true;
+    var resp = try exchangeBoundedBufferedHttpRequest(
+        allocator,
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        uri,
+        "GET",
+        &.{},
+        "",
+        null,
+        1 << 20,
+        1_000,
+        1_000,
+        true,
+        &reusable,
+    );
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 204), resp.status_code);
+    try std.testing.expect(!reusable);
+}
+
 /// A capturing downstream writer for the streaming-relay tests: satisfies the
 /// `print`/`writeAll` interface `writeChunk` needs and records all bytes.
 const CaptureWriter = struct {
@@ -3411,7 +3512,13 @@ test "streaming relay handles a close-delimited body (not reusable)" {
     try std.testing.expect(!r.reusable and !r.aborted);
 }
 
-test "streaming relay treats 204 as bodiless" {
+test "streaming relay treats 204 as bodiless and never reuses the connection (#673 review)" {
+    // A bodiless response is never pooled for reuse, even when nothing has
+    // trailed the headers at parse time: a malicious/misbehaving upstream
+    // could still send an illegal body or a ghost response later, after
+    // Tardigrade has already returned the socket to the idle pool, and
+    // those bytes would poison whatever unrelated request checks the
+    // connection out next.
     const allocator = std.testing.allocator;
     var body = std.array_list.Managed(u8).init(allocator);
     defer body.deinit();
@@ -3419,7 +3526,7 @@ test "streaming relay treats 204 as bodiless" {
     try std.testing.expectEqual(@as(u16, 204), r.status);
     try std.testing.expectEqualStrings("none", r.framing_tag);
     try std.testing.expectEqual(@as(usize, 0), body.items.len);
-    try std.testing.expect(r.reusable);
+    try std.testing.expect(!r.reusable);
 }
 
 test "streaming relay reports abort on a truncated Content-Length body" {

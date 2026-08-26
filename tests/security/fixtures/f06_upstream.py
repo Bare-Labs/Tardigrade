@@ -25,6 +25,7 @@ import argparse
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _lock = threading.Lock()
@@ -121,6 +122,18 @@ HOSTILE_SCENARIOS = {
     "invalid_304_with_body": b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\nnope!",
 }
 
+# #673 review: a hostile upstream can send just a bodiless response's header
+# block, flush, wait until Tardigrade decides the connection is idle/reusable,
+# and only then send an illegal body or a full ghost response -- bytes that
+# would poison a pooled upstream connection for whatever unrelated request
+# checks it out next. This scenario is handled specially (not via
+# HOSTILE_SCENARIOS) because it needs a real sleep between two separate
+# writes, which a single static byte string cannot express.
+DELAYED_GHOST_SCENARIO = "delayed_ghost_after_bodiless"
+DELAYED_GHOST_DELAY_SECONDS = 0.35
+DELAYED_GHOST_HEAD = b"HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n"
+DELAYED_GHOST_TAIL = b"HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\nF06_UPSTREAM_GHOST_MARKER"
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -172,6 +185,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/hostile"):
             scenario = self.headers.get("X-F06-Scenario", "")
             count = _record(self.command, self.path, dict(self.headers.items()), body)
+            if scenario == DELAYED_GHOST_SCENARIO:
+                self.wfile.write(DELAYED_GHOST_HEAD)
+                self.wfile.flush()
+                time.sleep(DELAYED_GHOST_DELAY_SECONDS)
+                try:
+                    self.wfile.write(DELAYED_GHOST_TAIL)
+                    self.wfile.flush()
+                except OSError:
+                    # Expected once the fix holds: Tardigrade has already
+                    # closed this connection rather than pooling it.
+                    pass
+                self.close_connection = True
+                return
             raw = HOSTILE_SCENARIOS.get(scenario)
             if raw is None:
                 raw = f"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".encode()

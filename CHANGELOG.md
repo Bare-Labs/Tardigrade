@@ -5,7 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Six auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Eight auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
   hostile one) and found:
@@ -35,8 +35,18 @@ All notable user-facing changes to Tardigrade are documented here.
     `Content-Length` -- a real response-splitting vector, since a
     downstream client would treat the illegal bytes as the start of the
     next response on the connection.
+  - Both the buffered and streamed proxy paths could still return a
+    bodiless upstream connection to the idle pool for reuse whenever
+    nothing had trailed the header block *at the instant it was parsed* --
+    a malicious/misbehaving upstream could send just the headers, wait
+    until the connection was pooled, and only then send an illegal body or
+    a full ghost response, poisoning whatever unrelated request checked
+    the connection out next.
+  - The first interim `1xx` response in a chain (e.g. `103 Early Hints`)
+    was wrongly treated as the complete exchange, silently discarding
+    whatever actually followed -- including the real final response.
 
-  All five fixed with regression coverage in `gateway_proxy_headers.zig`,
+  All eight fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
   and `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the
   full campaign writeup.

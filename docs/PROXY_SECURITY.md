@@ -291,7 +291,24 @@ bodiless rule and would otherwise treat the illegal bytes as the start of
 the next response on the connection, making a naive pass-through a
 response-splitting vector (#673).
 
-Implementation: `parseBufferedUpstreamResponse()` in `src/gateway_proxy.zig`.
+A bodiless response's upstream connection is **never** returned to the
+keep-alive pool for reuse, even when nothing trailed the header block at
+parse time (#673). A malicious or misbehaving upstream can send just the
+header block, flush, and only send an illegal body or a full extra response
+after Tardigrade has already decided to pool the connection; those delayed
+bytes would otherwise become part of whatever unrelated request checks the
+connection out next.
+
+An upstream `1xx` interim response (`100 Continue`, `103 Early Hints`, etc.)
+does not end the exchange. Tardigrade discards each interim response — `101
+Switching Protocols` excepted, since it completes a protocol switch rather
+than signaling more to come — and keeps reading until the actual final,
+non-1xx response arrives; only that final response is returned to the
+client. Interim responses are not currently relayed to the downstream
+client separately.
+
+Implementation: `exchangeBoundedBufferedHttpRequest()` and
+`parseBufferedUpstreamResponse()` in `src/gateway_proxy.zig`.
 
 ## 12. Directory Traversal — Static File Serving
 
