@@ -66,6 +66,7 @@ jobs:
         env:
           INSTALL_MODE: ${{ matrix.install_mode }}
           EXPECTED_VERSION: ${{ inputs.expected_version || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = Linux ]; then

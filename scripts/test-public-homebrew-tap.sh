@@ -104,8 +104,9 @@ strip_tag_prefix() {
 
 latest_stable_release_version() {
     local tag
-    if command -v gh >/dev/null 2>&1; then
-        tag="$(gh release view --repo Bare-Systems/Tardigrade --json tagName -q .tagName)"
+    if command -v gh >/dev/null 2>&1 &&
+        tag="$(gh release view --repo Bare-Systems/Tardigrade --json tagName -q .tagName 2>/dev/null)"; then
+        :
     else
         tag="$(
             curl -fsSL https://api.github.com/repos/Bare-Systems/Tardigrade/releases/latest |
