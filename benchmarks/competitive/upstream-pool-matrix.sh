@@ -23,26 +23,6 @@ TLS_ORIGIN_PID=""
 ORIGIN_PIDS=()
 LOCK_METRICS=false
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --binary) BINARY="$2"; shift 2 ;;
-        --listen-port) LISTEN_PORT="$2"; shift 2 ;;
-        --origin-base-port) ORIGIN_BASE_PORT="$2"; shift 2 ;;
-        --duration) DURATION="$2"; shift 2 ;;
-        --connections) CONNECTIONS="$2"; shift 2 ;;
-        --threads) THREADS="$2"; shift 2 ;;
-        --output) OUTPUT="$2"; shift 2 ;;
-        --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "unknown arg: $1" >&2; exit 2 ;;
-    esac
-done
-
-[[ -n "$OUTPUT" ]] || { echo "--output is required" >&2; exit 1; }
-for tool in wrk curl python3 jq awk ps pgrep openssl k6; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 1; }
-done
-[[ -x "$BINARY" ]] || { echo "tardi binary not found at ${BINARY}" >&2; exit 1; }
-
 cleanup() {
     local status=$?
     if [[ "$status" -ne 0 && -n "$TMP_DIR" && -f "${TMP_DIR}/tardigrade.log" ]]; then
@@ -65,8 +45,6 @@ cleanup() {
     [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
     exit "$status"
 }
-trap cleanup EXIT
-
 monotonic_ns() {
     python3 -c 'import time; print(time.monotonic_ns())'
 }
@@ -333,6 +311,223 @@ run_measured_wrk() {
     scenario_json "$rps" "$p99" "$p99_ttfb" "$errors" "$cpu_pct" "$rss_mb" "$open_fds" "$before" "$after" "$elapsed"
 }
 
+route_result_json() {
+    local label="$1" raw_file="$2" duration="$3" connections="$4" threads="$5" requested_share="$6" total_rps="$7" elapsed="$8"
+    local raw summary rps p99 errors request_count achieved_share
+    raw="$(cat "$raw_file")"
+    summary="$(printf '%s\n' "$raw" | sed -n 's/^WRK_SUMMARY //p' | tail -1)"
+    if [[ -z "$summary" ]]; then
+        echo "missing wrk summary for ${label}" >&2
+        echo "$raw" >&2
+        return 1
+    fi
+    rps="$(jq -r '.rps // 0' <<<"$summary")"
+    p99="$(jq -r '.p99_ms // null' <<<"$summary")"
+    errors="$(printf '%s\n' "$raw" | wrk_error_count)"
+    if ! awk -v rps="$rps" 'BEGIN { exit !(rps > 0) }'; then
+        echo "wrk reported non-positive rps for ${label}: ${rps}" >&2
+        echo "$raw" >&2
+        return 1
+    fi
+    if [[ "$errors" != "0" ]]; then
+        echo "wrk reported ${errors} errors for ${label}" >&2
+        echo "$raw" >&2
+        return 1
+    fi
+    request_count="$(awk -v rps="$rps" -v elapsed="$elapsed" 'BEGIN { if (rps > 0 && elapsed > 0) printf "%.0f", rps * elapsed; else print 0 }')"
+    achieved_share="$(awk -v rps="$rps" -v total="$total_rps" 'BEGIN { if (total > 0) printf "%.6f", rps / total; else print 0 }')"
+    jq -n \
+        --argjson requested_share "$requested_share" \
+        --argjson achieved_share "$achieved_share" \
+        --argjson rps "$rps" \
+        --argjson p99 "$p99" \
+        --argjson errors "$errors" \
+        --argjson duration "$duration" \
+        --argjson connections "$connections" \
+        --argjson threads "$threads" \
+        --argjson request_count "$request_count" \
+        '{
+            requested_share: $requested_share,
+            achieved_share: $achieved_share,
+            rps: $rps,
+            p99_ms: $p99,
+            errors: $errors,
+            configured_duration_s: $duration,
+            configured_connections: $connections,
+            configured_threads: $threads,
+            achieved_request_count: $request_count
+        }'
+}
+
+run_concurrent_uneven_routes() {
+    local label="uneven-route-distribution"
+    local duration="$DURATION"
+    local route_a_connections=16 route_a_threads=4 route_a_share=0.80
+    local route_b_connections=3 route_b_threads=1 route_b_share=0.15
+    local route_c_connections=1 route_c_threads=1 route_c_share=0.05
+    local before after mon_pid mon_file cpu_before start_ns end_ns elapsed cpu_pct rss_mb open_fds
+    local route_a_raw route_b_raw route_c_raw route_a_status_file route_b_status_file route_c_status_file
+    local route_a_pid route_b_pid route_c_pid route_a_done=false route_b_done=false route_c_done=false remaining=3 failed=0
+    local route_a_status=0 route_b_status=0 route_c_status=0 route_a_summary route_b_summary route_c_summary
+    local route_a_rps route_b_rps route_c_rps total_rps total_errors combined route_a route_b route_c
+    before="${TMP_DIR}/${label}-before.metrics"
+    after="${TMP_DIR}/${label}-after.metrics"
+    route_a_raw="${TMP_DIR}/${label}-route-a.wrk"
+    route_b_raw="${TMP_DIR}/${label}-route-b.wrk"
+    route_c_raw="${TMP_DIR}/${label}-route-c.wrk"
+    route_a_status_file="${TMP_DIR}/${label}-route-a.status"
+    route_b_status_file="${TMP_DIR}/${label}-route-b.status"
+    route_c_status_file="${TMP_DIR}/${label}-route-c.status"
+
+    current_metrics > "$before"
+    read -r mon_pid mon_file cpu_before start_ns < <(start_monitor)
+
+    (
+        wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${route_a_threads}" -c"${route_a_connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/route-a" >"$route_a_raw" 2>&1 &
+        child_pid="$!"
+        trap 'kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' TERM INT
+        wait "$child_pid"
+        printf '%s\n' "$?" > "$route_a_status_file"
+    ) &
+    route_a_pid="$!"
+    (
+        wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${route_b_threads}" -c"${route_b_connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/route-b" >"$route_b_raw" 2>&1 &
+        child_pid="$!"
+        trap 'kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' TERM INT
+        wait "$child_pid"
+        printf '%s\n' "$?" > "$route_b_status_file"
+    ) &
+    route_b_pid="$!"
+    (
+        wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${route_c_threads}" -c"${route_c_connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/route-c" >"$route_c_raw" 2>&1 &
+        child_pid="$!"
+        trap 'kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' TERM INT
+        wait "$child_pid"
+        printf '%s\n' "$?" > "$route_c_status_file"
+    ) &
+    route_c_pid="$!"
+
+    while [[ "$remaining" -gt 0 ]]; do
+        if ! $route_a_done && [[ -f "$route_a_status_file" ]]; then
+            route_a_status="$(cat "$route_a_status_file")"
+            route_a_done=true
+            remaining=$((remaining - 1))
+            if [[ "$route_a_status" -ne 0 ]]; then
+                failed=1
+                if ! $route_b_done; then
+                    kill "$route_b_pid" 2>/dev/null || true
+                    route_b_status=143
+                    route_b_done=true
+                    remaining=$((remaining - 1))
+                fi
+                if ! $route_c_done; then
+                    kill "$route_c_pid" 2>/dev/null || true
+                    route_c_status=143
+                    route_c_done=true
+                    remaining=$((remaining - 1))
+                fi
+            fi
+        fi
+        if ! $route_b_done && [[ -f "$route_b_status_file" ]]; then
+            route_b_status="$(cat "$route_b_status_file")"
+            route_b_done=true
+            remaining=$((remaining - 1))
+            if [[ "$route_b_status" -ne 0 ]]; then
+                failed=1
+                if ! $route_a_done; then
+                    kill "$route_a_pid" 2>/dev/null || true
+                    route_a_status=143
+                    route_a_done=true
+                    remaining=$((remaining - 1))
+                fi
+                if ! $route_c_done; then
+                    kill "$route_c_pid" 2>/dev/null || true
+                    route_c_status=143
+                    route_c_done=true
+                    remaining=$((remaining - 1))
+                fi
+            fi
+        fi
+        if ! $route_c_done && [[ -f "$route_c_status_file" ]]; then
+            route_c_status="$(cat "$route_c_status_file")"
+            route_c_done=true
+            remaining=$((remaining - 1))
+            if [[ "$route_c_status" -ne 0 ]]; then
+                failed=1
+                if ! $route_a_done; then
+                    kill "$route_a_pid" 2>/dev/null || true
+                    route_a_status=143
+                    route_a_done=true
+                    remaining=$((remaining - 1))
+                fi
+                if ! $route_b_done; then
+                    kill "$route_b_pid" 2>/dev/null || true
+                    route_b_status=143
+                    route_b_done=true
+                    remaining=$((remaining - 1))
+                fi
+            fi
+        fi
+        [[ "$remaining" -eq 0 ]] || sleep 0.05
+    done
+    wait "$route_a_pid" 2>/dev/null || true
+    wait "$route_b_pid" 2>/dev/null || true
+    wait "$route_c_pid" 2>/dev/null || true
+    end_ns="$(monotonic_ns)"
+    read -r cpu_pct rss_mb open_fds < <(stop_monitor "$mon_pid" "$mon_file" "$cpu_before" "$start_ns")
+    current_metrics > "$after"
+
+    if [[ "$failed" -ne 0 || "$route_a_status" -ne 0 || "$route_b_status" -ne 0 || "$route_c_status" -ne 0 ]]; then
+        echo "concurrent uneven route wrk failed: route-a=${route_a_status} route-b=${route_b_status} route-c=${route_c_status}" >&2
+        echo "---- route-a wrk output ----" >&2
+        cat "$route_a_raw" >&2
+        echo "---- route-b wrk output ----" >&2
+        cat "$route_b_raw" >&2
+        echo "---- route-c wrk output ----" >&2
+        cat "$route_c_raw" >&2
+        return 1
+    fi
+
+    route_a_summary="$(sed -n 's/^WRK_SUMMARY //p' "$route_a_raw" | tail -1)"
+    route_b_summary="$(sed -n 's/^WRK_SUMMARY //p' "$route_b_raw" | tail -1)"
+    route_c_summary="$(sed -n 's/^WRK_SUMMARY //p' "$route_c_raw" | tail -1)"
+    if [[ -z "$route_a_summary" || -z "$route_b_summary" || -z "$route_c_summary" ]]; then
+        [[ -n "$route_a_summary" ]] || { echo "missing wrk summary for route-a" >&2; cat "$route_a_raw" >&2; }
+        [[ -n "$route_b_summary" ]] || { echo "missing wrk summary for route-b" >&2; cat "$route_b_raw" >&2; }
+        [[ -n "$route_c_summary" ]] || { echo "missing wrk summary for route-c" >&2; cat "$route_c_raw" >&2; }
+        return 1
+    fi
+    route_a_rps="$(jq -r '.rps // 0' <<<"$route_a_summary")"
+    route_b_rps="$(jq -r '.rps // 0' <<<"$route_b_summary")"
+    route_c_rps="$(jq -r '.rps // 0' <<<"$route_c_summary")"
+    total_rps="$(awk -v a="$route_a_rps" -v b="$route_b_rps" -v c="$route_c_rps" 'BEGIN { printf "%.3f", a + b + c }')"
+    elapsed="$(awk -v s="$start_ns" -v e="$end_ns" 'BEGIN { printf "%.3f", (e - s) / 1000000000 }')"
+
+    route_a="$(route_result_json route-a "$route_a_raw" "$duration" "$route_a_connections" "$route_a_threads" "$route_a_share" "$total_rps" "$elapsed")"
+    route_b="$(route_result_json route-b "$route_b_raw" "$duration" "$route_b_connections" "$route_b_threads" "$route_b_share" "$total_rps" "$elapsed")"
+    route_c="$(route_result_json route-c "$route_c_raw" "$duration" "$route_c_connections" "$route_c_threads" "$route_c_share" "$total_rps" "$elapsed")"
+    total_errors="$(jq -n --argjson a "$route_a" --argjson b "$route_b" --argjson c "$route_c" '($a.errors // 0) + ($b.errors // 0) + ($c.errors // 0)')"
+    combined="$(scenario_json "$total_rps" null null "$total_errors" "$cpu_pct" "$rss_mb" "$open_fds" "$before" "$after" "$elapsed")"
+
+    jq -n \
+        --argjson route_a "$route_a" \
+        --argjson route_b "$route_b" \
+        --argjson route_c "$route_c" \
+        --argjson combined "$combined" \
+        '{
+            covered: true,
+            concurrent: true,
+            note: "Routes were measured under one concurrent wrk window. Route-local rps, p99, errors, and achieved shares come from each wrk process; CPU, RSS, fd, upstream reuse, and lock-wait metrics are process-wide combined-window measurements.",
+            routes: {
+                route_a: $route_a,
+                route_b: $route_b,
+                route_c: $route_c
+            },
+            combined: $combined,
+            errors: (($route_a.errors // 0) + ($route_b.errors // 0) + ($route_c.errors // 0))
+        }'
+}
+
 start_gateway() {
     local workers="$1"
     [[ -n "$TARDIGRADE_PID" ]] && { kill "$TARDIGRADE_PID" 2>/dev/null || true; wait "$TARDIGRADE_PID" 2>/dev/null || true; }
@@ -396,6 +591,28 @@ worker_sweep_json() {
     }'
 }
 
+main() {
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --binary) BINARY="$2"; shift 2 ;;
+        --listen-port) LISTEN_PORT="$2"; shift 2 ;;
+        --origin-base-port) ORIGIN_BASE_PORT="$2"; shift 2 ;;
+        --duration) DURATION="$2"; shift 2 ;;
+        --connections) CONNECTIONS="$2"; shift 2 ;;
+        --threads) THREADS="$2"; shift 2 ;;
+        --output) OUTPUT="$2"; shift 2 ;;
+        --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+[[ -n "$OUTPUT" ]] || { echo "--output is required" >&2; exit 1; }
+for tool in wrk curl python3 jq awk ps pgrep openssl k6; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 1; }
+done
+[[ -x "$BINARY" ]] || { echo "tardi binary not found at ${BINARY}" >&2; exit 1; }
+trap cleanup EXIT
+
 TMP_DIR="$(mktemp -d /tmp/tardigrade-upstream-matrix-XXXXXX)"
 CONFIG_FILE="${TMP_DIR}/upstream-matrix.conf"
 TLS_ORIGIN_PORT=$((ORIGIN_BASE_PORT + 40))
@@ -457,9 +674,7 @@ for ((i = 0; i < ORIGIN_COUNT; i += 1)); do
 done
 
 hot_json="$(run_measured_wrk hot-origin hot "$DURATION" "$CONNECTIONS" "$THREADS" true)"
-route_a_json="$hot_json"
-route_b_json="$(run_measured_wrk route-b route-b 2 4 1 false)"
-route_c_json="$(run_measured_wrk route-c route-c 1 2 1 false)"
+uneven_routes_json="$(run_concurrent_uneven_routes)"
 
 origins_before="${TMP_DIR}/origins-before.metrics"
 origins_after="${TMP_DIR}/origins-after.metrics"
@@ -512,9 +727,7 @@ jq -n \
     --argjson duration "$DURATION" \
     --argjson threads "$THREADS" \
     --argjson hot "$hot_json" \
-    --argjson route_a "$route_a_json" \
-    --argjson route_b "$route_b_json" \
-    --argjson route_c "$route_c_json" \
+    --argjson uneven_routes "$uneven_routes_json" \
     --argjson origins_aggregate "$origins_aggregate" \
     --argjson origins "$origins_json" \
     --argjson tls "$tls_json" \
@@ -527,16 +740,7 @@ jq -n \
             note: "p99_ttfb_ms is measured from k6 http_req_waiting where present; p99_ms is wrk end-to-end latency."
         },
         scenarios: {
-            "uneven-route-distribution": {
-                covered: false,
-                reason: "route-a/b/c run as three sequential wrk passes, not concurrent mixed traffic — they never compete for the shared worker/connection pool at the same time, so this does not exercise or validate route-fairness under concurrent uneven traffic as #149/#593 require. Per-route numbers below are real, informational single-route measurements, not fairness evidence. See https://github.com/Bare-Systems/Tardigrade/issues/683.",
-                routes: {
-                    "route-a-hot": ($route_a + {requested_weight: 80}),
-                    "route-b-warm": ($route_b + {requested_weight: 15}),
-                    "route-c-cold": ($route_c + {requested_weight: 5})
-                },
-                errors: (($route_a.errors // 0) + ($route_b.errors // 0) + ($route_c.errors // 0))
-            },
+            "uneven-route-distribution": $uneven_routes,
             "many-origins-low-volume": ($origins_aggregate + {
                 covered: (($origins | map(.errors // 0) | add) == 0),
                 origins: ($origins | length),
@@ -551,3 +755,8 @@ jq -n \
     }' > "$OUTPUT"
 
 echo "Wrote upstream-pool matrix: ${OUTPUT}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
