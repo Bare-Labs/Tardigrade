@@ -134,6 +134,11 @@ itself must equal `chunked` exactly — a coding list such as
 `chunked, gzip` is rejected rather than treated as plain chunked framing
 with the unrecognized coding silently dropped.
 
+The request direction has the same exact-match requirement (#673 review
+round 7): `Request.parse()`/`Request.parseHead()` reject a `Transfer-Encoding`
+value that is anything other than `chunked` exactly, rather than accepting
+any comma-separated list containing a `chunked` token.
+
 Implementation: `src/http/request.zig`, function `Request.parse()`, lines
 that set `error.ConflictingHeaders`; the response-direction equivalent in
 `detectResponseFraming()` in `src/gateway_proxy.zig`.
@@ -272,6 +277,40 @@ each decoded chunk is accumulated and the running total is checked against the
 limit; the first chunk that would push the total over the limit causes
 `error.BodyTooLarge`.
 
+A chunked request body must actually be complete before it is treated as
+one (#673 review round 7): reaching the end of the buffered bytes right
+after a nonzero chunk, with no terminating zero-size chunk ever seen, is a
+truncated body and is rejected (`error.InvalidChunkedBody`) rather than
+accepted as if it ended there. The trailer section following the
+terminating chunk must reach its own blank-line terminator, and each
+non-blank trailer line must actually be `header-field` syntax (RFC 7230
+§4.1.2 — contain a colon); a trailer line with no colon is rejected rather
+than treated as free text. `Request.parse()` reports exactly how many bytes
+of the input a chunked body's encoding consumed, so a pipelined next
+request sitting immediately after the real terminator is left for the next
+parse rather than being silently swallowed into (or corrupting) the
+current request's consumed-bytes count.
+
+This same completeness requirement is enforced *before* `Request.parse()`
+is even called: on the buffered H1 path, `firstRequestCompleteLen()`
+(`src/gateway_connection.zig`) decides how many already-read bytes make up
+"one complete request" so the connection knows when to stop waiting for
+more data. For a `Transfer-Encoding: chunked` request with no
+`Content-Length`, this used to default the assumed body length to zero and
+declare the request complete the instant its headers finished — before a
+single body byte had arrived. `Request.parse()` would then decode an empty
+body, and the connection would be treated as ready for the next request
+while the real chunked body was still in flight on the wire — a
+request-smuggling-class desync. `firstRequestCompleteLen()` now scans for
+the actual chunked-body boundary (mirroring the completeness rules above,
+without decoding) whenever `Transfer-Encoding: chunked` is present, so the
+buffered path waits for the real terminator the same way it already waits
+for a declared `Content-Length` to be fully delivered.
+
+Implementation: `decodeChunkedBody()` in `src/http/request.zig`;
+`firstRequestCompleteLen()`/`chunkedBodyCompleteLen()`/
+`hasChunkedTransferEncoding()` in `src/gateway_connection.zig`.
+
 ## 10. Header Size and Header Count Limits
 
 Three independent limits are enforced during request parsing:
@@ -322,6 +361,19 @@ until the actual final, non-1xx response arrives; only that final response
 is returned to the client. Interim responses are not currently relayed to
 the downstream client separately.
 
+On the streaming path, the number of interim responses discarded this way
+is capped (`max_interim_upstream_responses`, 64) rather than unbounded
+(#673 review round 7): a hostile origin that drip-feeds interim responses
+indefinitely is rejected once the cap is exceeded, the loop checks
+cancellation on every iteration, and each discarded interim head's
+header/reason-phrase allocations are freed (`arena.reset(.free_all)`)
+before the next one is read, instead of accumulating in one arena for the
+life of the request. Without this, an origin could tie up a request past
+its nominal deadline and grow memory without bound simply by never
+sending a final response. The buffered path's equivalent loop is already
+bounded by the existing total-bytes cap on the response buffer regardless
+of how many interim responses arrive, so it did not need the same fix.
+
 An upstream `101 Switching Protocols` response is rejected outright
 (`error.UpstreamProtocolError`, `502 Bad Gateway`) rather than either
 being treated as a skippable 1xx interim response or forwarded as an
@@ -367,11 +419,30 @@ skips past, and chunk-size arithmetic uses checked addition so a
 maliciously oversized hex chunk-size is rejected as a protocol error
 instead of overflowing.
 
+All of the framing-correctness rules above only prove a connection was in
+sync *at the instant it was released* back to the keep-alive pool. A
+`Content-Length` or chunked response that lands exactly on its declared
+boundary is legitimately marked reusable — but a hostile or misbehaving
+origin can still send a "ghost" response *asynchronously*, any time after
+release, with no relationship to any request Tardigrade ever sent on that
+connection; nothing at release time can observe bytes that have not
+arrived yet. `UpstreamPool.checkout()` now polls each idle connection's raw
+fd (zero-timeout, watching for `POLLIN`/`POLLHUP`/`POLLERR`) immediately
+before handing it to the next, unrelated caller (#673 review round 7):
+anything already pending — an unsolicited byte, or the peer having closed
+the connection — discards that connection instead of reusing it, the same
+way an aged-out idle connection is discarded. A poll failure fails closed
+(treated as stale) rather than risking a false "clean" result. This closes
+the gap for `Content-Length`/chunked responses the same way the
+bodiless-never-reusable rule above closes it for bodiless ones.
+
 Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `parseBufferedUpstreamResponse()`, `detectResponseFraming()`,
 `decodeChunkedBody()`, `parseStrictStatusLine()`, and
 `readUpstreamHead()`/`streamProxyOverTransport()`/`relayUpstreamBody()`
-(the streaming path's equivalents) in `src/gateway_proxy.zig`.
+(the streaming path's equivalents) in `src/gateway_proxy.zig`;
+`UpstreamPool.checkout()`/`hasUnexpectedReadableBytes()` in
+`src/http/upstream_pool.zig`.
 
 ## 12. Directory Traversal — Static File Serving
 

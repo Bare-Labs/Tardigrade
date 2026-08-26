@@ -53,10 +53,13 @@ TRAVERSAL_CANARY = "F06_TRAVERSAL_CANARY_SHOULD_NEVER_BE_SERVED"
 ALIAS_ROOT_CANARY = "F06_ALIAS_ROOT_OK"
 GHOST_MARKER = "F06_UPSTREAM_GHOST_MARKER"
 # Must match tests/security/fixtures/f06_upstream.py's DELAYED_GHOST_SCENARIO
-# / DELAYED_GHOST_DELAY_SECONDS -- the fixture runs as a separate process, so
-# these can't be shared via import.
+# / DELAYED_GHOST_DELAY_SECONDS / DELAYED_GHOST_AFTER_CONTENT_LENGTH_SCENARIO
+# / DELAYED_GHOST_AFTER_CHUNKED_SCENARIO -- the fixture runs as a separate
+# process, so these can't be shared via import.
 DELAYED_GHOST_SCENARIO = "delayed_ghost_after_bodiless"
 DELAYED_GHOST_DELAY_SECONDS = 0.35
+DELAYED_GHOST_AFTER_CONTENT_LENGTH_SCENARIO = "delayed_ghost_after_content_length"
+DELAYED_GHOST_AFTER_CHUNKED_SCENARIO = "delayed_ghost_after_chunked"
 
 # Distinctive bytes for each hostile-upstream scenario that must never
 # appear verbatim in a later, unrelated response if the downstream
@@ -543,39 +546,85 @@ def run_hostile_framing(up: Upstream, port: int) -> None:
     # boundary. Each is run through framing_marker_case(), which appends a
     # unique pipelined marker request and proves it is never dispatched
     # (#673 review point 3).
+    #
+    # Every probe carries a VALID Authorization header (#673 review round 7):
+    # without it, "the upstream was never hit" is equally explained by the
+    # /protected auth gate rejecting the (auth-less) request, regardless of
+    # whether the framing parser itself would have accepted or rejected the
+    # malformed/ambiguous body -- a parser bug that wrongly accepted one of
+    # these as valid would still show zero hits, since the request never
+    # gets past auth either way. With valid auth, a parser bug that
+    # incorrectly accepts the framing is no longer masked: the request
+    # sails past auth and actually reaches (and is visible at) the upstream.
 
     framing_marker_case(up, "duplicate_cl_equal_values", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nABCD" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nABCD" + tail)
     framing_marker_case(up, "duplicate_cl_conflicting_values_hides_second_request", cat, port, lambda tail:
-                         (lambda body: b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: "
+                         (lambda body: b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nContent-Length: 4\r\nContent-Length: "
                           + str(len(body)).encode() + b"\r\n\r\n" + body)(b"ABCD" + tail))
     framing_marker_case(up, "comma_separated_content_length", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4, 4\r\n\r\nABCD" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nContent-Length: 4, 4\r\n\r\nABCD" + tail)
     framing_marker_case(up, "negative_content_length", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nContent-Length: -1\r\n\r\n" + tail)
     framing_marker_case(up, "content_length_integer_overflow", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999999999999999999\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nContent-Length: 99999999999999999999999999\r\n\r\n" + tail)
     framing_marker_case(up, "smuggling_probe_te_chunked_plus_cl", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n"
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nContent-Length: 4\r\n"
                          b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "te_before_cl_header_order", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "te_cl_mixed_case_both_present", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\ncontent-length: 4\r\nTRANSFER-ENCODING: chunked\r\n\r\n0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\ncontent-length: 4\r\nTRANSFER-ENCODING: chunked\r\n\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "duplicate_transfer_encoding_fields", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "unsupported_transfer_coding_gzip_chunked", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "chunked_not_final_coding", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "invalid_chunk_size_hex", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\nabc\r\n0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\nabc\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "oversized_chunk_size_value", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n" + b"a" * 32 + b"\r\n0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n" + b"a" * 32 + b"\r\n0\r\n\r\n" + tail)
     framing_marker_case(up, "missing_crlf_after_chunk_data", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcdXXXX0\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcdXXXX0\r\n\r\n" + tail)
     framing_marker_case(up, "malformed_chunk_trailers", cat, port, lambda tail:
-                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Trailer No Colon\r\n\r\n" + tail)
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Trailer No Colon\r\n\r\n" + tail)
+
+    # #673 review round 7 point 3: every case above tests one MALFORMED or
+    # ambiguous framing combination and asserts it is rejected (zero
+    # upstream hits). None of them prove the ordinary, single, valid
+    # Content-Length path correctly finds the body boundary in the first
+    # place -- the duplicate-CL cases exercise the *rejection* path, not the
+    # normal CL boundary computation. Append a pipelined marker request
+    # right after a single valid `Content-Length: 4` request's 4-byte body,
+    # on the same connection, and assert the first request's body is read
+    # as EXACTLY those 4 bytes -- neither over-reading into the marker's
+    # bytes (which a boundary off-by-one would do) nor under-reading (which
+    # would leave stray bytes to desync the connection). This build of
+    # Tardigrade does not eagerly process a second pipelined request already
+    # sitting in the same read behind the first (confirmed against a bare
+    # double-pipelined GET /health, unrelated to any change in this PR), so
+    # this asserts the boundary is exact rather than that the marker itself
+    # gets independently dispatched.
+    up.reset()
+    single_cl_case = "single_cl_boundary"
+    single_cl_marker_path = f"/f06-marker-{single_cl_case}"
+    single_cl_raw = (
+        b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() +
+        b"\r\nContent-Length: 4\r\n\r\nABCD" +
+        f"GET {single_cl_marker_path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
+    )
+    send_raw(port, single_cl_raw, read_timeout=1.3)
+    single_cl_hits = up.hits()
+    single_cl_first = next((h for h in single_cl_hits if h["path"] == "/protected"), None)
+    single_cl_ok = (
+        single_cl_first is not None
+        and single_cl_first["body_len"] == 4
+        and single_cl_first["body_preview"] == "ABCD"
+        and len(single_cl_hits) == 1
+    )
+    record("single_content_length_correctly_bounds_the_body_exactly", cat, single_cl_ok,
+           f"hits={[(h['path'], h['body_len']) for h in single_cl_hits]}")
 
     # Truncation-only cases: the connection is deliberately cut short before
     # a complete request exists, so no coherent trailing marker request
@@ -583,7 +632,7 @@ def run_hostile_framing(up: Upstream, port: int) -> None:
     # These stay as "never dispatches" assertions on the incomplete send.
     up.reset()
     send_raw_then_close_early(port,
-                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n",
+                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nContent-Length: 100\r\n\r\n",
                                b"short-body-only", delay=0.1)
     hits = up.hits()
     ok = len(hits) == 0
@@ -591,7 +640,7 @@ def run_hostile_framing(up: Upstream, port: int) -> None:
 
     up.reset()
     send_raw_then_close_early(port,
-                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
+                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
                                b"", delay=0.1)
     hits = up.hits()
     ok = len(hits) == 0
@@ -599,7 +648,7 @@ def run_hostile_framing(up: Upstream, port: int) -> None:
 
     up.reset()
     send_raw_then_close_early(port,
-                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n",
+                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n",
                                b"", delay=0.1)
     hits = up.hits()
     ok = len(hits) == 0
@@ -707,7 +756,9 @@ def run_traversal_boundary(up: Upstream, port: int) -> None:
            f"status={status} canary_leaked={canary_leaked}")
 
 
-def hostile_delayed_ghost_does_not_poison_pool(up: Upstream, cat: str, port: int, path: str, name: str) -> None:
+def hostile_delayed_ghost_does_not_poison_pool(
+    up: Upstream, cat: str, port: int, path: str, name: str, scenario: str = DELAYED_GHOST_SCENARIO
+) -> None:
     """
     #673 review: a hostile upstream can send just a bodiless response's
     headers, flush, and only send an illegal body / full ghost response
@@ -720,9 +771,17 @@ def hostile_delayed_ghost_does_not_poison_pool(up: Upstream, cat: str, port: int
     is the live, timing-based confirmation). Parameterized by `path` so it
     can be run against both the buffered and forced-streaming hostile
     routes, which have separate implementations of this fix.
+
+    `scenario` defaults to the bodiless-response variant; round 7 point 5
+    also passes `DELAYED_GHOST_AFTER_CONTENT_LENGTH_SCENARIO` /
+    `DELAYED_GHOST_AFTER_CHUNKED_SCENARIO`, where the FIRST response is a
+    complete, correctly-framed, non-bodiless response that Tardigrade has
+    every reason to pool -- proving the ghost is still caught by
+    `UpstreamPool.checkout()`'s staleness probe at the next checkout, not
+    just by the bodiless-never-reusable rule the original scenario exercises.
     """
     up.reset()
-    first = send_raw(port, req("GET", path, [("X-F06-Scenario", DELAYED_GHOST_SCENARIO)]), read_timeout=0.6)
+    first = send_raw(port, req("GET", path, [("X-F06-Scenario", scenario)]), read_timeout=0.6)
     # Give the fixture's delayed tail write time to land on the upstream
     # socket before probing -- comfortably longer than its own delay.
     time.sleep(DELAYED_GHOST_DELAY_SECONDS * 2)
@@ -868,6 +927,17 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
 
     hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile",
                                                 "hostile_upstream_delayed_ghost_after_bodiless_does_not_poison_pool")
+    # #673 review round 7 point 5: unlike the bodiless case above, these two
+    # responses land exactly on their declared boundary and are legitimately
+    # pooled -- proving the ghost is caught by UpstreamPool.checkout()'s
+    # staleness probe at the NEXT checkout, not just by bodiless responses
+    # never being reusable in the first place.
+    hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile",
+                                                "hostile_upstream_delayed_ghost_after_content_length_does_not_poison_pool",
+                                                scenario=DELAYED_GHOST_AFTER_CONTENT_LENGTH_SCENARIO)
+    hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile",
+                                                "hostile_upstream_delayed_ghost_after_chunked_does_not_poison_pool",
+                                                scenario=DELAYED_GHOST_AFTER_CHUNKED_SCENARIO)
     hostile_1xx_chain_returns_final_response(up, cat, port, "/hostile",
                                               "hostile_upstream_unusual_1xx_chain_returns_actual_final_response")
 
@@ -889,8 +959,37 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     # twin of the same upstream route (see f06_tardigrade.conf).
     hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile-streaming",
                                                 "hostile_upstream_streaming_delayed_ghost_after_bodiless_does_not_poison_pool")
+    hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile-streaming",
+                                                "hostile_upstream_streaming_delayed_ghost_after_content_length_does_not_poison_pool",
+                                                scenario=DELAYED_GHOST_AFTER_CONTENT_LENGTH_SCENARIO)
+    hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile-streaming",
+                                                "hostile_upstream_streaming_delayed_ghost_after_chunked_does_not_poison_pool",
+                                                scenario=DELAYED_GHOST_AFTER_CHUNKED_SCENARIO)
     hostile_1xx_chain_returns_final_response(up, cat, port, "/hostile-streaming",
                                               "hostile_upstream_streaming_unusual_1xx_chain_returns_actual_final_response")
+
+    # #673 review round 7 point 4: a hostile origin drip-feeding interim
+    # responses forever must not tie up the streaming path indefinitely.
+    # Buffered-path 1xx handling is already bounded by the total-bytes cap
+    # on the response buffer regardless of iteration count, so this is
+    # streaming-only.
+    #
+    # The response itself (a 502, once the cap rejects the chain) arrives in
+    # a few milliseconds, but Tardigrade does not force-close the downstream
+    # connection just because the upstream exchange failed -- so `send_raw`
+    # always runs its full read_timeout waiting for an EOF that never comes,
+    # regardless of how fast the response was. Elapsed time through
+    # `send_raw` is therefore not a usable "did this hang" signal here; a
+    # real hang (no cap, chain never ends) would instead show up as no
+    # status line at all having arrived by the time that timeout elapses.
+    up.reset()
+    raw = send_raw(port, hostile("excessive_1xx_chain", "/hostile-streaming"), read_timeout=1.2)
+    followup = send_raw(port, req("GET", "/health", []))
+    got_a_response = first_status_code(raw) is not None
+    edge_healthy = first_status_code(followup) == 200
+    ok = got_a_response and edge_healthy
+    record("hostile_upstream_streaming_excessive_1xx_chain_does_not_hang_or_break_edge", cat, ok,
+           f"status={first_status_code(raw)} followup_status={first_status_code(followup)}")
 
     up.reset()
     raw = send_raw(port, hostile("reverse_conflicting_cl", "/hostile-streaming"))

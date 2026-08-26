@@ -184,6 +184,15 @@ HOSTILE_SCENARIOS = {
     # digits alone also admits 000..099 and 600..999 (#673 review round 6).
     "status_code_too_low": b"HTTP/1.1 099 Weird\r\nContent-Length: 2\r\n\r\nok",
     "status_code_too_high": b"HTTP/1.1 600 Weird\r\nContent-Length: 2\r\n\r\nok",
+    # #673 review round 7 point 4: a hostile origin drip-feeding interim
+    # responses forever must not tie up the streaming path indefinitely or
+    # grow its memory unbounded. 80 interim responses is comfortably past
+    # gateway_proxy.zig's max_interim_upstream_responses (64), so this must
+    # be rejected rather than eventually reaching the real final response.
+    "excessive_1xx_chain": (
+        b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n" * 80
+        + b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    ),
 }
 
 # #673 review: a hostile upstream can send just a bodiless response's header
@@ -197,6 +206,27 @@ DELAYED_GHOST_SCENARIO = "delayed_ghost_after_bodiless"
 DELAYED_GHOST_DELAY_SECONDS = 0.35
 DELAYED_GHOST_HEAD = b"HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n"
 DELAYED_GHOST_TAIL = b"HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\nF06_UPSTREAM_GHOST_MARKER"
+
+# #673 review round 7 point 5: the delayed-ghost defense above only proves
+# BODILESS responses are never pooled. A Content-Length/chunked response
+# that lands exactly on its declared boundary is legitimately marked
+# reusable and DOES get pooled -- these two variants send a complete,
+# correctly-framed, non-bodiless response first (so Tardigrade has no
+# reason not to pool it), then delay the same ghost tail, proving
+# `UpstreamPool.checkout()`'s staleness probe -- not just the framing-time
+# reusable decision -- is what actually keeps this connection out of a
+# later, unrelated exchange.
+DELAYED_GHOST_AFTER_CONTENT_LENGTH_SCENARIO = "delayed_ghost_after_content_length"
+DELAYED_GHOST_AFTER_CONTENT_LENGTH_HEAD = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+DELAYED_GHOST_AFTER_CHUNKED_SCENARIO = "delayed_ghost_after_chunked"
+DELAYED_GHOST_AFTER_CHUNKED_HEAD = (
+    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+)
+DELAYED_GHOST_HEADS = {
+    DELAYED_GHOST_SCENARIO: DELAYED_GHOST_HEAD,
+    DELAYED_GHOST_AFTER_CONTENT_LENGTH_SCENARIO: DELAYED_GHOST_AFTER_CONTENT_LENGTH_HEAD,
+    DELAYED_GHOST_AFTER_CHUNKED_SCENARIO: DELAYED_GHOST_AFTER_CHUNKED_HEAD,
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -249,8 +279,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/hostile"):
             scenario = self.headers.get("X-F06-Scenario", "")
             count = _record(self.command, self.path, dict(self.headers.items()), body)
-            if scenario == DELAYED_GHOST_SCENARIO:
-                self.wfile.write(DELAYED_GHOST_HEAD)
+            if scenario in DELAYED_GHOST_HEADS:
+                self.wfile.write(DELAYED_GHOST_HEADS[scenario])
                 self.wfile.flush()
                 time.sleep(DELAYED_GHOST_DELAY_SECONDS)
                 try:

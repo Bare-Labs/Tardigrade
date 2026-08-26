@@ -1884,6 +1884,13 @@ fn decodeChunkedBody(allocator: std.mem.Allocator, encoded: []const u8, max_byte
             while (true) {
                 const tlen = std.mem.find(u8, encoded[tpos..], "\r\n") orelse return null;
                 if (tlen == 0) return .{ .body = try out.toOwnedSlice(), .consumed = tpos + 2 }; // blank line → done
+                // RFC 7230 §4.1.2: the trailer part is `*( header-field CRLF
+                // )` -- a non-blank line must actually be `name ":" value`,
+                // not arbitrary text a hostile upstream could use to hide a
+                // pipelined ghost response inside what looks like "just a
+                // trailer" (#673 review).
+                const trailer_line = encoded[tpos .. tpos + tlen];
+                if (std.mem.findScalar(u8, trailer_line, ':') == null) return error.UpstreamProtocolError;
                 tpos += tlen + 2;
             }
         }
@@ -2774,6 +2781,14 @@ fn releaseDrainedHeadBytes(
     head_bytes_held.* = still_held;
 }
 
+/// Hard cap on the number of `1xx` interim responses `streamProxyOverTransport`
+/// will discard while waiting for an upstream's actual final response.
+/// Without this, a hostile or misbehaving origin could drip-feed interim
+/// responses (e.g. `103 Early Hints`) indefinitely, tying up the request past
+/// any read-level deadline (#673 review). Generous enough for legitimate
+/// multi-hint chains; far below anything a real origin would ever need.
+const max_interim_upstream_responses: usize = 64;
+
 /// Run one streaming proxy attempt over an already-connected `transport`: send
 /// the request, read the response head, relay the head+body downstream, and
 /// report whether the connection is reusable. `wrote_downstream` is set true the
@@ -2867,8 +2882,27 @@ fn streamProxyOverTransport(
     // already rejects status 101 outright with `error.UpstreamProtocolError`
     // before it can ever reach this loop, so any status still in the 1xx
     // range here is a genuine skippable interim response.
+    //
+    // Three further hardenings on this loop (#673 review): a hostile origin
+    // that drip-feeds interim responses forever must not be able to (1) grow
+    // memory without bound -- each `readUpstreamHead` call allocates header
+    // and reason-phrase copies from `arena`, and a shared arena across
+    // unboundedly many iterations never frees a discarded interim head's
+    // allocations until the whole request ends; (2) run past the request's
+    // actual cancellation, since nothing inside this loop previously checked
+    // `cancel_token`; or (3) run for an unbounded number of iterations at
+    // all, since `read_deadline_ms` bounds a single read, not the cumulative
+    // time/iterations spent here.
     var head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method);
+    var interim_responses: usize = 0;
     while (head.status_code >= 100 and head.status_code < 200) {
+        if (cancelStopped(cancel_token)) return error.RequestCancelled;
+        interim_responses += 1;
+        if (interim_responses > max_interim_upstream_responses) return error.UpstreamProtocolError;
+        // Free the just-discarded interim head's allocations before reading
+        // the next one; the eventual non-1xx head's allocations are the only
+        // ones left standing when this loop exits.
+        _ = arena.reset(.free_all);
         head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method);
     }
     const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
@@ -3797,6 +3831,20 @@ test "exchange refuses reuse when bytes trail a chunked body's terminator (#673 
     defer resp.deinit(allocator);
     try std.testing.expectEqualStrings("hello", resp.body);
     try std.testing.expect(!reusable);
+}
+
+test "exchange rejects an upstream chunked body whose trailer line has no colon (#673 review)" {
+    // Same rationale as the request-side fix: RFC 7230 §4.1.2's trailer
+    // part is `*( header-field CRLF )`, not arbitrary text -- a hostile
+    // upstream could otherwise hide unstructured bytes (potentially the
+    // start of a smuggled ghost response) behind what looks like "just a
+    // trailer".
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UpstreamProtocolError, exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\nBad Trailer No Colon\r\n\r\n",
+    ));
 }
 
 test "exchange rejects a chunk whose data is not terminated by CRLF (#673 review)" {

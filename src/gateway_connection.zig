@@ -319,9 +319,86 @@ pub fn firstRequestHeadersCompleteLen(data: []const u8) ?usize {
     return header_pos + 4;
 }
 
+/// Whether `headers` (the raw header block, CRLF-separated) carries a
+/// `Transfer-Encoding` naming exactly `chunked`. Used only to decide *how*
+/// to look for the request boundary below; `Request.parse()`/`parseHead()`
+/// do the authoritative strict validation (rejecting any other value, a
+/// duplicate field, or TE+CL together) once a complete buffer is handed to
+/// them. Any other `Transfer-Encoding` value is deliberately left to the
+/// existing Content-Length-based sizing below -- such a request is rejected
+/// outright by `Request.parse()` regardless of how much of its body has
+/// arrived, so there is no framing decision to get right for it here.
+fn hasChunkedTransferEncoding(headers: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, headers, "\r\n");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "transfer-encoding")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.ascii.eqlIgnoreCase(value, "chunked");
+    }
+    return false;
+}
+
+/// How many bytes of `data` (everything after the request head) make up a
+/// complete `Transfer-Encoding: chunked` body -- through and including the
+/// terminating zero-size chunk's trailer section and its final blank line.
+/// Returns `null` if the body has not fully arrived yet, so the caller keeps
+/// reading. Does not decode or validate chunk contents beyond what is needed
+/// to find this boundary; `Request.parse()`'s own chunked decoder is the
+/// authoritative validator once a complete buffer is handed to it (#673
+/// review).
+///
+/// Before this existed, `firstRequestCompleteLen()` had no chunked-body
+/// awareness at all: with no `Content-Length` header, `parseContentLength()`
+/// returns `null`, defaulting the assumed body length to zero and declaring
+/// a chunked request "complete" the instant its headers finish -- before a
+/// single body byte arrives. The buffered H1 path would then hand
+/// `Request.parse()` an empty body slice (decoding to an empty body) and
+/// treat the connection as ready for the next request, while the real
+/// chunked body bytes were still in flight -- a request-smuggling-class
+/// desync where the actual body (or an attacker-crafted "next request"
+/// embedded in it) gets misread as a separate pipelined request.
+fn chunkedBodyCompleteLen(data: []const u8) ?usize {
+    var pos: usize = 0;
+    while (true) {
+        const line_end = std.mem.find(u8, data[pos..], "\r\n") orelse return null;
+        const chunk_size_line = data[pos .. pos + line_end];
+        const semi = std.mem.findScalar(u8, chunk_size_line, ';');
+        const hex = std.mem.trim(u8, if (semi) |s| chunk_size_line[0..s] else chunk_size_line, " \t");
+        const chunk_size = std.fmt.parseInt(usize, hex, 16) catch {
+            // Unparseable chunk-size: this request can never become valid by
+            // waiting for more bytes. Report "complete now" so the caller
+            // stops buffering and hands it to `Request.parse()`, which will
+            // reject it deterministically instead of stalling until a
+            // header/body timeout fires.
+            return pos + line_end + 2;
+        };
+        const data_start = pos + line_end + 2;
+        if (chunk_size == 0) {
+            var tpos = data_start;
+            while (true) {
+                const tlen = std.mem.find(u8, data[tpos..], "\r\n") orelse return null;
+                if (tlen == 0) return tpos + 2;
+                tpos += tlen + 2;
+            }
+        }
+        const data_end = std.math.add(usize, data_start, chunk_size) catch return data_start;
+        const chunk_end = std.math.add(usize, data_end, 2) catch return data_end;
+        if (chunk_end > data.len) return null;
+        pos = chunk_end;
+    }
+}
+
 pub fn firstRequestCompleteLen(data: []const u8) ?usize {
     const headers_len = firstRequestHeadersCompleteLen(data) orelse return null;
-    const content_length = parseContentLength(data[0..headers_len]) orelse 0;
+    const headers_block = data[0..headers_len];
+    if (hasChunkedTransferEncoding(headers_block)) {
+        const body_consumed = chunkedBodyCompleteLen(data[headers_len..]) orelse return null;
+        return headers_len + body_consumed;
+    }
+    const content_length = parseContentLength(headers_block) orelse 0;
     const full_len = headers_len + content_length;
     if (data.len >= full_len) return full_len;
     return null;
@@ -433,4 +510,35 @@ test "firstRequestCompleteLen handles keep-alive pipelined requests" {
     const first = reqs[0..first_len];
     try std.testing.expect(std.mem.find(u8, first, "GET /a") != null);
     try std.testing.expect(std.mem.find(u8, first, "keep-alive") != null);
+}
+
+test "firstRequestCompleteLen waits for a chunked body instead of declaring complete at headers (#673 review)" {
+    // Before this fix, a Transfer-Encoding: chunked request with no
+    // Content-Length was declared "complete" the instant its headers
+    // finished (parseContentLength() defaults missing CL to 0), handing
+    // Request.parse() an empty body slice before a single chunk byte
+    // arrived -- and the real chunked body that followed on the wire would
+    // then be misread as the start of the next pipelined request.
+    const headers = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try std.testing.expect(firstRequestCompleteLen(headers) == null);
+
+    const partial_chunk = headers ++ "5\r\nhel";
+    try std.testing.expect(firstRequestCompleteLen(partial_chunk) == null);
+
+    const missing_terminator = headers ++ "5\r\nhello\r\n";
+    try std.testing.expect(firstRequestCompleteLen(missing_terminator) == null);
+
+    const complete = headers ++ "5\r\nhello\r\n0\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, complete.len), firstRequestCompleteLen(complete).?);
+}
+
+test "firstRequestCompleteLen finds the pipelined boundary after a chunked body (#673 review)" {
+    const pipelined =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n" ++
+        "GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const first_len = firstRequestCompleteLen(pipelined).?;
+    const first = pipelined[0..first_len];
+    try std.testing.expect(std.mem.find(u8, first, "/upload") != null);
+    try std.testing.expect(std.mem.find(u8, first, "/next") == null);
+    try std.testing.expect(std.mem.find(u8, pipelined[first_len..], "GET /next") != null);
 }

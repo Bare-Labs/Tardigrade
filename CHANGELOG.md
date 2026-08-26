@@ -5,7 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Eighteen auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Twenty-five auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
   hostile one, on both the buffered and a forced-streaming proxy route) and
@@ -94,11 +94,48 @@ All notable user-facing changes to Tardigrade are documented here.
     -- and on the buffered path, an unrejected `099` was later reformatted
     straight back out to the client as the invalid response line
     `HTTP/1.1 99 ...`.
+  - The campaign's own request-framing smuggling oracle sent every
+    malformed/ambiguous probe with no `Authorization` header, so "zero
+    upstream hits" was equally explained by the `/protected` auth gate
+    rejecting the request regardless of what the framing parser would have
+    done -- masking whether the parser itself was actually correct on 15
+    live cases.
+  - Once probes carried valid auth, the REQUEST direction turned out to
+    have the same `Transfer-Encoding` list-matching defect already fixed on
+    the response direction: a coding list like `chunked, gzip` was accepted
+    as plain chunked framing.
+  - The request-side chunked-body decoder accepted EOF right after a
+    nonzero chunk with no terminating zero-chunk ever seen (treating a
+    truncated body as complete), never required the trailer section to
+    reach its own blank-line terminator, and always reported the whole
+    buffer as consumed regardless of where the chunked body's encoding
+    actually ended -- silently swallowing a pipelined next request's bytes.
+  - Neither chunked-body decoder (request or response direction) validated
+    that a non-blank trailer line was actually `name: value` syntax; a line
+    with no colon at all was accepted as "a trailer".
+  - The buffered path's request-completeness check had no
+    `Transfer-Encoding` awareness at all: a chunked request with no
+    `Content-Length` was declared "complete" the instant its headers
+    finished, before a single body byte arrived, handing the parser an
+    empty body and treating the connection as ready for the next request
+    while the real chunked body was still in flight on the wire.
+  - The streaming path's interim-`1xx`-discarding loop had no cap on how
+    many interim responses a hostile origin could drip-feed, no
+    cancellation check inside the loop, and a shared arena across every
+    iteration that never freed a discarded interim head's allocations
+    until the whole request ended.
+  - `UpstreamPool.checkout()` handed back an idle pooled connection without
+    checking whether its peer had sent anything (or closed) since release
+    -- so a "ghost" response delayed until after release, on a
+    `Content-Length`/chunked response that legitimately landed on its
+    declared boundary (not just the already-covered bodiless case), could
+    still poison a later, unrelated request over the same connection.
 
-  All eighteen fixed with regression coverage in `gateway_proxy_headers.zig`,
+  All twenty-five fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
-  and `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the
-  full campaign writeup.
+  `src/gateway_connection.zig`, `src/http/upstream_pool.zig`, and
+  `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the full
+  campaign writeup.
 
 ## [0.6.2] - 2026-08-25
 

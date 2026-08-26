@@ -146,7 +146,7 @@ client got a 4xx -- and every smuggling-shaped framing probe additionally
 appends a unique pipelined marker request to prove it is never dispatched,
 not just that the malformed probe itself was rejected.
 
-Coverage (148 live cases):
+Coverage (154 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
   oversized token, malformed/invalid-signature JWT, comma-joined
   `Authorization`, NUL/CR injection attempts), including a strict deny for
@@ -210,9 +210,28 @@ Coverage (148 live cases):
 - an upstream status code outside RFC 9110 §15's valid `100..599` range
   (e.g. `099`, `600`) is rejected outright rather than reformatted back out
   to the client as an invalid status line, on both the buffered and
-  streaming paths.
+  streaming paths;
+- every request-direction smuggling-shaped framing probe (duplicate/
+  conflicting Content-Length, TE+CL together in either header order or
+  case, duplicate/unsupported/misordered Transfer-Encoding, invalid/
+  oversized chunk-size hex, missing chunk-data CRLF, a malformed
+  no-colon chunk trailer) is sent with **valid** auth so a parser bug that
+  wrongly accepts the framing would actually reach the upstream instead of
+  being masked by the `/protected` auth gate, and a separate positive-
+  control case proves a single, ordinary, valid `Content-Length` request's
+  body boundary is computed exactly -- neither over- nor under-reading by
+  even one byte;
+- a hostile origin drip-feeding interim `1xx` responses well past what any
+  real origin would ever send is rejected outright on the streaming path
+  rather than tying up the request indefinitely, without breaking the edge
+  for unrelated requests;
+- a "ghost" response delayed until after release, on a `Content-Length` or
+  chunked response that legitimately lands on its declared boundary (not
+  just the already-covered bodiless case), never poisons a later, unrelated
+  request over the same pooled upstream connection, on both the buffered
+  and streaming paths.
 
-The campaign found and fixed eighteen real defects, all now covered by
+The campaign found and fixed twenty-five real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -398,6 +417,81 @@ deterministic regression tests:
     parser is prepared to handle. Fixed by rejecting any status code
     outside `100..599` in the shared `parseStrictStatusLine()`, covering
     both the buffered and streaming paths from the single call site.
+19. The campaign's request-framing smuggling oracle (`framing_marker_case()`)
+    sent every malformed/ambiguous probe to `/protected` with no
+    `Authorization` header at all. Its pass condition -- zero upstream hits
+    -- was equally satisfied by "the framing parser correctly rejected this"
+    or "the parser wrongly accepted it, but auth rejected the request
+    anyway", so 15 live cases proved nothing about parser behavior. Fixed by
+    giving every probe valid auth, so a parser bug that wrongly accepts the
+    framing now actually reaches (and is visible at) the upstream instead of
+    being masked by the auth gate.
+20. Once probes had valid auth, `Request.parse()`/`parseHead()` (request
+    direction) turned out to have the same `Transfer-Encoding` list-matching
+    defect already fixed on the response direction (defect 14): a coding
+    list like `Transfer-Encoding: chunked, gzip` or `gzip, chunked` was
+    accepted as plain chunked framing because the check only asked "does any
+    comma-separated token equal chunked". Fixed the same way: the value must
+    equal `chunked` exactly.
+21. The request-side chunked-body decoder (`decodeChunkedBody()` in
+    `src/http/request.zig`) had the same defects as the response-side one
+    before defects 13/17 fixed it: its outer loop condition
+    (`while (pos < data.len)`) silently accepted reaching the end of the
+    buffer right after a nonzero chunk -- with no terminating zero-size
+    chunk ever seen -- as a complete body; it never required the trailer
+    section to reach its own blank-line terminator; and it always reported
+    `total_bytes = data.len`, so a pipelined next request sitting right
+    after a chunked body's real terminator was silently swallowed into "this
+    request's consumed bytes" instead of being left for the next parse.
+    Fixed the same way as the response side: require the terminator, require
+    the trailer section's blank line, and return an exact consumed offset.
+22. Neither chunked-body decoder (request or response direction) validated
+    that a non-blank trailer line was actually `header-field` syntax (RFC
+    7230 §4.1.2 -- `name ":" value`); a line with no colon at all was
+    silently accepted as "a trailer". Unstructured bytes there could really
+    be the start of a pipelined next request. Fixed by requiring a colon in
+    each non-blank trailer line, in both decoders.
+23. `firstRequestCompleteLen()` in `src/gateway_connection.zig` -- which
+    decides how many buffered bytes make up "one complete request" on the
+    buffered H1 path -- had no `Transfer-Encoding` awareness at all. With no
+    `Content-Length` header, `parseContentLength()` returns `null`, which
+    defaulted the assumed body length to zero: a chunked request was
+    declared "complete" the instant its headers finished, before a single
+    body byte arrived. `Request.parse()` would then be handed an empty body
+    slice (decoding to an empty body, thanks to defect 21's bug), and the
+    connection would be treated as ready for the next request while the
+    real chunked body was still in flight -- a request-smuggling-class
+    desync where the actual body (or an attacker-crafted "next request"
+    embedded in it) gets misread as a separate pipelined request. Fixed by
+    adding a chunked-body boundary scanner that `firstRequestCompleteLen()`
+    consults whenever `Transfer-Encoding: chunked` is present, so the
+    buffered path waits for the real terminator the same way the
+    `Content-Length` path waits for the declared body length.
+24. The streaming path's interim-`1xx`-discarding loop
+    (`streamProxyOverTransport()`) had three unbounded-processing gaps: no
+    cap on the number of interim responses a hostile origin could drip-feed
+    before Tardigrade gave up, no cancellation check inside the loop, and a
+    single arena shared across every iteration that never freed a discarded
+    interim head's header/reason-phrase allocations until the whole request
+    ended -- letting a hostile origin grow memory and tie up the request
+    past its nominal read deadline by sending 1xx responses indefinitely.
+    Fixed by capping the number of interim responses
+    (`max_interim_upstream_responses = 64`), checking `cancel_token` each
+    iteration, and resetting the arena (`.free_all`) before reading each new
+    interim head so only the eventual final head's allocations survive.
+25. `UpstreamPool.checkout()` handed back an idle pooled connection without
+    checking whether its peer had sent anything (or closed) since release.
+    The bodiless-response fix (defect 7) prevents a bodiless response's
+    connection from ever being pooled at all, but a `Content-Length` or
+    chunked response that lands exactly on its declared boundary is
+    legitimately marked reusable -- and a hostile or misbehaving origin can
+    still send a "ghost" response *asynchronously*, any time after release,
+    with no relationship to any request Tardigrade ever sent on that
+    connection. Nothing at release time can observe that; only a check at
+    the next checkout can. Fixed by polling each idle connection's raw fd
+    (zero-timeout, `POLLIN`/`POLLHUP`/`POLLERR`) before handing it out,
+    discarding it instead of reusing it if anything is already pending --
+    failing closed on a poll error too.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
@@ -407,7 +501,7 @@ forced-streaming `/hostile-streaming` twin -- plus a symlink and an
 `tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
 results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials
 are synthetic and local-only; no production secrets or traffic were used.
-148/148 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
+154/154 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
 script for current evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference

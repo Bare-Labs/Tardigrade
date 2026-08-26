@@ -12827,7 +12827,17 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
         "X-Test-Hop: secret-one\r\n" ++
         "X-Another-Hop: secret-two\r\n" ++
         "X-Custom-Pass: still-here\r\n" ++
-        "\r\n";
+        "\r\n" ++
+        // A well-formed (empty) chunked body: the terminating zero-size
+        // chunk and its trailer's blank line. Before #673 review round 7's
+        // firstRequestCompleteLen() fix, a declared `Transfer-Encoding:
+        // chunked` request was treated as complete the instant its headers
+        // finished (defaulting the body to zero length) regardless of
+        // whether any chunked framing had actually arrived, so this test
+        // happened to pass even with no body at all. That default masked a
+        // real defect: Tardigrade now correctly waits for the terminator
+        // rather than accepting an ended chunked request as valid.
+        "0\r\n\r\n";
 
     var response = try sendRawRequest(allocator, tardigrade.port, raw_request);
     defer response.deinit();
@@ -12954,7 +12964,23 @@ test "proxy evicts stale pooled upstream connection after backend restart" {
     try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 }
 
-test "proxy does not replay non-idempotent request on stale pooled upstream connection after backend restart" {
+test "proxy safely completes a non-idempotent request after backend restart by catching the stale pooled connection before use (#673 review)" {
+    // Before #673 review round 7, `UpstreamPool.checkout()` handed back a
+    // pooled connection without checking whether its peer had since closed
+    // it: the exchange would only discover that once it tried to use the
+    // connection, and for a non-idempotent method (POST) the code
+    // deliberately never retries after that ambiguous failure -- it cannot
+    // tell whether the request bytes were already sent before the failure,
+    // so retrying could double-apply it. That made this scenario always a
+    // 502, even though the backend was actually healthy again.
+    //
+    // `checkout()` now polls an idle connection for a pending close/error
+    // before handing it out (the same fix that catches a hostile upstream's
+    // delayed "ghost" bytes on a pooled connection). A backend restart
+    // shuts down the pooled connection's peer, which this probe detects
+    // deterministically before the POST is ever attempted on it -- so the
+    // request is sent exactly once, on a fresh connection to the
+    // now-restarted backend, with no ambiguity to guard against.
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{.{
@@ -13006,8 +13032,9 @@ test "proxy does not replay non-idempotent request on stale pooled upstream conn
         .headers = &.{},
     });
     defer post.deinit();
-    try std.testing.expectEqual(@as(u16, 502), post.status_code);
-    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+    try std.testing.expectEqual(@as(u16, 200), post.status_code);
+    try std.testing.expectEqualStrings("{\"version\":\"new\"}", post.body);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
     var second = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
@@ -13018,7 +13045,7 @@ test "proxy does not replay non-idempotent request on stale pooled upstream conn
     defer second.deinit();
     try std.testing.expectEqual(@as(u16, 200), second.status_code);
     try std.testing.expectEqualStrings("{\"version\":\"new\"}", second.body);
-    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 }
 
 test "proxy forwards POST with an explicit zero-length body" {
