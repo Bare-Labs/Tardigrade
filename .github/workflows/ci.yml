@@ -58,6 +58,8 @@ jobs:
           benchmarks/run.sh
           benchmarks/competitive/run.sh
           benchmarks/competitive/netem-impair.sh
+          benchmarks/competitive/upstream-pool-matrix.sh
+          benchmarks/competitive/test-upstream-pool-matrix.sh
           benchmarks/test-h3-benchmark.sh
 
       # A native `zig build` with no explicit -Dcpu embeds the exact CPU
@@ -681,6 +683,9 @@ jobs:
       # coverage.
       - name: Run H3 benchmark harness tests (#256-G)
         run: ./benchmarks/test-h3-benchmark.sh
+
+      - name: Run upstream pool matrix harness tests (#683)
+        run: ./benchmarks/competitive/test-upstream-pool-matrix.sh
 
       - name: Stage perf smoke artifact
         if: always()

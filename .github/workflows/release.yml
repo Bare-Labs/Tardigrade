@@ -344,11 +344,59 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  verify-linux-archive:
+    name: Verify ${{ matrix.archive_name }} on ${{ matrix.distro }}
+    needs:
+      - prepare-release
+      - build-release
+    if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - archive_name: tardigrade-linux-x86_64
+            distro: ubuntu:22.04
+          - archive_name: tardigrade-linux-x86_64
+            distro: rockylinux:9
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Download archive artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.archive_name }}
+          path: ${{ runner.temp }}/verify-artifacts
+
+      - name: Verify compatibility on ${{ matrix.distro }}
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          DISTRO: ${{ matrix.distro }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.prepare-release.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare-release.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          printf 'candidate_tag=%s\n' "$RELEASE_TAG"
+          printf 'expected_version=%s\n' "$EXPECTED_VERSION"
+          printf 'source_commit_sha=%s\n' "$RELEASE_SHA"
+          ./scripts/verify-linux-compatibility.sh \
+            "$DISTRO" \
+            "$RUNNER_TEMP/verify-artifacts/$ARCHIVE_NAME.tar.gz" \
+            "$EXPECTED_VERSION"
+
   publish-release:
     name: Publish GitHub release assets
     needs:
       - prepare-release
       - build-release
+      - verify-linux-archive
     if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
