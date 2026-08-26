@@ -146,7 +146,7 @@ client got a 4xx -- and every smuggling-shaped framing probe additionally
 appends a unique pipelined marker request to prove it is never dispatched,
 not just that the malformed probe itself was rejected.
 
-Coverage (118 live cases):
+Coverage (126 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
   oversized token, malformed/invalid-signature JWT, comma-joined
   `Authorization`, NUL/CR injection attempts), including a strict deny for
@@ -188,9 +188,16 @@ Coverage (118 live cases):
   connection to the idle pool;
 - the client-visible result of an upstream `103 → 103 → 200` interim-response
   chain is exactly the real final response, not a bare 103 with the 200
-  silently dropped.
+  silently dropped, and a Connection-nominated header hidden behind a bare
+  LF in the status line is still stripped;
+- every scenario in the hostile upstream response matrix that specifically
+  targets the buffered proxy path's bodiless-response/1xx/Content-Length
+  handling is replayed against a forced-streaming twin route
+  (`/hostile-streaming`, `proxy_streaming response;`), since the streaming
+  proxy path (`streamProxyOverTransport()`/`readUpstreamHead()`) has its
+  own, separately-fixed copies of that logic and is off by default.
 
-The campaign found and fixed eight real defects, all now covered by
+The campaign found and fixed twelve real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -266,27 +273,63 @@ deterministic regression tests:
    switch rather than signaling more to come) and keep reading until the
    real final response arrives, in `exchangeBoundedBufferedHttpRequest()`
    in `gateway_proxy.zig`.
-   responses whenever the upstream included one, even though RFC 7230 §3.3 /
-   RFC 7231 §6.3.5, §6.5.5 define those statuses as bodiless *regardless of
-   any `Content-Length` sent* -- an RFC-compliant downstream client honors
-   that rule and treats the illegal trailing bytes as the start of the next
-   response on the connection, so this was a real response-splitting vector
-   from a hostile/misbehaving upstream, not just an RFC nicety. The
-   streamed proxy path already handled this correctly
-   (`detectResponseFraming()` already treated these statuses as bodiless);
-   only the buffered path (`parseBufferedUpstreamResponse()`) was affected.
-   Fixed by discarding any trailing bytes for bodiless statuses before they
-   are stored as the response body.
+9. Defects 7 and 8's fixes only ran on the **buffered** HTTP/1 proxy path.
+   The **streaming** path (`streamProxyOverTransport()`) calls
+   `relayUpstreamBody()` -- where defect 7's fix lives -- only inside
+   `if (body_allowed)`, and `responseBodyAllowed()` is false for exactly
+   `HEAD`/`1xx`/`204`/`304`, so that branch (and the fix in it) never ran
+   for precisely the response family it was meant to protect; a delayed
+   illegal body/ghost could still poison a streamed HTTP/1 upstream socket.
+   Fixed by making bodiless streamed final responses fail closed for reuse
+   in `streamProxyOverTransport()` itself, not only in the relay helper.
+10. `streamProxyOverTransport()` still called `readUpstreamHead()` once and
+    immediately serialized that head downstream, so a streaming route
+    receiving a `103 → 103 → 200` chain still treated the first `103` as
+    the completed exchange and abandoned the final response -- the
+    streaming analog of defect 8, in a separate code path. Fixed by
+    looping `readUpstreamHead()` past 1xx interim responses (101 excepted)
+    before committing anything downstream, mirroring the buffered fix.
+11. `detectResponseFraming()` overwrote `content_length` on every
+    `Content-Length` occurrence instead of rejecting duplicates, so a
+    conflicting pair resolved to whichever field came last regardless of
+    order -- reversing the order from "small value first" to "large value
+    first" flips which boundary wins, and picking the smaller one leaves
+    "extra" bytes (e.g. a smuggled follow-up request or a ghost response)
+    past what the parser thinks is the end of the response. Fixed by
+    rejecting any duplicate `Content-Length` outright (`error.UpstreamProtocolError`),
+    matching the request-direction policy, regardless of field order or
+    whether the values happen to match.
+12. Upstream response status-line parsing was not strict, and a bare LF (not
+    part of a `\r\n` pair) right after the status line could bypass the
+    `Connection`-nomination filter from defect 2's fix: in the buffered
+    path, the nomination scanner walked the raw header block from byte 0
+    using exact `\r\n` splitting, so the still-unterminated status line text
+    merged with the first real header line into one bogus segment that no
+    longer matched `connection` by name; in the streaming path, the whole
+    run up to the first genuine `\r\n` -- including an injected header --
+    was swallowed into the reason phrase and later written verbatim into
+    the status line sent to the downstream client, which may treat the
+    embedded LF as a line terminator of its own and interpret the smuggled
+    text as a genuine extra header. This composes two explicit #673
+    malicious-upstream cases: malformed status line and
+    Connection-nominated hop-by-hop header. Fixed by validating the parsed
+    status line for embedded control characters (rejecting the response
+    outright if present, in both paths) and, in the buffered path, scanning
+    the same header-lines view the main per-header loop already uses
+    (starting after the status line) rather than the whole raw block from
+    byte 0. Also rejects a status line whose status code doesn't parse,
+    rather than silently defaulting to `200`/`0`.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
-`f06_tardigrade.conf`, plus a symlink and an `alias`-rooted directory), and
-runs the probe engine in `tests/security/f06_live_campaign.py`, writing
-evidence (metadata, raw results, process logs) to
-`.zig-cache/f06-campaign-673/`. All credentials are synthetic and
-local-only; no production secrets or traffic were used. 118/118 probes pass
-after the fixes (Zig 0.16.0, macOS arm64; rerun the script for current
-evidence -- results are not committed).
+`f06_tardigrade.conf` -- with both a buffered `/hostile` route and a
+forced-streaming `/hostile-streaming` twin -- plus a symlink and an
+`alias`-rooted directory), and runs the probe engine in
+`tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
+results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials
+are synthetic and local-only; no production secrets or traffic were used.
+126/126 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
+script for current evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference
 

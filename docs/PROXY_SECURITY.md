@@ -134,6 +134,12 @@ that set `error.ConflictingHeaders`.
 Duplicate `Content-Length` headers are rejected with `error.ConflictingHeaders`
 regardless of whether the values match. A single unambiguous value is required.
 
+The same policy applies to an **upstream response's** `Content-Length`
+(#673): `detectResponseFraming()` in `src/gateway_proxy.zig` rejects a
+duplicate field with `error.UpstreamProtocolError` regardless of field
+order or whether the values match, rather than resolving to whichever
+field happened to appear last.
+
 See the regression corpus case `tests/corpus/http/request/duplicate_content_length.http`.
 
 ## 4a. Duplicate Authorization (#673)
@@ -297,18 +303,37 @@ parse time (#673). A malicious or misbehaving upstream can send just the
 header block, flush, and only send an illegal body or a full extra response
 after Tardigrade has already decided to pool the connection; those delayed
 bytes would otherwise become part of whatever unrelated request checks the
-connection out next.
+connection out next. This holds on both the buffered and the streaming
+HTTP/1 proxy paths, which have separate implementations of the rule.
 
 An upstream `1xx` interim response (`100 Continue`, `103 Early Hints`, etc.)
-does not end the exchange. Tardigrade discards each interim response — `101
-Switching Protocols` excepted, since it completes a protocol switch rather
-than signaling more to come — and keeps reading until the actual final,
-non-1xx response arrives; only that final response is returned to the
-client. Interim responses are not currently relayed to the downstream
-client separately.
+does not end the exchange, on either the buffered or the streaming HTTP/1
+proxy path. Tardigrade discards each interim response — `101 Switching
+Protocols` excepted, since it completes a protocol switch rather than
+signaling more to come — and keeps reading until the actual final, non-1xx
+response arrives; only that final response is returned to the client.
+Interim responses are not currently relayed to the downstream client
+separately.
 
-Implementation: `exchangeBoundedBufferedHttpRequest()` and
-`parseBufferedUpstreamResponse()` in `src/gateway_proxy.zig`.
+A duplicate upstream `Content-Length` — conflicting values, matching
+values, or either field order — is rejected the same way a duplicate
+request `Content-Length` is (§4), rather than resolving to whichever field
+happened to appear last.
+
+The upstream response status line itself is validated for embedded control
+characters and a parseable status code, and rejected outright if either
+check fails, on both proxy paths. Without this, a bare LF (not part of a
+`\r\n` pair) immediately after the status line could let a real header
+line — including one nominated via `Connection` — merge with the status
+line text and either evade the `Connection`-nomination scanner (buffered
+path) or be written verbatim into the reason phrase sent to the downstream
+client, which may treat the embedded LF as its own line terminator (streaming
+path).
+
+Implementation: `exchangeBoundedBufferedHttpRequest()`,
+`parseBufferedUpstreamResponse()`, `detectResponseFraming()`, and
+`readUpstreamHead()`/`streamProxyOverTransport()` (the streaming path's
+equivalents) in `src/gateway_proxy.zig`.
 
 ## 12. Directory Traversal — Static File Serving
 

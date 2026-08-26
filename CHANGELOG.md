@@ -5,10 +5,11 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Eight auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Twelve auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
-  hostile one) and found:
+  hostile one, on both the buffered and a forced-streaming proxy route) and
+  found:
   - Upstream response `Connection` header could smuggle a header past
     hop-by-hop stripping: a malicious/misbehaving upstream sending
     `Connection: X-Foo` alongside `X-Foo: ...` could ride `X-Foo` through to
@@ -41,12 +42,27 @@ All notable user-facing changes to Tardigrade are documented here.
     a malicious/misbehaving upstream could send just the headers, wait
     until the connection was pooled, and only then send an illegal body or
     a full ghost response, poisoning whatever unrelated request checked
-    the connection out next.
+    the connection out next. The streamed path's own copy of this fix
+    turned out not to run at all in production for exactly the response
+    family it targeted (only inside a conditional that is false for
+    bodiless responses), requiring a second, separate fix.
   - The first interim `1xx` response in a chain (e.g. `103 Early Hints`)
-    was wrongly treated as the complete exchange, silently discarding
-    whatever actually followed -- including the real final response.
+    was wrongly treated as the complete exchange on the buffered proxy
+    path, silently discarding whatever actually followed -- including the
+    real final response. The streamed proxy path had the same bug in a
+    separate code path, fixed separately.
+  - A duplicate upstream `Content-Length` resolved to whichever field
+    happened to appear last instead of being rejected, so reversing field
+    order could flip which (possibly smaller, leaving "extra" bytes past
+    the parsed boundary) value won.
+  - Upstream status-line parsing was not strict: a bare LF right after the
+    status line could hide a `Connection`-nominated header from the
+    nomination filter (buffered path) or get swallowed into the reason
+    phrase and re-emitted to the client with the embedded LF intact
+    (streaming path), and an unparseable status code silently defaulted to
+    `200`/`0` instead of being rejected.
 
-  All eight fixed with regression coverage in `gateway_proxy_headers.zig`,
+  All twelve fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
   and `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the
   full campaign writeup.

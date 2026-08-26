@@ -351,10 +351,20 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
 
     const first_line_end = std.mem.findScalar(u8, headers_raw, '\n') orelse return error.UpstreamProtocolError;
     const first_line = compat.trimRight(u8, headers_raw[0..first_line_end], "\r");
+    // Reject rather than tolerate a status line carrying embedded control
+    // characters (#673 review): validated the same way header values
+    // already are, since a dirty status line -- e.g. a bare LF hiding a
+    // real header behind what this parser treats as reason-phrase text --
+    // is exactly the kind of injection this campaign has already found and
+    // fixed for header values.
+    if (!http.headers.isValidHeaderValue(first_line)) return error.UpstreamProtocolError;
     var line_parts = std.mem.splitScalar(u8, first_line, ' ');
     _ = line_parts.next();
-    const status_str = line_parts.next() orelse "200";
-    const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
+    const status_str = line_parts.next() orelse "";
+    // A status line whose status code doesn't parse is malformed, not
+    // "200 OK" -- silently defaulting to 200 could mask a real upstream
+    // error response as success (#673 review).
+    const status_code = std.fmt.parseInt(u16, status_str, 10) catch return error.UpstreamProtocolError;
     const reason = line_parts.rest();
 
     // RFC 7230 §3.3 / RFC 7231 §6.3.5, §6.5.5: 1xx, 204, and 304 responses
@@ -386,7 +396,16 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
             return error.UpstreamProtocolError;
         }
         if (gph.shouldSkipUpstreamResponseHeader(hname, null)) continue;
-        if (gph.anyRawConnectionHeaderReferencesHeader(headers_raw, hname)) continue;
+        // Scan the SAME header-lines view this loop itself iterates
+        // (starting after the status line), not the whole `headers_raw`
+        // from byte 0 (#673 review). Scanning from byte 0 let a status
+        // line corrupted by an embedded bare LF merge with the first real
+        // header line into one bogus "\r\n"-delimited segment, which no
+        // longer matched "connection" by name -- hiding a genuine
+        // Connection-nominated header from this scanner even though the
+        // main loop above (which already starts past the status line)
+        // parsed that same header correctly.
+        if (gph.anyRawConnectionHeaderReferencesHeader(headers_raw[first_line_end + 1 ..], hname)) continue;
         try resp_headers.append(.{
             .name = try metadata_allocator.dupe(u8, hname),
             .value = try metadata_allocator.dupe(u8, hval),
@@ -1566,7 +1585,7 @@ fn exchangeBoundedBufferedHttpRequest(
             if (std.mem.find(u8, resp_raw.items[response_start..], "\r\n\r\n")) |rel_he| {
                 const he = response_start + rel_he;
                 header_end = he;
-                framing = detectResponseFraming(resp_raw.items[response_start..he], method);
+                framing = try detectResponseFraming(resp_raw.items[response_start..he], method);
             }
         }
         if (header_end) |he| {
@@ -1706,7 +1725,16 @@ fn statusCodeFromHeaderBlock(header_block: []const u8) u16 {
 
 /// Determine response framing from the header block (excluding the trailing
 /// CRLFCRLF), the request method, and the status line.
-fn detectResponseFraming(header_block: []const u8, method: []const u8) ResponseFraming {
+///
+/// Returns `error.UpstreamProtocolError` for an invalid or duplicated
+/// `Content-Length` (#673 review): a prior version silently kept
+/// overwriting `content_length` on every occurrence, so a duplicate
+/// `Content-Length` -- conflicting *or* merely repeated -- picked
+/// whichever field happened to come last, with no guarantee a downstream
+/// client would resolve the same ambiguity the same way. This mirrors the
+/// request-direction policy, which rejects any duplicate Content-Length
+/// outright regardless of whether the values match.
+fn detectResponseFraming(header_block: []const u8, method: []const u8) !ResponseFraming {
     const status = statusCodeFromHeaderBlock(header_block);
 
     if (std.ascii.eqlIgnoreCase(method, "HEAD")) return .none;
@@ -1726,7 +1754,9 @@ fn detectResponseFraming(header_block: []const u8, method: []const u8) ResponseF
                 if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "chunked")) chunked = true;
             }
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            content_length = std.fmt.parseInt(usize, value, 10) catch null;
+            const parsed = std.fmt.parseInt(usize, value, 10) catch return error.UpstreamProtocolError;
+            if (content_length != null) return error.UpstreamProtocolError;
+            content_length = parsed;
         }
     }
 
@@ -1923,6 +1953,126 @@ test "parseBufferedUpstreamResponse rejects control characters embedded in a hea
     var ok_response = try parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nX-Safe: value\r\nContent-Length: 2\r\n\r\nok");
     defer ok_response.deinit(testing.allocator);
     try testing.expectEqualStrings("ok", ok_response.body);
+}
+
+test "exchange rejects duplicate upstream Content-Length in either order, not just conflicting values (#673 review)" {
+    // `detectResponseFraming()` -- which the buffered/streaming EXCHANGE
+    // loops call to decide how many bytes to read, not
+    // `parseBufferedUpstreamResponse()`, which only parses an
+    // already-fully-buffered blob -- kept overwriting `content_length` on
+    // every occurrence. A duplicate field, whether the values conflicted
+    // or merely repeated, silently resolved to whichever field came last,
+    // with no guarantee a downstream client would resolve the same
+    // ambiguity the same way. This mirrors the request-direction policy,
+    // which rejects ANY duplicate Content-Length outright.
+    const testing = std.testing;
+
+    // Small value first, then large: the smaller of the two would produce
+    // a "safe-looking" short read if honored, so this ordering alone could
+    // previously mask the bug (the larger, later value always won).
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        exchangeAgainstKeepAlivePeer(testing.allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 99\r\n\r\nok"),
+    );
+
+    // Large value first, then small: with the old last-wins logic this
+    // ordering picks the SMALLER boundary, leaving "extra" bytes -- e.g. a
+    // smuggled follow-up request or a ghost response -- past what the
+    // parser thinks is the end of this response.
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        exchangeAgainstKeepAlivePeer(testing.allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 99\r\nContent-Length: 2\r\n\r\nok"),
+    );
+
+    // Equal duplicate values are also rejected -- HTTP defines no
+    // combination semantics for Content-Length, so a repeated field is
+    // ambiguous regardless of whether the values happen to match.
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        exchangeAgainstKeepAlivePeer(testing.allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok"),
+    );
+
+    // A single, unambiguous Content-Length is unaffected.
+    var ok_response = try exchangeAgainstKeepAlivePeer(testing.allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
+    defer ok_response.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", ok_response.body);
+}
+
+test "parseBufferedUpstreamResponse rejects an unparseable status code instead of defaulting to 200 (#673 review)" {
+    // Silently defaulting to 200 on a garbled status line could mask a
+    // real upstream error response as success.
+    const testing = std.testing;
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 NOTASTATUS OK\r\nContent-Length: 2\r\n\r\nok"),
+    );
+}
+
+test "parseBufferedUpstreamResponse still strips a Connection-nominated header when a bare LF precedes the real header lines (#673 review)" {
+    // The reviewer's exact composed example. `parseBufferedUpstreamResponse`
+    // finds the status line's own end via the first BARE LF (matching
+    // `compat.trimRight(..., "\r")` immediately after), so it correctly
+    // isolates "HTTP/1.1 200 OK" here and starts its per-header loop right
+    // after that bare LF -- meaning it sees "Connection: X-Hostile-Secret"
+    // as an ordinary header line, same as if it had arrived after a normal
+    // "\r\n". The bug this regression targets was specifically in the
+    // separate Connection-nomination *scanner*: before the fix, it walked
+    // the raw header block from byte 0 using EXACT "\r\n" splitting, so the
+    // still-unterminated status line text merged with the first real
+    // header line into one bogus segment that no longer matched
+    // "connection" by name -- hiding the nomination from that scanner
+    // even though the main loop parsed the identical header correctly.
+    // With the scanner now consulting the same starting offset as the main
+    // loop, the nomination is recognized and "X-Hostile-Secret" is
+    // correctly stripped rather than forwarded.
+    const testing = std.testing;
+    const hostile =
+        "HTTP/1.1 200 OK\nConnection: X-Hostile-Secret\r\n" ++
+        "X-Hostile-Secret: must-not-leak\r\n" ++
+        "Content-Length: 2\r\n\r\nok";
+    var parsed = try parseBufferedUpstreamResponse(testing.allocator, hostile);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), parsed.status_code);
+    try testing.expect(parsed.headerValue("X-Hostile-Secret") == null);
+    try testing.expectEqualStrings("ok", parsed.body);
+}
+
+test "readUpstreamHead rejects a status line whose embedded bare LF swallows a header into the reason phrase (#673 review)" {
+    // The streaming path's status-line boundary is found via the first
+    // EXACT "\r\n" (not a bare LF), so for the reviewer's composed hostile
+    // example the whole run "HTTP/1.1 200 OK\nConnection: X-Hostile-Secret"
+    // -- everything up to the first REAL "\r\n", which lands after
+    // "X-Hostile-Secret" rather than right after "OK" -- gets treated as
+    // ONE status line, with "OK\nConnection: X-Hostile-Secret" becoming the
+    // reason phrase. That text would then be written verbatim into the
+    // status line Tardigrade sends the downstream client, which may treat
+    // the embedded LF as a line terminator of its own and interpret the
+    // smuggled text as a genuine extra header -- a response-splitting
+    // vector distinct from (and, for this path, more direct than) the
+    // Connection-nomination-scanner bypass the buffered path had.
+    const testing = std.testing;
+    const allocator = std.testing.allocator;
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+    const hostile =
+        "HTTP/1.1 200 OK\nConnection: X-Hostile-Secret\r\n" ++
+        "X-Hostile-Secret: must-not-leak\r\n" ++
+        "Content-Length: 2\r\n\r\nok";
+    _ = std.c.write(peer_fd, hostile.ptr, hostile.len);
+
+    var read_storage: [4096]u8 = undefined;
+    var rb = StreamReadBuf{ .buf = &read_storage };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const transport = compat.netStreamFromFd(client_fd);
+
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET"),
+    );
 }
 
 pub fn bufferedUpstreamResponseHasNoStore(response: *const BufferedUpstreamResponse) bool {
@@ -2160,10 +2310,23 @@ fn readUpstreamHead(
 
     const first_line_end = std.mem.find(u8, header_block, "\r\n") orelse head_end;
     const status_line = header_block[0..first_line_end];
+    // Reject a status line carrying embedded control characters (#673
+    // review) rather than accepting it: without a real "\r\n" anywhere
+    // before the genuine one, a bare LF earlier in the response gets
+    // absorbed into what this parser treats as the status line's own
+    // reason-phrase text -- including a real header line that followed
+    // it -- and that text is later written verbatim into the status line
+    // sent to the downstream client, which may treat the embedded LF as a
+    // line terminator of its own and interpret the smuggled text as a
+    // genuine extra header.
+    if (!http.headers.isValidHeaderValue(status_line)) return error.UpstreamProtocolError;
     const http_1_1 = std.mem.startsWith(u8, status_line, "HTTP/1.1");
     var sp = std.mem.splitScalar(u8, status_line, ' ');
     _ = sp.next();
-    const status_code = std.fmt.parseInt(u16, sp.next() orelse "0", 10) catch 0;
+    // A status line whose status code doesn't parse is malformed, not
+    // status 0 -- silently defaulting could let a garbled response sail
+    // through downstream framing/status decisions on a bogus value.
+    const status_code = std.fmt.parseInt(u16, sp.next() orelse "", 10) catch return error.UpstreamProtocolError;
     const reason = try arena.dupe(u8, sp.rest());
 
     var headers = std.array_list.Managed(UpstreamHeader).init(arena);
@@ -2188,10 +2351,13 @@ fn readUpstreamHead(
             return error.UpstreamProtocolError;
         }
         if (gph.shouldSkipUpstreamResponseHeader(name, null)) continue;
-        if (gph.anyRawConnectionHeaderReferencesHeader(header_block, name)) continue;
+        // See parseBufferedUpstreamResponse: scan the same header-lines
+        // view this loop itself iterates (starting after the status
+        // line), not the whole `header_block` from byte 0.
+        if (gph.anyRawConnectionHeaderReferencesHeader(header_block[@min(first_line_end + 2, header_block.len)..], name)) continue;
         try headers.append(.{ .name = try arena.dupe(u8, name), .value = try arena.dupe(u8, value) });
     }
-    const framing = detectResponseFraming(header_block, method);
+    const framing = try detectResponseFraming(header_block, method);
     rb.consume(head_end + 4);
     return .{
         .status_code = status_code,
@@ -2595,7 +2761,17 @@ fn streamProxyOverTransport(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var rb = StreamReadBuf{ .buf = read_buf };
-    const head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method);
+    // Discard 1xx interim responses (101 excepted, since it completes a
+    // protocol switch rather than signaling more to come) and keep reading
+    // until the actual final response arrives (#673 review): before this
+    // fix, the streaming path -- like the buffered path before its own
+    // fix -- treated the FIRST interim response (e.g. 103 Early Hints) as
+    // the complete exchange, committing it downstream and abandoning
+    // whatever actually followed, including the real final response.
+    var head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method);
+    while (head.status_code >= 100 and head.status_code < 200 and head.status_code != 101) {
+        head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method);
+    }
     const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
 
     const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
@@ -2619,7 +2795,16 @@ fn streamProxyOverTransport(
 
     var body_bytes: usize = 0;
     var aborted = false;
-    var reusable = head.http_1_1 and !head.connection_close;
+    // Bodiless final responses (HEAD/204/304 -- 1xx was already consumed
+    // above) never mark the upstream connection reusable, regardless of
+    // HTTP version or Connection header (#673 review): `relayUpstreamBody`
+    // is the ONLY place that previously enforced this, but it is skipped
+    // entirely whenever `!body_allowed`, so its fix never actually ran for
+    // exactly the response family it was meant to protect. A malicious or
+    // misbehaving upstream can send just the header block, flush, wait
+    // until this connection is pooled, and only then send an illegal body
+    // or a full ghost response.
+    var reusable = body_allowed and head.http_1_1 and !head.connection_close;
     if (body_allowed) {
         const outcome = relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, downstream_writer, cancel_token) catch |err| {
             if (err == error.ClientAborted) {

@@ -236,7 +236,7 @@ def framing_marker_case(up: Upstream, name: str, cat: str, port: int, build_raw)
     record(name, cat, ok, f"status={status} hits={len(hits)} smuggled={smuggled}")
 
 
-def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scenario: str) -> None:
+def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scenario: str, path: str = "/hostile") -> None:
     """
     Same-downstream-connection desync proof (#673 review, both passes): open
     ONE TCP connection to tardi, send the hostile-upstream probe, then --
@@ -266,7 +266,7 @@ def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scen
         record(name, cat, False, f"connect failed: {e}")
         return
     try:
-        s.sendall(req("GET", "/hostile", [("X-F06-Scenario", scenario)]))
+        s.sendall(req("GET", path, [("X-F06-Scenario", scenario)]))
         s.settimeout(1.0)
         first = b""
         try:
@@ -294,7 +294,7 @@ def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scen
 
         second_send_failed = False
         try:
-            s.sendall(req("GET", "/hostile", [("X-F06-Scenario", "")]))
+            s.sendall(req("GET", path, [("X-F06-Scenario", "")]))
         except OSError:
             second_send_failed = True
 
@@ -706,15 +706,66 @@ def run_traversal_boundary(up: Upstream, port: int) -> None:
            f"status={status} canary_leaked={canary_leaked}")
 
 
+def hostile_delayed_ghost_does_not_poison_pool(up: Upstream, cat: str, port: int, path: str, name: str) -> None:
+    """
+    #673 review: a hostile upstream can send just a bodiless response's
+    headers, flush, and only send an illegal body / full ghost response
+    AFTER Tardigrade has already decided the connection is idle and
+    returned it to the upstream connection pool -- those delayed bytes
+    would then poison whatever unrelated request checks the connection out
+    next. `parseBufferedUpstreamResponse()`'s in-memory truncation fix
+    cannot catch this by itself; it requires bodiless responses to never be
+    pooled for reuse at all (verified directly in gateway_proxy.zig; this
+    is the live, timing-based confirmation). Parameterized by `path` so it
+    can be run against both the buffered and forced-streaming hostile
+    routes, which have separate implementations of this fix.
+    """
+    up.reset()
+    first = send_raw(port, req("GET", path, [("X-F06-Scenario", DELAYED_GHOST_SCENARIO)]), read_timeout=0.6)
+    # Give the fixture's delayed tail write time to land on the upstream
+    # socket before probing -- comfortably longer than its own delay.
+    time.sleep(DELAYED_GHOST_DELAY_SECONDS * 2)
+    leaked_followup = False
+    for _ in range(5):
+        followup = send_raw(port, req("GET", path, [("X-F06-Scenario", "")]), read_timeout=1.0)
+        if GHOST_MARKER.encode() in followup:
+            leaked_followup = True
+            break
+    leaked_first = GHOST_MARKER.encode() in first
+    ok = not leaked_first and not leaked_followup
+    record(name, cat, ok, f"leaked_first={leaked_first} leaked_followup={leaked_followup}")
+
+
+def hostile_1xx_chain_returns_final_response(up: Upstream, cat: str, port: int, path: str, name: str) -> None:
+    """
+    #673 review: Tardigrade must consume 1xx interim responses instead of
+    wrongly treating the first one as final. Asserts the client-visible
+    result directly: exactly the real final response, not a bare 103 with
+    the 200 silently dropped. Parameterized by `path` so it can be run
+    against both the buffered and forced-streaming hostile routes, which
+    have separate implementations of this fix.
+    """
+    up.reset()
+    raw = send_raw(port, req("GET", path, [("X-F06-Scenario", "unusual_1xx_chain")]))
+    status = first_status_code(raw)
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    # The streaming path forwards a chunked body ("2\r\nok\r\n0\r\n\r\n")
+    # rather than a Content-Length-framed one; accept either encoding of
+    # the same two-byte payload.
+    ok = status == 200 and (body == b"ok" or body.endswith(b"2\r\nok\r\n0\r\n\r\n"))
+    record(name, cat, ok, f"status={status} body={body!r}")
+
+
 def run_malicious_upstream(up: Upstream, port: int) -> None:
     cat = "upstream.malicious_response_framing"
 
-    def hostile(scenario: str) -> bytes:
-        return req("GET", "/hostile", [("X-F06-Scenario", scenario)])
+    def hostile(scenario: str, path: str = "/hostile") -> bytes:
+        return req("GET", path, [("X-F06-Scenario", scenario)])
 
     core_scenarios = [
         "duplicate_cl_equal",
         "conflicting_cl",
+        "reverse_conflicting_cl",
         "te_and_cl",
         "malformed_status_line",
         "ctl_and_bare_cr_in_header_value",
@@ -751,6 +802,10 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         ("te_header", "te"),
         ("trailer_header", "trailer"),
         ("upgrade_header", "upgrade"),
+        # A bare LF hiding a Connection nomination behind what a naive
+        # scanner treats as reason-phrase text (#673 review) -- composes
+        # the malformed-status-line and Connection-nomination cases.
+        ("bare_lf_hides_connection_nomination", "x-hostile-secret"),
     ]
     for scenario, header_name in stripped_header_scenarios:
         up.reset()
@@ -786,42 +841,10 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
            f"leaked_first={leaked_first} leaked_followup={leaked_followup} followup_head={followup[:100]!r}")
     hostile_same_socket_reuse(up, "hostile_upstream_extra_bytes_same_connection_reuse_is_clean", cat, port, "extra_bytes_after_response")
 
-    # #673 review: a hostile upstream can send just a bodiless response's
-    # headers, flush, and only send an illegal body / full ghost response
-    # AFTER Tardigrade has already decided the connection is idle and
-    # returned it to the upstream connection pool -- those delayed bytes
-    # would then poison whatever unrelated request checks the connection
-    # out next. `parseBufferedUpstreamResponse()`'s in-memory truncation
-    # fix cannot catch this by itself; it requires bodiless responses to
-    # never be pooled for reuse at all (verified directly in
-    # gateway_proxy.zig; this is the live, timing-based confirmation).
-    up.reset()
-    first = send_raw(port, hostile(DELAYED_GHOST_SCENARIO), read_timeout=0.6)
-    # Give the fixture's delayed tail write time to land on the upstream
-    # socket before probing -- comfortably longer than its own delay.
-    time.sleep(DELAYED_GHOST_DELAY_SECONDS * 2)
-    leaked_followup = False
-    for _ in range(5):
-        followup = send_raw(port, hostile(""), read_timeout=1.0)
-        if GHOST_MARKER.encode() in followup:
-            leaked_followup = True
-            break
-    leaked_first = GHOST_MARKER.encode() in first
-    ok = not leaked_first and not leaked_followup
-    record("hostile_upstream_delayed_ghost_after_bodiless_does_not_poison_pool", cat, ok,
-           f"leaked_first={leaked_first} leaked_followup={leaked_followup}")
-
-    # Now that Tardigrade correctly consumes 1xx interim responses instead
-    # of wrongly treating the first one as final (#673 review), assert the
-    # client-visible result directly: exactly the real final response,
-    # not a bare 103 with the 200 silently dropped.
-    up.reset()
-    raw = send_raw(port, hostile("unusual_1xx_chain"))
-    status = first_status_code(raw)
-    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
-    ok = status == 200 and body == b"ok"
-    record("hostile_upstream_unusual_1xx_chain_returns_actual_final_response", cat, ok,
-           f"status={status} body={body!r}")
+    hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile",
+                                                "hostile_upstream_delayed_ghost_after_bodiless_does_not_poison_pool")
+    hostile_1xx_chain_returns_final_response(up, cat, port, "/hostile",
+                                              "hostile_upstream_unusual_1xx_chain_returns_actual_final_response")
 
     for scenario in ["unusual_1xx_chain", "invalid_204_with_body", "invalid_304_with_body"]:
         up.reset()
@@ -831,6 +854,34 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         record(f"hostile_upstream_{scenario}_connection_stays_healthy", cat, ok,
                f"followup_status={first_status_code(followup)}")
         hostile_same_socket_reuse(up, f"hostile_upstream_{scenario}_same_connection_reuse_is_clean", cat, port, scenario)
+
+    # #673 review: the streaming proxy path (streamProxyOverTransport /
+    # readUpstreamHead) has its own, separately-fixed copies of the
+    # bodiless-reuse and 1xx-interim logic. Streaming is off by default, so
+    # the whole campaign above -- run against /hostile -- only ever
+    # exercised the buffered path. Replay the two scenarios the review
+    # specifically called out against /hostile-streaming, a forced-streaming
+    # twin of the same upstream route (see f06_tardigrade.conf).
+    hostile_delayed_ghost_does_not_poison_pool(up, cat, port, "/hostile-streaming",
+                                                "hostile_upstream_streaming_delayed_ghost_after_bodiless_does_not_poison_pool")
+    hostile_1xx_chain_returns_final_response(up, cat, port, "/hostile-streaming",
+                                              "hostile_upstream_streaming_unusual_1xx_chain_returns_actual_final_response")
+
+    up.reset()
+    raw = send_raw(port, hostile("reverse_conflicting_cl", "/hostile-streaming"))
+    followup = send_raw(port, req("GET", "/health", []))
+    ok = first_status_code(followup) == 200
+    record("hostile_upstream_streaming_reverse_conflicting_cl_does_not_hang_or_break_edge", cat, ok,
+           f"status={first_status_code(raw)} followup_status={first_status_code(followup)}")
+    hostile_same_socket_reuse(up, "hostile_upstream_streaming_reverse_conflicting_cl_same_connection_reuse_is_clean",
+                               cat, port, "reverse_conflicting_cl", path="/hostile-streaming")
+
+    up.reset()
+    raw = send_raw(port, hostile("bare_lf_hides_connection_nomination", "/hostile-streaming"))
+    headers = response_headers_lower(raw)
+    ok = "x-hostile-secret" not in headers
+    record("hostile_upstream_streaming_bare_lf_hides_connection_nomination_stripped", cat, ok,
+           f"status={first_status_code(raw)} headers={list(headers.keys())}")
 
 
 def main() -> int:

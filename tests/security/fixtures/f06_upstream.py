@@ -66,6 +66,28 @@ HOSTILE_SCENARIOS = {
         b"\r\n"
         b"ok"
     ),
+    # Reverse field order from "conflicting_cl" (#673 review): a
+    # last-one-wins parser would pick the SMALLER value here, leaving
+    # "extra" bytes past what it thinks is the response boundary --
+    # exactly the ordering that would have masked the bug if only the
+    # small-first case were ever tested.
+    "reverse_conflicting_cl": (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: 99\r\n"
+        b"Content-Length: 2\r\n"
+        b"\r\n"
+        b"ok"
+    ),
+    # A bare LF (not part of a \r\n pair) right after the status line, with
+    # a real Connection-nominated hostile header immediately following
+    # (#673 review). Composes two explicit #673 malicious-upstream cases:
+    # malformed status line and Connection-nominated hop-by-hop header.
+    "bare_lf_hides_connection_nomination": (
+        b"HTTP/1.1 200 OK\nConnection: X-Hostile-Secret\r\n"
+        b"X-Hostile-Secret: must-not-leak\r\n"
+        b"Content-Length: 2\r\n\r\nok"
+    ),
     "te_and_cl": (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/plain\r\n"
