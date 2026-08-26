@@ -40,9 +40,32 @@ default live record listener policy does not advertise RSA-PSS signatures.
 
 ## Scanner Pass
 
-`tls-scan` / `tls_scan` was not available on the host. Two maintained
-black-box scanners were run as equivalents and their full text/XML/JSON output
-is retained under [`docs/evidence/f05-672/`](evidence/f05-672/).
+`tls-scan` / `tls_scan` was not available on the host. The successful
+scanner-equivalent pass is a committed wrapper around maintained OpenSSL
+3.6.3. It preserves scanner enumeration semantics by enumerating OpenSSL's
+local TLS 1.3 ciphersuite list and probing each candidate independently
+against the live listener while always sending the listener's mandatory ALPN.
+It also probes legacy protocol versions. Full retained outputs:
+[`openssl-alpn-cipher-enum.sh`](evidence/f05-672/openssl-alpn-cipher-enum.sh)
+and
+[`openssl-alpn-cipher-enum.txt`](evidence/f05-672/openssl-alpn-cipher-enum.txt).
+
+```bash
+OPENSSL_BIN=/opt/homebrew/bin/openssl \
+  sh docs/evidence/f05-672/openssl-alpn-cipher-enum.sh \
+  > docs/evidence/f05-672/openssl-alpn-cipher-enum.txt 2>&1
+```
+
+Result: OpenSSL enumerated the TLS 1.3 candidates
+`TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`, and
+`TLS_AES_128_GCM_SHA256`. With SNI `tardigrade.test` and ALPN `http/1.1`,
+only `TLS_AES_128_GCM_SHA256` negotiated successfully. AES-256 and ChaCha20
+failed closed with alert `handshake failure`, and TLS 1.2 failed closed with
+alert `protocol version`. TLS 1.1 and TLS 1.0 did not negotiate.
+
+The following additional maintained scanners were attempted and are retained
+as supplemental evidence. They confirm that generic scanners without an ALPN
+override cannot enumerate this target shape.
 
 ```bash
 nmap -Pn -sV --version-all --script +ssl-enum-ciphers \
@@ -64,9 +87,7 @@ testssl.sh --protocols --server-preference --cipher-per-proto \
 
 Result: `testssl.sh` reported SSLv2/SSLv3/TLS 1.0/TLS 1.1/TLS 1.2 as not
 offered. It also reported TLS 1.3 as not offered because its protocol/cipher
-probes do not send the ALPN extension required by this listener. Manual
-ALPN-bearing OpenSSL and `nghttp` probes below are therefore the authoritative
-semantic evidence for TLS 1.3, cipher, SNI, and ALPN behavior. Full retained
+probes do not send the ALPN extension required by this listener. Full retained
 outputs: [`testssl.log`](evidence/f05-672/testssl.log) and
 [`testssl.json`](evidence/f05-672/testssl.json). The retained `testssl.sh`
 banner includes its own short display version; the full commit above was
