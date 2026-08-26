@@ -312,8 +312,8 @@ run_measured_wrk() {
 }
 
 route_result_json() {
-    local label="$1" raw_file="$2" duration="$3" connections="$4" threads="$5" requested_share="$6" total_rps="$7" elapsed="$8"
-    local raw summary rps p99 errors request_count achieved_share
+    local label="$1" raw_file="$2" duration="$3" connections="$4" threads="$5" requested_share="$6" total_rps="$7"
+    local raw summary rps p99 errors achieved_share
     raw="$(cat "$raw_file")"
     summary="$(printf '%s\n' "$raw" | sed -n 's/^WRK_SUMMARY //p' | tail -1)"
     if [[ -z "$summary" ]]; then
@@ -334,7 +334,6 @@ route_result_json() {
         echo "$raw" >&2
         return 1
     fi
-    request_count="$(awk -v rps="$rps" -v elapsed="$elapsed" 'BEGIN { if (rps > 0 && elapsed > 0) printf "%.0f", rps * elapsed; else print 0 }')"
     achieved_share="$(awk -v rps="$rps" -v total="$total_rps" 'BEGIN { if (total > 0) printf "%.6f", rps / total; else print 0 }')"
     jq -n \
         --argjson requested_share "$requested_share" \
@@ -345,7 +344,6 @@ route_result_json() {
         --argjson duration "$duration" \
         --argjson connections "$connections" \
         --argjson threads "$threads" \
-        --argjson request_count "$request_count" \
         '{
             requested_share: $requested_share,
             achieved_share: $achieved_share,
@@ -354,9 +352,24 @@ route_result_json() {
             errors: $errors,
             configured_duration_s: $duration,
             configured_connections: $connections,
-            configured_threads: $threads,
-            achieved_request_count: $request_count
+            configured_threads: $threads
         }'
+}
+
+run_wrk_to_status_file() {
+    local raw_file="$1" status_file="$2" threads="$3" connections="$4" duration="$5" path="$6"
+    local child_pid status status_tmp
+    wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${threads}" -c"${connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/${path}" >"$raw_file" 2>&1 &
+    child_pid="$!"
+    trap 'kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' TERM INT
+    if wait "$child_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    status_tmp="${status_file}.tmp.$$"
+    printf '%s\n' "$status" > "$status_tmp"
+    mv "$status_tmp" "$status_file"
 }
 
 run_concurrent_uneven_routes() {
@@ -382,29 +395,11 @@ run_concurrent_uneven_routes() {
     current_metrics > "$before"
     read -r mon_pid mon_file cpu_before start_ns < <(start_monitor)
 
-    (
-        wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${route_a_threads}" -c"${route_a_connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/route-a" >"$route_a_raw" 2>&1 &
-        child_pid="$!"
-        trap 'kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' TERM INT
-        wait "$child_pid"
-        printf '%s\n' "$?" > "$route_a_status_file"
-    ) &
+    run_wrk_to_status_file "$route_a_raw" "$route_a_status_file" "$route_a_threads" "$route_a_connections" "$duration" route-a &
     route_a_pid="$!"
-    (
-        wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${route_b_threads}" -c"${route_b_connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/route-b" >"$route_b_raw" 2>&1 &
-        child_pid="$!"
-        trap 'kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' TERM INT
-        wait "$child_pid"
-        printf '%s\n' "$?" > "$route_b_status_file"
-    ) &
+    run_wrk_to_status_file "$route_b_raw" "$route_b_status_file" "$route_b_threads" "$route_b_connections" "$duration" route-b &
     route_b_pid="$!"
-    (
-        wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${route_c_threads}" -c"${route_c_connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/route-c" >"$route_c_raw" 2>&1 &
-        child_pid="$!"
-        trap 'kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' TERM INT
-        wait "$child_pid"
-        printf '%s\n' "$?" > "$route_c_status_file"
-    ) &
+    run_wrk_to_status_file "$route_c_raw" "$route_c_status_file" "$route_c_threads" "$route_c_connections" "$duration" route-c &
     route_c_pid="$!"
 
     while [[ "$remaining" -gt 0 ]]; do
@@ -503,9 +498,9 @@ run_concurrent_uneven_routes() {
     total_rps="$(awk -v a="$route_a_rps" -v b="$route_b_rps" -v c="$route_c_rps" 'BEGIN { printf "%.3f", a + b + c }')"
     elapsed="$(awk -v s="$start_ns" -v e="$end_ns" 'BEGIN { printf "%.3f", (e - s) / 1000000000 }')"
 
-    route_a="$(route_result_json route-a "$route_a_raw" "$duration" "$route_a_connections" "$route_a_threads" "$route_a_share" "$total_rps" "$elapsed")"
-    route_b="$(route_result_json route-b "$route_b_raw" "$duration" "$route_b_connections" "$route_b_threads" "$route_b_share" "$total_rps" "$elapsed")"
-    route_c="$(route_result_json route-c "$route_c_raw" "$duration" "$route_c_connections" "$route_c_threads" "$route_c_share" "$total_rps" "$elapsed")"
+    route_a="$(route_result_json route-a "$route_a_raw" "$duration" "$route_a_connections" "$route_a_threads" "$route_a_share" "$total_rps")"
+    route_b="$(route_result_json route-b "$route_b_raw" "$duration" "$route_b_connections" "$route_b_threads" "$route_b_share" "$total_rps")"
+    route_c="$(route_result_json route-c "$route_c_raw" "$duration" "$route_c_connections" "$route_c_threads" "$route_c_share" "$total_rps")"
     total_errors="$(jq -n --argjson a "$route_a" --argjson b "$route_b" --argjson c "$route_c" '($a.errors // 0) + ($b.errors // 0) + ($c.errors // 0)')"
     combined="$(scenario_json "$total_rps" null null "$total_errors" "$cpu_pct" "$rss_mb" "$open_fds" "$before" "$after" "$elapsed")"
 

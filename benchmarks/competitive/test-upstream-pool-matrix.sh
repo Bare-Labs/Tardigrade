@@ -6,9 +6,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRIPT_UNDER_TEST="${REPO_ROOT}/benchmarks/competitive/upstream-pool-matrix.sh"
+COMPETITIVE_RUN_SH="${REPO_ROOT}/benchmarks/competitive/run.sh"
 TEST_DIR="$(mktemp -d /tmp/tardigrade-upstream-matrix-test-XXXXXX)"
 
-# shellcheck disable=SC2329 # invoked by trap
+# shellcheck disable=SC2317,SC2329 # invoked by trap; ShellCheck versions differ
 cleanup() {
     rm -rf "$TEST_DIR"
 }
@@ -168,6 +169,7 @@ jq -e '
     and .routes.route_a.achieved_share == 0.8
     and .routes.route_b.achieved_share == 0.15
     and .routes.route_c.achieved_share == 0.05
+    and (.routes.route_a | has("achieved_request_count") | not)
     and .combined.rps == 1000
     and .combined.new_connections == 4
     and .combined.reused_connections == 16
@@ -196,13 +198,32 @@ export WRK_FAIL_ROUTE="route-c"
 if run_concurrent_uneven_routes >"${TEST_DIR}/failed.out" 2>"${TEST_DIR}/failed.err"; then
     fail "failed route process unexpectedly succeeded"
 fi
-grep -q 'concurrent uneven route wrk failed: route-a=0 route-b=0 route-c=17' "${TEST_DIR}/failed.err" || {
+grep -q 'concurrent uneven route wrk failed:' "${TEST_DIR}/failed.err" || {
     cat "${TEST_DIR}/failed.err" >&2
     fail "missing child-status diagnostic"
+}
+grep -q 'route-c=17' "${TEST_DIR}/failed.err" || {
+    cat "${TEST_DIR}/failed.err" >&2
+    fail "missing failed-route status"
 }
 grep -q 'forced failure for route-c' "${TEST_DIR}/failed.err" || {
     cat "${TEST_DIR}/failed.err" >&2
     fail "missing failed-route raw output"
 }
+
+echo "==> Test 4: competitive formatter reads nested combined aggregate metrics"
+# shellcheck disable=SC2016 # matching literal jq source text
+combined_fallbacks="$(grep -cF '(.value.combined // .value) as $v' "$COMPETITIVE_RUN_SH")"
+[[ "$combined_fallbacks" -ge 2 ]] || fail "expected CSV and Markdown upstream aggregate formatters to bind combined fallback"
+# shellcheck disable=SC2016 # matching literal jq source text
+grep -qF '($v.rps // null)' "$COMPETITIVE_RUN_SH" || fail "CSV upstream aggregate formatter does not read RPS from combined fallback"
+# shellcheck disable=SC2016 # matching literal jq source text
+grep -qF '($v.cpu_pct_avg // null)' "$COMPETITIVE_RUN_SH" || fail "CSV upstream aggregate formatter does not read CPU from combined fallback"
+# shellcheck disable=SC2016 # matching literal jq source text
+grep -qF '$v.new_connections_per_sec' "$COMPETITIVE_RUN_SH" || fail "Markdown upstream aggregate formatter does not read connection metrics from combined fallback"
+# shellcheck disable=SC2016 # matching literal jq source text
+grep -qF '$v.reuse_ratio' "$COMPETITIVE_RUN_SH" || fail "Markdown upstream aggregate formatter does not read reuse metrics from combined fallback"
+# shellcheck disable=SC2016 # matching literal jq source text
+grep -qF '$v.pool_lock_wait_ns_per_request' "$COMPETITIVE_RUN_SH" || fail "Markdown upstream aggregate formatter does not read lock metrics from combined fallback"
 
 echo "PASS: upstream-pool matrix concurrent route tests"

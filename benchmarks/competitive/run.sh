@@ -1123,10 +1123,11 @@ write_combined_outputs() {
              (.value.quic.udp_buffers.recv.status // null), (.value.quic.udp_buffers.send.status // null)]),
         (if .upstream_pool_matrix != null then
             (.upstream_pool_matrix.scenarios | to_entries[] |
+                (.value.combined // .value) as $v |
                 ["tardigrade", ("upstream-pool/" + .key), (if .value.covered != null then .value.covered elif .value.supported != null then .value.supported else true end), (.value.reason // .value.sharding_note // null),
-                 (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
-                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null),
-                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null),
+                 ($v.rps // null), null, null, ($v.p99_ms // null), null, ($v.p99_ttfb_ms // null), null,
+                 ($v.cpu_pct_avg // null), ($v.cpu_ms_per_request // null), ($v.rss_mb_peak // null), ($v.open_fds_peak // null), (.value.errors // $v.errors // null),
+                 ($v.pool_lock_wait_ns_per_request // null), ($v.pool_lock_wait_ns_per_acquire // null),
                  null, null, null, null, null, null, null]),
             (.upstream_pool_matrix.scenarios["uneven-route-distribution"].routes // {} | to_entries[] |
                 ["tardigrade", ("upstream-pool/uneven/" + .key), (if .value.covered == null then true else .value.covered end), (.value.reason // null),
@@ -1191,7 +1192,8 @@ write_combined_outputs() {
             echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |"
             jq -r '
                 .upstream_pool_matrix.scenarios | to_entries[] |
-                "| `\(.key)` | \((if .value.covered != null then .value.covered elif .value.supported != null then .value.supported else true end)) | \(.value.rps // "-") | \(.value.p99_ms // "-") | \(.value.p99_ttfb_ms // "-") | \(.value.cpu_pct_avg // "-") | \(.value.cpu_ms_per_request // "-") | \(.value.rss_mb_peak // "-") | \(.value.new_connections_per_sec // "-") | \(.value.reuse_ratio // "-") | \(.value.pool_lock_wait_ns_per_request // "-") | \(.value.sharding_justified // "-") | \(.value.errors // "-") | \(.value.reason // "-") |"
+                (.value.combined // .value) as $v |
+                "| `\(.key)` | \((if .value.covered != null then .value.covered elif .value.supported != null then .value.supported else true end)) | \($v.rps // "-") | \($v.p99_ms // "-") | \($v.p99_ttfb_ms // "-") | \($v.cpu_pct_avg // "-") | \($v.cpu_ms_per_request // "-") | \($v.rss_mb_peak // "-") | \($v.new_connections_per_sec // "-") | \($v.reuse_ratio // "-") | \($v.pool_lock_wait_ns_per_request // "-") | \(.value.sharding_justified // "-") | \(.value.errors // $v.errors // "-") | \(.value.reason // "-") |"
             ' "$combined_json"
             echo ""
             echo "### Upstream Pool Detail Rows"
