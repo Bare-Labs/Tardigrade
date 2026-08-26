@@ -53,9 +53,10 @@ Use this checklist before tagging and distributing a Tardigrade release.
       `homebrew-tap/README.md` is tap-owned; update it only when public
       support policy or install instructions change.
 - [ ] After the public tap update is pushed, run the black-box public-tap smoke
-      with `./scripts/test-public-homebrew-tap.sh --install-mode qualified` and
-      `./scripts/test-public-homebrew-tap.sh --install-mode tap-short`, or run
-      the manual `Public Homebrew Smoke` workflow.
+      with `./scripts/test-public-homebrew-tap.sh --install-mode qualified --expected-version X.Y.Z`
+      and `./scripts/test-public-homebrew-tap.sh --install-mode tap-short --expected-version X.Y.Z`,
+      or run the manual `Public Homebrew Smoke` workflow with the expected
+      version input.
 - [ ] Verify both Darwin archives have matching SPDX SBOMs and
       `dependency-inventory-*.json` artifacts, and verify archive provenance
       with `gh attestation verify <archive> --repo Bare-Systems/Tardigrade`

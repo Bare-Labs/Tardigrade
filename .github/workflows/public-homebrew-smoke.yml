@@ -2,6 +2,11 @@ name: Public Homebrew Smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_version:
+        description: "Expected public Tardigrade release version, with or without leading v. Defaults to the latest stable GitHub release."
+        required: false
+        type: string
   schedule:
     - cron: "37 11 * * 1"
 
@@ -60,6 +65,7 @@ jobs:
       - name: Smoke public Homebrew tap install
         env:
           INSTALL_MODE: ${{ matrix.install_mode }}
+          EXPECTED_VERSION: ${{ inputs.expected_version || '' }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = Linux ]; then

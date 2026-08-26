@@ -14,17 +14,23 @@ SERVER_PID=""
 
 usage() {
     cat <<'EOF'
-Usage: test-public-homebrew-tap.sh [--install-mode qualified|tap-short]
+Usage: test-public-homebrew-tap.sh [--install-mode qualified|tap-short] [--expected-version VERSION]
 
 Installs Tardigrade from the public Bare-Systems/homebrew-tap path and smokes
 only the installed Homebrew artifact from a temporary directory outside the
 checkout. This is intended for post-release/manual/scheduled distribution
-validation, not PR-time generated-formula validation.
+validation, not PR-time generated-formula validation. If --expected-version
+is omitted, the latest stable GitHub release is used.
 EOF
 }
 
 # shellcheck disable=SC2317,SC2329 # invoked by trap
 cleanup() {
+    local status="$1"
+    if [ "$status" -ne 0 ] && [ -f "$TMPDIR/public-tap-runtime/server.log" ]; then
+        echo "--- public Homebrew smoke server.log ---" >&2
+        cat "$TMPDIR/public-tap-runtime/server.log" >&2
+    fi
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
         kill -INT "$SERVER_PID" >/dev/null 2>&1 || true
         wait "$SERVER_PID" >/dev/null 2>&1 || true
@@ -40,12 +46,18 @@ cleanup() {
     fi
     rm -rf "$TMPDIR"
 }
-trap cleanup EXIT
+trap 'status=$?; cleanup "$status"; exit "$status"' EXIT
+
+EXPECTED_VERSION="${EXPECTED_VERSION:-}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
     --install-mode)
         INSTALL_MODE="$2"
+        shift 2
+        ;;
+    --expected-version)
+        EXPECTED_VERSION="$2"
         shift 2
         ;;
     -h | --help)
@@ -86,16 +98,34 @@ if brew tap | grep -Fx "$TAP_NAME" >/dev/null; then
     exit 2
 fi
 
+strip_tag_prefix() {
+    printf '%s\n' "${1#v}"
+}
+
+latest_stable_release_version() {
+    local tag
+    if command -v gh >/dev/null 2>&1; then
+        tag="$(gh release view --repo Bare-Systems/Tardigrade --json tagName -q .tagName)"
+    else
+        tag="$(
+            curl -fsSL https://api.github.com/repos/Bare-Systems/Tardigrade/releases/latest |
+                ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("tag_name")'
+        )"
+    fi
+    strip_tag_prefix "$tag"
+}
+
+formula_stable_version() {
+    brew info --json=v2 "$FORMULA_REF" |
+        ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("formulae").fetch(0).fetch("versions").fetch("stable")'
+}
+
 emit_evidence() {
-    local installed="$1" alias_path="$2" version_output="$3" audit_output="$4"
-    local tap_repo tap_commit formula_version install_ref
+    local installed="$1" alias_path="$2" version_output="$3" audit_output="$4" formula_version="$5"
+    local tap_repo tap_commit install_ref
 
     tap_repo="$(brew --repo "$TAP_NAME")"
     tap_commit="$(git -C "$tap_repo" rev-parse HEAD)"
-    formula_version="$(
-        brew info --json=v2 "$FORMULA_REF" |
-            ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("formulae").fetch(0).fetch("versions").fetch("stable")'
-    )"
     if [ "$INSTALL_MODE" = qualified ]; then
         install_ref="$FORMULA_REF"
     else
@@ -109,6 +139,7 @@ emit_evidence() {
     printf 'os_arch=%s %s\n' "$(uname -s)" "$(uname -m)"
     printf 'tap=%s\n' "$TAP_NAME"
     printf 'tap_commit=%s\n' "$tap_commit"
+    printf 'expected_version=%s\n' "$EXPECTED_VERSION"
     printf 'formula_version=%s\n' "$formula_version"
     printf 'installed_binary=%s\n' "$installed"
     printf 'installed_alias=%s\n' "$alias_path"
@@ -133,6 +164,22 @@ tap-short)
 esac
 
 brew test "$FORMULA_REF" --verbose
+
+if [ -z "$EXPECTED_VERSION" ]; then
+    EXPECTED_VERSION="$(latest_stable_release_version)"
+else
+    EXPECTED_VERSION="$(strip_tag_prefix "$EXPECTED_VERSION")"
+fi
+if [ -z "$EXPECTED_VERSION" ]; then
+    echo "expected release version could not be resolved" >&2
+    exit 2
+fi
+
+formula_version="$(formula_stable_version)"
+if [ "$formula_version" != "$EXPECTED_VERSION" ]; then
+    echo "public tap is stale: expected formula version $EXPECTED_VERSION, got $formula_version" >&2
+    exit 1
+fi
 
 prefix="$(brew --prefix)"
 installed="$(command -v tardi)"
@@ -159,6 +206,13 @@ ruby -e 'exit(File.realpath(ARGV.fetch(0)) == File.realpath(ARGV.fetch(1)) ? 0 :
 }
 
 version_output="$("$installed" version)"
+case "$version_output" in
+"$EXPECTED_VERSION "*) ;;
+*)
+    echo "installed binary version does not match $EXPECTED_VERSION: $version_output" >&2
+    exit 1
+    ;;
+esac
 printf '%s\n' "$version_output" | grep -F 'tls-profile=general' >/dev/null
 printf '%s\n' "$version_output" | grep -F 'tls-backend=native' >/dev/null
 
@@ -196,7 +250,6 @@ for _ in $(seq 1 50); do
 done
 
 if [ "$ready" != true ]; then
-    cat server.log >&2
     echo "public Homebrew artifact did not become ready" >&2
     exit 1
 fi
@@ -207,5 +260,5 @@ kill -INT "$SERVER_PID"
 wait "$SERVER_PID"
 SERVER_PID=""
 
-emit_evidence "$installed" "$alias_path" "$version_output" "$audit_status"
+emit_evidence "$installed" "$alias_path" "$version_output" "$audit_status" "$formula_version"
 printf 'Public Homebrew tap smoke passed\n'
