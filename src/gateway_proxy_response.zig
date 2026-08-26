@@ -123,7 +123,8 @@ pub fn writeStreamedUpstreamResponseHeadFromHeaders(
     try writer.writeAll("Connection: close\r\n");
     if (body_allowed) try writer.writeAll("Transfer-Encoding: chunked\r\n");
     try gph.writeRequestIdHeaders(writer, correlation_id);
-    const connection_header = gph.findHeaderValueInList(upstream_headers, "connection");
+    var connection_header_buf: [4096]u8 = undefined;
+    const connection_header = gph.joinHeaderValuesInList(upstream_headers, "connection", &connection_header_buf);
     for (upstream_headers) |header| {
         if (gph.shouldSkipUpstreamResponseHeader(header.name, connection_header)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
@@ -330,7 +331,8 @@ pub fn writeBufferedUpstreamResponseHead(
     try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     try writer.print("Content-Length: {d}\r\n", .{upstream_response.body.len});
     try gph.writeRequestIdHeaders(writer, correlation_id);
-    const connection_header = gph.findHeaderValueInList(upstream_response.headers, "connection");
+    var connection_header_buf: [4096]u8 = undefined;
+    const connection_header = gph.joinHeaderValuesInList(upstream_response.headers, "connection", &connection_header_buf);
     for (upstream_response.headers) |header| {
         // Defense-in-depth: skip any upstream header that should not be
         // forwarded even if parse-time filtering missed it (e.g. headers

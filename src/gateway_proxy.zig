@@ -358,7 +358,8 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
     const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
     const reason = line_parts.rest();
 
-    const connection_header = gph.findRawHeaderValue(headers_raw, "connection");
+    var connection_header_buf: [4096]u8 = undefined;
+    const connection_header = gph.joinRawHeaderValues(headers_raw, "connection", &connection_header_buf);
 
     var resp_headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
@@ -366,6 +367,18 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const hname = std.mem.trim(u8, line[0..colon], " \t");
         const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        // Reject the whole response rather than silently forwarding a
+        // malformed header: an upstream response header is only ever
+        // split on an exact "\r\n" line boundary, so a bare CR/LF or NUL
+        // embedded *inside* what should be a single header value survives
+        // into `hval` unless validated here. Without this check, a hostile
+        // or compromised upstream could ride control characters straight
+        // through to the client (#673) -- the request-direction parser
+        // already rejects these via Headers.append()/isValidHeaderValue();
+        // upstream responses never went through that path at all.
+        if (!http.headers.isValidHeaderName(hname) or !http.headers.isValidHeaderValue(hval)) {
+            return error.UpstreamProtocolError;
+        }
         if (gph.shouldSkipUpstreamResponseHeader(hname, connection_header)) continue;
         try resp_headers.append(.{
             .name = try metadata_allocator.dupe(u8, hname),
@@ -1833,6 +1846,41 @@ test "parseBufferedUpstreamResponse returns UpstreamProtocolError on partial ups
     try testing.expectError(error.UpstreamProtocolError, parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"));
 }
 
+test "parseBufferedUpstreamResponse rejects control characters embedded in a header value (#673)" {
+    // A header line is only split on an exact "\r\n" boundary, so a bare CR
+    // (not part of a \r\n pair) or a NUL byte embedded inside what should
+    // be a single value survives into the parsed value unless explicitly
+    // validated. Before this fix, a hostile or compromised upstream could
+    // ride such bytes straight through to the client -- exactly the kind
+    // of response-splitting-adjacent injection the request-direction
+    // parser already rejects via Headers.append()/isValidHeaderValue(),
+    // which upstream responses never went through.
+    const testing = std.testing;
+
+    // Bare CR (0x0D) embedded in a value, not part of a \r\n line ending.
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nX-Hostile: val\rue\r\nContent-Length: 2\r\n\r\nok"),
+    );
+
+    // NUL byte embedded in a value.
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nX-Hostile: val\x00ue\r\nContent-Length: 2\r\n\r\nok"),
+    );
+
+    // Control character embedded in a header name.
+    try testing.expectError(
+        error.UpstreamProtocolError,
+        parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nX-Bad\x01Name: value\r\nContent-Length: 2\r\n\r\nok"),
+    );
+
+    // A clean response with no control characters is unaffected.
+    var ok_response = try parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nX-Safe: value\r\nContent-Length: 2\r\n\r\nok");
+    defer ok_response.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", ok_response.body);
+}
+
 pub fn bufferedUpstreamResponseHasNoStore(response: *const BufferedUpstreamResponse) bool {
     for (response.headers) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
@@ -2074,7 +2122,8 @@ fn readUpstreamHead(
     const status_code = std.fmt.parseInt(u16, sp.next() orelse "0", 10) catch 0;
     const reason = try arena.dupe(u8, sp.rest());
 
-    const connection_header = gph.findRawHeaderValue(header_block, "connection");
+    var connection_header_buf: [4096]u8 = undefined;
+    const connection_header = gph.joinRawHeaderValues(header_block, "connection", &connection_header_buf);
 
     var headers = std.array_list.Managed(UpstreamHeader).init(arena);
     var connection_close = false;
@@ -2088,6 +2137,14 @@ fn readUpstreamHead(
             while (toks.next()) |t| {
                 if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " \t"), "close")) connection_close = true;
             }
+        }
+        // See parseBufferedUpstreamResponse: a header line is only split on
+        // an exact "\r\n" boundary, so a bare CR/LF or NUL embedded inside
+        // what should be a single value survives into `value` unless
+        // validated here -- reject the response rather than forward a
+        // hostile upstream's control characters straight to the client (#673).
+        if (!http.headers.isValidHeaderName(name) or !http.headers.isValidHeaderValue(value)) {
+            return error.UpstreamProtocolError;
         }
         if (gph.shouldSkipUpstreamResponseHeader(name, connection_header)) continue;
         try headers.append(.{ .name = try arena.dupe(u8, name), .value = try arena.dupe(u8, value) });
@@ -3338,6 +3395,34 @@ test "streaming relay refuses reuse when bytes trail a Content-Length body" {
     try std.testing.expectEqualStrings("hello", body.items);
     try std.testing.expect(!r.aborted);
     try std.testing.expect(!r.reusable); // socket out of sync — must not be pooled
+}
+
+test "readUpstreamHead rejects control characters embedded in a header value (#673)" {
+    // Same defect as the buffered path (see the parseBufferedUpstreamResponse
+    // test of the same name): a header line is only split on an exact
+    // "\r\n" boundary, so a bare CR or NUL embedded inside what should be a
+    // single value survives unless explicitly validated, letting a hostile
+    // upstream ride control characters through to the client over the
+    // streaming relay path too.
+    const allocator = std.testing.allocator;
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+    const response = "HTTP/1.1 200 OK\r\nX-Hostile: val\rue\r\nContent-Length: 2\r\n\r\nok";
+    _ = std.c.write(peer_fd, response.ptr, response.len);
+
+    var read_storage: [4096]u8 = undefined;
+    var rb = StreamReadBuf{ .buf = &read_storage };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const transport = compat.netStreamFromFd(client_fd);
+
+    try std.testing.expectError(
+        error.UpstreamProtocolError,
+        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET"),
+    );
 }
 
 test "streaming relay refuses reuse when bytes trail a 204 head" {

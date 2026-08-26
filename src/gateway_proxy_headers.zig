@@ -103,30 +103,57 @@ pub fn connectionHeaderReferencesHeader(connection_header: ?[]const u8, name: []
     return false;
 }
 
-/// Finds the value of `name` in an already-parsed list of `{name, value}`
-/// headers (case-insensitive). Used to recover an upstream response's own
-/// `Connection` value before filtering the rest of its headers.
-pub fn findHeaderValueInList(headers: anytype, name: []const u8) ?[]const u8 {
+/// Joins the values of *every* occurrence of `name` in an already-parsed
+/// list of `{name, value}` headers into `buf`, comma-separated. RFC 7230
+/// §3.2.2: multiple header fields with the same name are semantically
+/// equivalent to one field with the values comma-joined, so this recovers
+/// the upstream response's (or client request's) *complete* nominated
+/// `Connection` set -- consulting only the first occurrence would let a
+/// hop-by-hop nomination in a second or later `Connection` field ride past
+/// filtering unnoticed (#673). Returns null if `name` does not appear.
+/// Truncates silently if `buf` is too small (headers are already bounded by
+/// the configured header-size limits, so this is unreachable in practice).
+pub fn joinHeaderValuesInList(headers: anytype, name: []const u8, buf: []u8) ?[]const u8 {
+    var len: usize = 0;
+    var found = false;
     for (headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+        if (!std.ascii.eqlIgnoreCase(header.name, name)) continue;
+        found = true;
+        if (len > 0 and len < buf.len) {
+            buf[len] = ',';
+            len += 1;
+        }
+        const take = @min(header.value.len, buf.len - len);
+        @memcpy(buf[len..][0..take], header.value[0..take]);
+        len += take;
     }
-    return null;
+    return if (found) buf[0..len] else null;
 }
 
-/// Finds the value of `name` within a raw `\r\n`-separated header block
-/// (status/request line included -- lines without a colon are skipped).
-/// Used to recover the upstream response's `Connection` value during a
-/// single streaming parse pass, before per-header filtering decisions.
-pub fn findRawHeaderValue(header_block: []const u8, name: []const u8) ?[]const u8 {
+/// Same as `joinHeaderValuesInList`, but scans a raw `\r\n`-separated header
+/// block (status/request line included -- lines without a colon are
+/// skipped) instead of an already-parsed list. Used to recover the
+/// complete nominated `Connection` set during a single streaming parse
+/// pass, before per-header filtering decisions.
+pub fn joinRawHeaderValues(header_block: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
+    var len: usize = 0;
+    var found = false;
     var lines = std.mem.splitSequence(u8, header_block, "\r\n");
     while (lines.next()) |line| {
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const hname = std.mem.trim(u8, line[0..colon], " \t");
-        if (std.ascii.eqlIgnoreCase(hname, name)) {
-            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (!std.ascii.eqlIgnoreCase(hname, name)) continue;
+        found = true;
+        const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (len > 0 and len < buf.len) {
+            buf[len] = ',';
+            len += 1;
         }
+        const take = @min(hval.len, buf.len - len);
+        @memcpy(buf[len..][0..take], hval[0..take]);
+        len += take;
     }
-    return null;
+    return if (found) buf[0..len] else null;
 }
 
 /// Copy safe client request headers into `extra_headers`, omitting all
@@ -135,7 +162,11 @@ pub fn appendProxyRequestHeaders(
     extra_headers: *std.array_list.Managed(std.http.Header),
     request_headers: *const http.Headers,
 ) !void {
-    const connection_header = request_headers.get("connection");
+    // `Headers.get()` returns only the first match, but a client may repeat
+    // `Connection` as multiple fields; join all of them so a nomination
+    // hiding in a second/later field is still honored (#673).
+    var connection_header_buf: [4096]u8 = undefined;
+    const connection_header = joinHeaderValuesInList(request_headers.iterator(), "connection", &connection_header_buf);
     for (request_headers.iterator()) |header| {
         if (shouldSkipUpstreamRequestHeader(header.name, connection_header)) continue;
         try extra_headers.append(.{ .name = header.name, .value = header.value });
@@ -458,6 +489,27 @@ test "appendProxyRequestHeaders normalizes duplicate inbound Early-Data through 
     try std.testing.expectEqualStrings("1", extra_headers.items[1].value);
 }
 
+test "appendProxyRequestHeaders unions duplicate Connection fields, not just the first (#673)" {
+    // `Headers.get()` returns only the first match; a client repeating
+    // `Connection` as two separate fields must still have every nominated
+    // header stripped, not just whichever field happened to come first.
+    var request_headers = http.Headers.init(std.testing.allocator);
+    defer request_headers.deinit();
+    try request_headers.append("Connection", "X-Ignore");
+    try request_headers.append("Connection", "X-Hostile-Secret");
+    try request_headers.append("X-Ignore", "client-value");
+    try request_headers.append("X-Hostile-Secret", "client-value");
+    try request_headers.append("X-Safe", "kept");
+
+    var extra_headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer extra_headers.deinit();
+
+    try appendProxyRequestHeaders(&extra_headers, &request_headers);
+
+    try std.testing.expectEqual(@as(usize, 1), extra_headers.items.len);
+    try std.testing.expectEqualStrings("x-safe", extra_headers.items[0].name);
+}
+
 test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
     // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
     // to external clients — Tardigrade emits its own Server header instead.
@@ -519,18 +571,49 @@ test "shouldSkipUpstreamResponseHeader strips headers nominated by the upstream'
     try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie", conn));
 }
 
-test "findHeaderValueInList and findRawHeaderValue locate Connection case-insensitively" {
+test "joinHeaderValuesInList and joinRawHeaderValues locate Connection case-insensitively" {
     const Header = struct { name: []const u8, value: []const u8 };
     const headers = [_]Header{
         .{ .name = "Content-Type", .value = "text/plain" },
         .{ .name = "CONNECTION", .value = "X-Foo" },
     };
-    try std.testing.expectEqualStrings("X-Foo", findHeaderValueInList(&headers, "connection").?);
-    try std.testing.expect(findHeaderValueInList(&headers, "missing") == null);
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("X-Foo", joinHeaderValuesInList(&headers, "connection", &buf).?);
+    try std.testing.expect(joinHeaderValuesInList(&headers, "missing", &buf) == null);
 
     const raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: X-Foo\r\n";
-    try std.testing.expectEqualStrings("X-Foo", findRawHeaderValue(raw, "connection").?);
-    try std.testing.expect(findRawHeaderValue(raw, "missing") == null);
+    try std.testing.expectEqualStrings("X-Foo", joinRawHeaderValues(raw, "connection", &buf).?);
+    try std.testing.expect(joinRawHeaderValues(raw, "missing", &buf) == null);
+}
+
+test "joinHeaderValuesInList and joinRawHeaderValues union duplicate Connection fields regardless of order/casing (#673)" {
+    // A response (or request) is allowed to repeat Connection as multiple
+    // header fields; RFC 7230 §3.2.2 treats that as equivalent to one
+    // comma-joined field. Consulting only the first occurrence would let a
+    // nomination hiding in a second/later field bypass filtering.
+    const Header = struct { name: []const u8, value: []const u8 };
+    const headers = [_]Header{
+        .{ .name = "Connection", .value = "X-Ignore" },
+        .{ .name = "CONNECTION", .value = "X-Hostile-Secret" },
+    };
+    var buf: [256]u8 = undefined;
+    const joined = joinHeaderValuesInList(&headers, "connection", &buf).?;
+    try std.testing.expect(connectionHeaderReferencesHeader(joined, "X-Ignore"));
+    try std.testing.expect(connectionHeaderReferencesHeader(joined, "X-Hostile-Secret"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Hostile-Secret", joined));
+
+    // Reversed order, reversed casing: still unioned correctly.
+    const headers_reversed = [_]Header{
+        .{ .name = "connection", .value = "X-Hostile-Secret" },
+        .{ .name = "Connection", .value = "X-Ignore" },
+    };
+    const joined_reversed = joinHeaderValuesInList(&headers_reversed, "Connection", &buf).?;
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Hostile-Secret", joined_reversed));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Ignore", joined_reversed));
+
+    const raw = "HTTP/1.1 200 OK\r\nConnection: X-Ignore\r\nConnection: X-Hostile-Secret\r\n";
+    const raw_joined = joinRawHeaderValues(raw, "connection", &buf).?;
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Hostile-Secret", raw_joined));
 }
 
 test "connectionHeaderReferencesHeader handles whitespace around tokens" {

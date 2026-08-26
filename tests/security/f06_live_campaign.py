@@ -7,19 +7,27 @@ asserts -- from the upstream's own hit log, not just the client-visible
 status code -- that:
 
   * every missing/malformed-credential case is denied *before* the protected
-    upstream is ever invoked;
+    upstream is ever invoked, with no exceptions for cases where one of two
+    duplicate values happens to be valid;
   * method, path, and Host variations cannot move a request off the
     protected boundary;
   * client-supplied X-Tardigrade-* / X-Forwarded-* identity headers never
-    become the trusted identity forwarded upstream;
+    become the trusted identity forwarded upstream, and cannot rewrite the
+    rate-limit/access-log client identity from an untrusted connection;
   * TE/CL conflicts, chunked-encoding abuse, and duplicate/oversized headers
-    are rejected without ever dispatching a smuggled follow-up request;
-  * the static traversal boundary cannot be crossed;
+    are rejected without ever dispatching a smuggled follow-up request --
+    proven with a unique marker request appended to every applicable probe;
+  * the static traversal boundary (including symlink escape and an
+    alias-rooted location) cannot be crossed;
   * a deliberately hostile upstream cannot split or desync the downstream
-    connection, including bleeding a "ghost" second response into an
-    unrelated later request over a reused upstream connection.
+    connection: neither a fresh connection nor the *same* downstream
+    connection used for the hostile probe can be corrupted by it, and a
+    "ghost" second response cannot bleed into an unrelated later response
+    over a reused upstream connection.
 
-Started via scripts/run-f06-auth-framing-campaign.sh, which owns process
+Run with the hardened trust posture (TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true,
+TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES not including the test client's
+address) via scripts/run-f06-auth-framing-campaign.sh, which owns process
 lifecycle (build, start upstream + tardi, teardown) and evidence capture.
 Curl is deliberately not used: it normalizes malformed syntax this campaign
 needs to send byte-exact.
@@ -37,16 +45,25 @@ import sys
 import threading
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 VALID_TOKEN = "f06-valid-token-9f3c2a9b7e"
 JWT_SECRET = "f06-jwt-secret-do-not-use-in-prod-4c1a"
 TRAVERSAL_CANARY = "F06_TRAVERSAL_CANARY_SHOULD_NEVER_BE_SERVED"
+ALIAS_ROOT_CANARY = "F06_ALIAS_ROOT_OK"
 GHOST_MARKER = "F06_UPSTREAM_GHOST_MARKER"
 
-
-def sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
+# Distinctive bytes for each hostile-upstream scenario that must never
+# appear verbatim in a later, unrelated response if the downstream
+# connection (or the upstream connection pool behind it) is desynchronized.
+SCENARIO_LEAK_MARKERS: dict[str, bytes] = {
+    "malformed_status_line": b"20O WEIRD",
+    "ctl_and_bare_cr_in_header_value": b"with-ctl-and-bare-cr",
+    "truncated_body": b"short",
+    "unusual_1xx_chain": b"Early Hints",
+    "invalid_204_with_body": b"nope!",
+    "invalid_304_with_body": b"nope!",
+}
 
 
 def b64url(data: bytes) -> str:
@@ -184,18 +201,94 @@ def assert_allowed(up: Upstream, name: str, category: str, port: int, request: b
     return matching[0] if matching else None
 
 
-def assert_consistency(up: Upstream, name: str, category: str, port: int, request: bytes) -> None:
-    """Generic safety net: the client-visible success/failure must always agree
-    with whether the protected upstream was actually invoked."""
+def framing_marker_case(up: Upstream, name: str, cat: str, port: int, build_raw) -> None:
+    """
+    Smuggling oracle applied to every applicable hostile-framing probe
+    (#673 review): `build_raw(marker_tail)` returns a complete byte stream
+    for one malformed/ambiguous request with `marker_tail` -- a full,
+    syntactically valid pipelined GET for a unique per-case path -- appended
+    immediately after it. If Tardigrade ever mis-measures where the
+    malformed request "ends" and starts parsing trailing bytes as a fresh
+    request, the marker path would show up in the upstream's hit log.
+    Passes only if the protected upstream sees zero hits at all -- neither
+    the malformed request itself nor the smuggled marker was ever
+    dispatched.
+    """
+    marker_path = f"/f06-marker-{name}"
+    marker_tail = f"GET {marker_path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
+    raw_request = build_raw(marker_tail)
     up.reset()
-    raw = send_raw(port, request)
-    status = first_status_code(raw)
+    resp = send_raw(port, raw_request, read_timeout=1.3)
     hits = up.hits()
-    client_says_ok = status is not None and 200 <= status < 300
-    upstream_was_hit = len(hits) >= 1
-    ok = client_says_ok == upstream_was_hit
-    detail = f"status={status} upstream_hits={len(hits)} (mismatch between client status and upstream reality)"
-    record(name, category, ok, detail)
+    smuggled = any(marker_path in h["path"] for h in hits)
+    status = first_status_code(resp)
+    ok = len(hits) == 0 and not smuggled
+    record(name, cat, ok, f"status={status} hits={len(hits)} smuggled={smuggled}")
+
+
+def hostile_same_socket_reuse(up: Upstream, name: str, cat: str, port: int, scenario: str) -> None:
+    """
+    Same-downstream-connection desync proof (#673 review): open ONE TCP
+    connection to tardi, send the hostile-upstream probe, then -- on that
+    SAME socket, without reconnecting -- send a second, ordinary request
+    and inspect what comes back. Two outcomes are accepted as safe:
+      (a) tardi closed the connection after the first response (the
+          strictest possible mitigation -- no reuse risk at all); or
+      (b) tardi kept it open and the second response is a single,
+          well-formed response that contains none of the first (hostile)
+          response's distinguishing bytes.
+    More than one apparent status line in the second read, or leakage of
+    the hostile scenario's distinguishing content, is a downstream desync
+    and fails.
+    """
+    up.reset()
+    leak_marker = SCENARIO_LEAK_MARKERS.get(scenario, b"")
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+    except OSError as e:
+        record(name, cat, False, f"connect failed: {e}")
+        return
+    try:
+        s.sendall(req("GET", "/hostile", [("X-F06-Scenario", scenario)]))
+        s.settimeout(1.0)
+        first = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                first += chunk
+        except (socket.timeout, ConnectionResetError):
+            pass
+
+        second_send_failed = False
+        try:
+            s.sendall(req("GET", "/hostile", [("X-F06-Scenario", "")]))
+        except OSError:
+            second_send_failed = True
+
+        second = b""
+        if not second_send_failed:
+            s.settimeout(1.0)
+            try:
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    second += chunk
+            except (socket.timeout, ConnectionResetError):
+                pass
+    finally:
+        s.close()
+
+    if second_send_failed or not second:
+        record(name, cat, True, "connection closed after first response (no reuse -- safe)")
+        return
+
+    status_line_count = second.count(b"HTTP/1.")
+    leaked = bool(leak_marker) and leak_marker in second
+    ok = status_line_count == 1 and not leaked
+    record(name, cat, ok, f"status_lines_in_second={status_line_count} leaked={leaked} first_len={len(first)}")
 
 
 # --- case builders ----------------------------------------------------
@@ -231,10 +324,17 @@ def run_auth_matrix(up: Upstream, port: int) -> None:
     bad_sig_jwt = make_hs256_jwt("wrong-secret-entirely", {"sub": "attacker"})
     assert_denied(up, "invalid_jwt_signature", cat, port, req("GET", "/protected", [("Authorization", f"Bearer {bad_sig_jwt}")]))
 
-    assert_consistency(up, "duplicate_authorization_invalid_then_valid", cat, port,
-                        req("GET", "/protected", [("Authorization", "Bearer garbage"), ("Authorization", f"Bearer {VALID_TOKEN}")]))
-    assert_consistency(up, "duplicate_authorization_valid_then_invalid", cat, port,
-                        req("GET", "/protected", [("Authorization", f"Bearer {VALID_TOKEN}"), ("Authorization", "Bearer garbage")]))
+    # Duplicate Authorization is ambiguous the same way duplicate
+    # Content-Length is (fixed in src/http/request.zig -- rejected with
+    # error.DuplicateAuthorizationHeader before routing/auth ever runs), so
+    # this must be a strict deny in BOTH field orders, not merely
+    # "client status agrees with whether upstream was hit" -- a request
+    # that happens to authenticate because a valid token was one of the two
+    # duplicated values is exactly the bypass #673 asks to close.
+    assert_denied(up, "duplicate_authorization_invalid_then_valid", cat, port,
+                  req("GET", "/protected", [("Authorization", "Bearer garbage"), ("Authorization", f"Bearer {VALID_TOKEN}")]))
+    assert_denied(up, "duplicate_authorization_valid_then_invalid", cat, port,
+                  req("GET", "/protected", [("Authorization", f"Bearer {VALID_TOKEN}"), ("Authorization", "Bearer garbage")]))
     assert_denied(up, "comma_joined_authorization_variant", cat, port,
                   req("GET", "/protected", [("Authorization", f"Bearer {VALID_TOKEN}, Bearer other-token")]))
 
@@ -288,6 +388,31 @@ def run_identity_spoofing(up: Upstream, port: int) -> None:
     record("connection_nominated_identity_header_not_trusted", cat, ok,
            f"status={status} forwarded_identity={forwarded_identity!r}")
 
+    # #673 review: valid-auth X-Forwarded-* rotation must not let the
+    # asserted client identity (used for rate limiting and access logging)
+    # be freely rewritten by an untrusted connecting peer. The campaign runs
+    # with TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true and
+    # TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES excluding 127.0.0.1 (the Safe
+    # Deployment Checklist's recommended hardened posture), so the test
+    # client itself is an untrusted connecting peer -- every rotated,
+    # forged X-Forwarded-For value must be ignored and the upstream must
+    # always see the real loopback address instead.
+    up.reset()
+    forged_ips = ["6.6.6.6", "9.9.9.9", "1.1.1.1"]
+    for ip in forged_ips:
+        send_raw(port, req("GET", "/protected", [
+            ("Authorization", f"Bearer {VALID_TOKEN}"),
+            ("X-Forwarded-For", ip),
+            ("X-Real-IP", ip),
+        ]))
+    hits = up.hits()
+    forwarded_ips_seen = {h["headers"].get("X-Forwarded-For") for h in hits}
+    real_ips_seen = {h["headers"].get("X-Real-IP") for h in hits}
+    no_forged_ip_honored = not (forwarded_ips_seen & set(forged_ips)) and not (real_ips_seen & set(forged_ips))
+    ok = len(hits) == len(forged_ips) and no_forged_ip_honored
+    record("x_forwarded_for_rotation_does_not_rewrite_client_identity", cat, ok,
+           f"forwarded_ips_seen={forwarded_ips_seen} real_ips_seen={real_ips_seen}")
+
 
 def run_method_change_bypass(up: Upstream, port: int) -> None:
     cat = "auth.method_change_bypass"
@@ -329,8 +454,12 @@ def run_path_canonicalization(up: Upstream, port: int) -> None:
     ok = (status is None or status >= 400) and len(hits) == 0
     record("absolute_form_request_target_still_requires_auth", cat, ok, f"status={status} hits={len(hits)}")
 
+    # A genuine second Host field (not just one non-matching value -- the
+    # `req()` helper suppresses its default Host whenever the caller already
+    # supplies one, so a naive single-Host call here would not actually
+    # test duplication at all, #673 review).
     up.reset()
-    raw = send_raw(port, req("GET", "/protected", [("Host", "evil.example")]))
+    raw = send_raw(port, b"GET /protected HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\n\r\n")
     status = first_status_code(raw)
     hits = up.hits()
     ok = (status is None or status >= 400) and len(hits) == 0
@@ -374,79 +503,78 @@ def run_positive_control_and_replay(up: Upstream, port: int) -> None:
 def run_hostile_framing(up: Upstream, port: int) -> None:
     cat = "framing.content_length_and_chunking"
 
-    assert_denied(up, "duplicate_cl_equal_values", cat, port,
-                  req("POST", "/protected", [("Content-Length", "4"), ("Content-Length", "4")], b"ABCD"))
-    assert_denied(up, "duplicate_cl_conflicting_values", cat, port,
-                  req("POST", "/protected", [("Content-Length", "4"), ("Content-Length", "8")], b"ABCDEFGH"))
-    assert_denied(up, "comma_separated_content_length", cat, port,
-                  req("POST", "/protected", [("Content-Length", "4, 4")], b"ABCD"))
-    assert_denied(up, "negative_content_length", cat, port,
-                  req("POST", "/protected", [("Content-Length", "-1")], b""))
-    assert_denied(up, "content_length_integer_overflow", cat, port,
-                  req("POST", "/protected", [("Content-Length", "99999999999999999999999999")], b""))
+    # Every case below is "smuggling-shaped": a complete (non-truncated)
+    # malformed/ambiguous request where trailing bytes could plausibly be
+    # reinterpreted as a fresh request if the parser mis-measures the body
+    # boundary. Each is run through framing_marker_case(), which appends a
+    # unique pipelined marker request and proves it is never dispatched
+    # (#673 review point 3).
 
+    framing_marker_case(up, "duplicate_cl_equal_values", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nABCD" + tail)
+    framing_marker_case(up, "duplicate_cl_conflicting_values_hides_second_request", cat, port, lambda tail:
+                         (lambda body: b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: "
+                          + str(len(body)).encode() + b"\r\n\r\n" + body)(b"ABCD" + tail))
+    framing_marker_case(up, "comma_separated_content_length", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4, 4\r\n\r\nABCD" + tail)
+    framing_marker_case(up, "negative_content_length", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n" + tail)
+    framing_marker_case(up, "content_length_integer_overflow", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999999999999999999\r\n\r\n" + tail)
+    framing_marker_case(up, "smuggling_probe_te_chunked_plus_cl", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n"
+                         b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "te_before_cl_header_order", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "te_cl_mixed_case_both_present", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\ncontent-length: 4\r\nTRANSFER-ENCODING: chunked\r\n\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "duplicate_transfer_encoding_fields", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "unsupported_transfer_coding_gzip_chunked", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "chunked_not_final_coding", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "invalid_chunk_size_hex", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\nabc\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "oversized_chunk_size_value", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n" + b"a" * 32 + b"\r\n0\r\n\r\n" + tail)
+    framing_marker_case(up, "missing_crlf_after_chunk_data", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcdXXXX0\r\n\r\n" + tail)
+    framing_marker_case(up, "malformed_chunk_trailers", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Trailer No Colon\r\n\r\n" + tail)
+
+    # Truncation-only cases: the connection is deliberately cut short before
+    # a complete request exists, so no coherent trailing marker request
+    # could ever be appended -- the smuggling oracle above does not apply.
+    # These stay as "never dispatches" assertions on the incomplete send.
     up.reset()
-    raw = send_raw_then_close_early(port,
-                                     b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n",
-                                     b"short-body-only", delay=0.1)
+    send_raw_then_close_early(port,
+                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n",
+                               b"short-body-only", delay=0.1)
     hits = up.hits()
     ok = len(hits) == 0
     record("content_length_longer_than_delivered_body_never_dispatches", cat, ok, f"hits={len(hits)}")
 
-    assert_denied(up, "smuggling_probe_te_chunked_plus_cl", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n"
-                  b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
-
-    smuggled_tail = b"GET /f06-smuggled-should-never-route HTTP/1.1\r\nHost: localhost\r\n\r\n"
-    body = b"ABCD" + smuggled_tail
     up.reset()
-    raw = send_raw(port,
-                    b"POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n"
-                    b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    send_raw_then_close_early(port,
+                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
+                               b"", delay=0.1)
     hits = up.hits()
-    smuggled_hit = any("f06-smuggled-should-never-route" in h["path"] for h in hits)
-    ok = len(hits) == 0 and not smuggled_hit
-    record("smuggling_probe_duplicate_conflicting_cl_hides_second_request", cat, ok, f"hits={len(hits)}")
+    ok = len(hits) == 0
+    record("truncated_chunk_body_never_dispatches", cat, ok, f"hits={len(hits)}")
+
+    up.reset()
+    send_raw_then_close_early(port,
+                               b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n",
+                               b"", delay=0.1)
+    hits = up.hits()
+    ok = len(hits) == 0
+    record("missing_final_zero_chunk_never_dispatches", cat, ok, f"hits={len(hits)}")
 
     up.reset()
     followup = send_raw(port, req("GET", "/health", []))
     ok = b"200" in followup[:20]
     record("connection_healthy_after_smuggling_probes", cat, ok, f"resp={followup[:60]!r}")
-
-    assert_denied(up, "te_before_cl_header_order", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n")
-    assert_denied(up, "te_cl_mixed_case_both_present", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\ncontent-length: 4\r\nTRANSFER-ENCODING: chunked\r\n\r\n0\r\n\r\n")
-    assert_denied(up, "unsupported_transfer_coding_gzip_chunked", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
-    assert_denied(up, "chunked_not_final_coding", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n")
-    assert_denied(up, "invalid_chunk_size_hex", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\nabc\r\n0\r\n\r\n")
-    assert_denied(up, "oversized_chunk_size_value", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n" + b"a" * 32 + b"\r\n0\r\n\r\n")
-
-    up.reset()
-    raw = send_raw_then_close_early(port,
-                                     b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
-                                     b"", delay=0.1)
-    hits = up.hits()
-    ok = len(hits) == 0
-    record("truncated_chunk_body_never_dispatches", cat, ok, f"hits={len(hits)}")
-
-    assert_denied(up, "missing_crlf_after_chunk_data", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcdXXXX0\r\n\r\n")
-
-    up.reset()
-    raw = send_raw_then_close_early(port,
-                                     b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n",
-                                     b"", delay=0.1)
-    hits = up.hits()
-    ok = len(hits) == 0
-    record("missing_final_zero_chunk_never_dispatches", cat, ok, f"hits={len(hits)}")
-
-    assert_denied(up, "malformed_chunk_trailers", cat, port,
-                  b"POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Trailer No Colon\r\n\r\n")
 
 
 def run_header_syntax(up: Upstream, port: int) -> None:
@@ -458,6 +586,13 @@ def run_header_syntax(up: Upstream, port: int) -> None:
                   b"GET /protected HTTP/1.1\r\nHost: localhost\r\nX-Custom: bad\x00value\r\n\r\n")
     assert_denied(up, "ctl_byte_in_header_name", cat, port,
                   b"GET /protected HTTP/1.1\r\nHost: localhost\r\nX-Bad\x01Name: value\r\n\r\n")
+
+    # General bare-LF / CR-without-LF parser syntax abuse, distinct from the
+    # Authorization-value-specific cases in run_auth_matrix() (#673 review).
+    assert_denied(up, "bare_lf_line_terminator_in_headers", cat, port,
+                  b"GET /protected HTTP/1.1\nHost: localhost\nX-Custom: value\n\n")
+    assert_denied(up, "bare_cr_without_lf_in_header_value", cat, port,
+                  b"GET /protected HTTP/1.1\r\nHost: localhost\r\nX-Custom: val\rue-with-bare-cr\r\n\r\n")
 
     long_path = "/protected/" + ("a" * 9000)
     assert_denied(up, "oversized_request_line", cat, port,
@@ -509,6 +644,34 @@ def run_traversal_boundary(up: Upstream, port: int) -> None:
         ok = not canary_leaked
         record(name, cat, ok, f"status={status} canary_leaked={canary_leaked}")
 
+    # Symlink escape: tests/security/fixtures/f06_static_root/escape-symlink
+    # points at ../f06_secret_outside_root.txt (outside the doc root).
+    up.reset()
+    raw = send_raw(port, req("GET", "/escape-symlink", []))
+    status = first_status_code(raw)
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    canary_leaked = TRAVERSAL_CANARY.encode() in body
+    record("symlink_escape_outside_doc_root", cat, not canary_leaked,
+           f"status={status} canary_leaked={canary_leaked}")
+
+    # root/alias interaction: /alias/ is served via `alias`, a different
+    # root than the default static location -- confirm it serves its own
+    # content and still enforces the same traversal boundary.
+    up.reset()
+    raw = send_raw(port, req("GET", "/alias/index.html", []))
+    status = first_status_code(raw)
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    ok = status == 200 and ALIAS_ROOT_CANARY.encode() in body
+    record("alias_root_serves_its_own_content", cat, ok, f"status={status}")
+
+    up.reset()
+    raw = send_raw(port, req("GET", "/alias/../f06_secret_outside_root.txt", []))
+    status = first_status_code(raw)
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    canary_leaked = TRAVERSAL_CANARY.encode() in body
+    record("alias_root_traversal_boundary_holds", cat, not canary_leaked,
+           f"status={status} canary_leaked={canary_leaked}")
+
 
 def run_malicious_upstream(up: Upstream, port: int) -> None:
     cat = "upstream.malicious_response_framing"
@@ -516,21 +679,64 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     def hostile(scenario: str) -> bytes:
         return req("GET", "/hostile", [("X-F06-Scenario", scenario)])
 
-    for scenario in ["duplicate_cl", "conflicting_cl", "te_and_cl", "malformed_status_line", "truncated_body"]:
+    core_scenarios = [
+        "duplicate_cl_equal",
+        "conflicting_cl",
+        "te_and_cl",
+        "malformed_status_line",
+        "ctl_and_bare_cr_in_header_value",
+        "truncated_body",
+    ]
+    for scenario in core_scenarios:
         up.reset()
         raw = send_raw(port, hostile(scenario))
         status = first_status_code(raw)
         followup = send_raw(port, req("GET", "/health", []))
         followup_ok = first_status_code(followup) == 200
-        ok = followup_ok
-        record(f"hostile_upstream_{scenario}_does_not_hang_or_break_edge", cat, ok,
+        record(f"hostile_upstream_{scenario}_does_not_hang_or_break_edge", cat, followup_ok,
                f"status={status} followup_status={first_status_code(followup)}")
 
+        # Same-downstream-connection desync proof (#673 review point 5):
+        # exercised on the SAME socket as the hostile probe, not a fresh
+        # connection, so a corrupted response boundary would show up here
+        # even if a brand-new connection would look fine.
+        hostile_same_socket_reuse(up, f"hostile_upstream_{scenario}_same_connection_reuse_is_clean", cat, port, scenario)
+
     up.reset()
-    raw = send_raw(port, hostile("connection_custom_hop"))
+    raw = send_raw(port, hostile("ctl_and_bare_cr_in_header_value"))
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    sanitized = b"\x00" not in raw and b"with-ctl-and-bare-cr" not in raw
+    record("hostile_upstream_ctl_bare_cr_not_reflected_verbatim", cat, sanitized,
+           f"resp_head={raw[:200]!r}")
+
+    # RFC 7230 §6.1 hop-by-hop headers and technology-disclosure headers a
+    # hostile upstream might try to ride through verbatim; each must be
+    # stripped before the client sees it.
+    stripped_header_scenarios = [
+        ("connection_custom_hop", "x-hostile-secret"),
+        ("proxy_connection_header", "proxy-connection"),
+        ("te_header", "te"),
+        ("trailer_header", "trailer"),
+        ("upgrade_header", "upgrade"),
+    ]
+    for scenario, header_name in stripped_header_scenarios:
+        up.reset()
+        raw = send_raw(port, hostile(scenario))
+        headers = response_headers_lower(raw)
+        ok = header_name not in headers
+        record(f"hostile_upstream_{scenario}_stripped", cat, ok, f"headers={list(headers.keys())}")
+
+    up.reset()
+    raw = send_raw(port, hostile("server_header"))
     headers = response_headers_lower(raw)
-    ok = "x-hostile-secret" not in headers
-    record("hostile_upstream_connection_nominated_header_stripped", cat, ok, f"headers={list(headers.keys())}")
+    ok = headers.get("server") == "tardigrade"
+    record("hostile_upstream_server_header_replaced_not_leaked", cat, ok, f"server={headers.get('server')!r}")
+
+    up.reset()
+    raw = send_raw(port, hostile("x_powered_by_header"))
+    headers = response_headers_lower(raw)
+    ok = "x-powered-by" not in headers
+    record("hostile_upstream_x_powered_by_stripped", cat, ok, f"headers={list(headers.keys())}")
 
     up.reset()
     _ = send_raw(port, hostile("extra_bytes_after_response"))
@@ -539,6 +745,7 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     ok = not leaked
     record("hostile_upstream_extra_bytes_do_not_leak_into_next_response", cat, ok,
            f"leaked={leaked} followup_head={followup[:100]!r}")
+    hostile_same_socket_reuse(up, "hostile_upstream_extra_bytes_same_connection_reuse_is_clean", cat, port, "extra_bytes_after_response")
 
     for scenario in ["unusual_1xx_chain", "invalid_204_with_body", "invalid_304_with_body"]:
         up.reset()
@@ -547,6 +754,7 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         ok = first_status_code(followup) == 200
         record(f"hostile_upstream_{scenario}_connection_stays_healthy", cat, ok,
                f"followup_status={first_status_code(followup)}")
+        hostile_same_socket_reuse(up, f"hostile_upstream_{scenario}_same_connection_reuse_is_clean", cat, port, scenario)
 
 
 def main() -> int:

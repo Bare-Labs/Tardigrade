@@ -46,13 +46,16 @@ def _record(method: str, path: str, headers: dict, body: bytes) -> int:
 
 
 HOSTILE_SCENARIOS = {
-    "duplicate_cl": (
+    # Two Content-Length fields with the SAME value -- still ambiguous per
+    # RFC 7230 (HTTP does not grant an exception for matching duplicates),
+    # kept distinct from the differing-values case below (#673 review).
+    "duplicate_cl_equal": (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/plain\r\n"
         b"Content-Length: 2\r\n"
-        b"Content-Length: 9\r\n"
+        b"Content-Length: 2\r\n"
         b"\r\n"
-        b"ok-hostile-extra"
+        b"ok"
     ),
     "conflicting_cl": (
         b"HTTP/1.1 200 OK\r\n"
@@ -71,10 +74,17 @@ HOSTILE_SCENARIOS = {
         b"2\r\nok\r\n0\r\n\r\n"
     ),
     "malformed_status_line": b"HTTP/1.1 20O WEIRD\r\nContent-Length: 0\r\n\r\n",
-    "crlf_injection_header": (
+    # Genuine malformed-byte injection attempt: a NUL and a bare CR (not
+    # part of a \r\n pair) embedded inside an otherwise well-formed header
+    # value, probing whether Tardigrade sanitizes/rejects control characters
+    # in upstream header values before re-emitting them to the client the
+    # way it already validates client-supplied header values (#673 review --
+    # the prior version of this scenario used two syntactically valid
+    # headers and tested nothing malformed).
+    "ctl_and_bare_cr_in_header_value": (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/plain\r\n"
-        b"X-Hostile: injected\r\nSet-Cookie: forged=1\r\n"
+        b"X-Hostile: val\x00ue\rwith-ctl-and-bare-cr\r\n"
         b"Content-Length: 2\r\n\r\nok"
     ),
     "connection_custom_hop": (
@@ -82,6 +92,20 @@ HOSTILE_SCENARIOS = {
         b"Connection: X-Hostile-Secret\r\n"
         b"X-Hostile-Secret: should-not-reach-client\r\n"
         b"Content-Length: 2\r\n\r\nok"
+    ),
+    # RFC 7230 §6.1 hop-by-hop headers a hostile upstream might try to ride
+    # through verbatim; each must be stripped before the client sees it.
+    "proxy_connection_header": (
+        b"HTTP/1.1 200 OK\r\nProxy-Connection: keep-alive\r\nContent-Length: 2\r\n\r\nok"
+    ),
+    "te_header": b"HTTP/1.1 200 OK\r\nTE: trailers\r\nContent-Length: 2\r\n\r\nok",
+    "trailer_header": b"HTTP/1.1 200 OK\r\nTrailer: X-Checksum\r\nContent-Length: 2\r\n\r\nok",
+    "upgrade_header": (
+        b"HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nContent-Length: 2\r\n\r\nok"
+    ),
+    "server_header": b"HTTP/1.1 200 OK\r\nServer: hostile-upstream/1.0\r\nContent-Length: 2\r\n\r\nok",
+    "x_powered_by_header": (
+        b"HTTP/1.1 200 OK\r\nX-Powered-By: hostile-framework\r\nContent-Length: 2\r\n\r\nok"
     ),
     "truncated_body": b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort",
     "extra_bytes_after_response": (

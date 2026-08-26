@@ -1,6 +1,7 @@
 zig-out/
 .zig-cache/
 .zig-toolchain/
+__pycache__/
 /tardigrade
 /test_cwd
 /test_fs

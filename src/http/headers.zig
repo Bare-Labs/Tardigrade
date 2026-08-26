@@ -111,6 +111,33 @@ pub const Headers = struct {
         return self.get(name) != null;
     }
 
+    /// Remove every occurrence of a header (case-insensitive), freeing its
+    /// owned name/value memory. Used to strip client-supplied headers that
+    /// must not survive past a trust-boundary decision (e.g. dropping
+    /// X-Forwarded-For/X-Real-IP from an untrusted connecting peer, #673)
+    /// before any downstream code has a chance to read them.
+    pub fn remove(self: *Headers, name: []const u8) void {
+        var lower_buf: [256]u8 = undefined;
+        if (name.len > lower_buf.len) return;
+
+        for (name, 0..) |c, i| {
+            lower_buf[i] = std.ascii.toLower(c);
+        }
+        const lower_name = lower_buf[0..name.len];
+
+        var write_idx: usize = 0;
+        for (self.items.items) |header| {
+            if (std.mem.eql(u8, header.name, lower_name)) {
+                self.allocator.free(header.name);
+                self.allocator.free(header.value);
+                continue;
+            }
+            self.items.items[write_idx] = header;
+            write_idx += 1;
+        }
+        self.items.shrinkRetainingCapacity(write_idx);
+    }
+
     /// RFC 8470 marker detection is based on field presence, not value.
     pub fn hasEarlyDataMarker(self: *const Headers) bool {
         return self.countByName("early-data") > 0;
@@ -302,6 +329,30 @@ test "missing header returns null" {
     try testing.expect(headers.get("X-Missing") == null);
     try testing.expect(!headers.contains("X-Missing"));
     try testing.expect(headers.contains("Host"));
+}
+
+test "remove drops every occurrence of a header case-insensitively and leaves others intact" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+    try headers.append("X-Forwarded-For", "1.2.3.4");
+    try headers.append("Host", "localhost");
+    try headers.append("x-forwarded-for", "5.6.7.8");
+    try headers.append("X-Real-IP", "9.9.9.9");
+
+    headers.remove("X-FORWARDED-FOR");
+
+    try testing.expect(!headers.contains("x-forwarded-for"));
+    try testing.expectEqual(@as(usize, 0), headers.countByName("x-forwarded-for"));
+    try testing.expectEqualStrings("localhost", headers.get("host").?);
+    try testing.expectEqualStrings("9.9.9.9", headers.get("x-real-ip").?);
+    try testing.expectEqual(@as(usize, 2), headers.count());
+
+    // Removing a name that isn't present is a harmless no-op.
+    headers.remove("X-Nonexistent");
+    try testing.expectEqual(@as(usize, 2), headers.count());
 }
 
 test "early data marker uses presence regardless of value" {

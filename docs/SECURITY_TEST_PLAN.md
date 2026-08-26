@@ -137,55 +137,108 @@ test in `src/http/config_file.zig` and an integration test in
 **F-06 — Auth enforcement and hostile HTTP/1.1 framing pass (WSTG-ATHZ-01/02, WSTG-INPV-15, ASVS-4.1/4.3, RFC 7230 §6.1) (#673)** ✅ RESOLVED
 A live black-box campaign runs raw, byte-exact HTTP/1.1 requests against a
 real local `tardi` process fronting a disposable marker-recording upstream,
-with one bearer/JWT-protected route and one deliberately hostile upstream
-route. Assertions are made from the upstream's own hit log, not just the
-client-visible status code, so "denied" means the protected upstream was
-never invoked, not merely that the client got a 4xx.
+with one bearer/JWT-protected route, one deliberately hostile upstream
+route, and (per the Safe Deployment Checklist) `trust_require_upstream_identity`
+enabled with the test client itself left untrusted. Assertions are made from
+the upstream's own hit log, not just the client-visible status code, so
+"denied" means the protected upstream was never invoked, not merely that the
+client got a 4xx -- and every smuggling-shaped framing probe additionally
+appends a unique pipelined marker request to prove it is never dispatched,
+not just that the malformed probe itself was rejected.
 
-Coverage (92 live cases):
+Coverage (116 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
-  oversized token, malformed/invalid-signature JWT, duplicate/comma-joined
-  `Authorization`, NUL/CR injection attempts);
+  oversized token, malformed/invalid-signature JWT, comma-joined
+  `Authorization`, NUL/CR injection attempts), including a strict deny for
+  duplicate `Authorization` fields in **both** orderings regardless of
+  whether one of the two duplicated values is itself valid;
 - `X-Tardigrade-*` / `X-Forwarded-*` / `Connection`-nominated identity
-  spoofing cannot become trusted identity;
+  spoofing cannot become trusted identity, and rotating forged
+  `X-Forwarded-For`/`X-Real-IP` values from an untrusted connection cannot
+  rewrite the client identity used for rate limiting and access logging;
 - method-change bypass across GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS/TRACE/CONNECT;
 - path/Host canonicalization variants (trailing slash, duplicate/encoded
   slashes, dot segments, single/double percent-encoding, absolute-form
-  target, conflicting Host) cannot move a request off the protected boundary;
+  target, a genuine duplicate `Host` field) cannot move a request off the
+  protected boundary;
 - positive control plus sequential and concurrent bearer/JWT reuse;
 - the issue's own TE+CL and duplicate-conflicting-`Content-Length` smuggling
-  probes, plus the wider CL/TE/chunked matrix, proven with upstream marker
-  evidence that no smuggled follow-up request is ever dispatched;
-- request header syntax limits (obs-fold, NUL/CTL, oversized line/header,
-  header-count and aggregate-size limits, malformed version/method);
-- the static traversal boundary;
-- a hostile upstream response matrix (duplicate/conflicting CL, TE+CL,
-  malformed status line, CRLF injection, `Connection`-nominated header,
-  truncated body, extra bytes after the framed response, unusual 1xx chain,
-  invalid 204/304 framing), including a dedicated check that a "ghost" second
-  response smuggled by the hostile upstream never leaks into a later,
-  unrelated proxied response over a reused upstream connection.
+  probes, plus the wider CL/TE/duplicate-TE/chunked matrix -- every
+  non-truncated case proven with a unique pipelined marker request that
+  never reaches the upstream; truncated-body cases (where no coherent
+  trailing request could exist) proven by zero upstream hits instead;
+- request header syntax limits (obs-fold, NUL/CTL, bare LF, bare CR without
+  LF, oversized line/header, header-count and aggregate-size limits,
+  malformed version/method);
+- the static traversal boundary, including a real symlink escaping the doc
+  root and a separate `alias`-rooted location retested for the same
+  boundary;
+- a hostile upstream response matrix (equal and conflicting duplicate CL,
+  TE+CL, malformed status line, control-character/bare-CR injection in a
+  header value, `Connection`-nominated header, `Proxy-Connection`/`TE`/
+  `Trailer`/`Upgrade`/`Server`/`X-Powered-By`, truncated body, extra bytes
+  after the framed response, unusual 1xx chain, invalid 204/304 framing),
+  each checked both on a fresh connection and on the *same* downstream
+  connection used for the hostile probe, plus a dedicated check that a
+  "ghost" second response smuggled by the hostile upstream never leaks into
+  a later, unrelated proxied response over a reused upstream connection.
 
-The campaign found and fixed one real defect: `shouldSkipUpstreamResponseHeader()`
-in `src/gateway_proxy_headers.zig` did not honor the upstream response's own
-`Connection` header nomination (RFC 7230 §6.1) the way the request-direction
-`shouldSkipUpstreamRequestHeader()` already did. A malicious or misconfigured
-upstream sending `Connection: X-Hostile-Secret` alongside
-`X-Hostile-Secret: ...` could ride an arbitrary header past the static
-response hop-by-hop list straight through to the client. Fixed at all five
-call sites (buffered and streamed proxy response paths, HTTP/2 upstream
-header forwarding in `edge_gateway.zig`). Regression: `shouldSkipUpstreamResponseHeader
-strips headers nominated by the upstream's own Connection value (#673)` in
-`src/gateway_proxy_headers.zig`.
+The campaign found and fixed five real defects, all now covered by
+deterministic regression tests:
+
+1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
+   response's own `Connection` header nomination (RFC 7230 §6.1) the way
+   the request-direction `shouldSkipUpstreamRequestHeader()` already did. A
+   malicious or misconfigured upstream sending `Connection: X-Hostile-Secret`
+   alongside `X-Hostile-Secret: ...` could ride an arbitrary header past the
+   static response hop-by-hop list straight through to the client. Fixed at
+   all five call sites (buffered and streamed proxy response paths, HTTP/2
+   upstream header forwarding in `edge_gateway.zig`).
+2. That same nomination check only consulted the *first* `Connection` field
+   when a header was duplicated, in both directions (`Headers.get()`
+   returns only the first match). Fixed by unioning every occurrence
+   (`joinHeaderValuesInList()` / `joinRawHeaderValues()` in
+   `gateway_proxy_headers.zig`) rather than reading a single value.
+3. Duplicate `Authorization` header fields were accepted whenever the
+   *first* field (whichever the reading code path happened to consult) was
+   a valid credential, silently ignoring a second, malformed field. Fixed
+   by rejecting any request with more than one `Authorization` field
+   outright (`error.DuplicateAuthorizationHeader` in `src/http/request.zig`,
+   mapped to `400 Bad Request` before routing or auth ever runs) --
+   analogous to the existing duplicate-`Content-Length` rejection.
+4. `extractClientIp()` (`src/http/request_context.zig`) honored client-supplied
+   `X-Forwarded-For`/`X-Real-IP` unconditionally, with no trust gate at all,
+   even though `docs/PROXY_SECURITY.md` §7 documents `trust_require_upstream_identity`
+   / `trusted_upstream_identities` as the boundary that should govern this.
+   Any client could rewrite the identity used to key rate-limit buckets and
+   the `client_ip` recorded in access logs, live even behind a correctly
+   configured trust boundary. Fixed by gating on the same trust check used
+   elsewhere (`gph.isTrustedUpstream()`) and stripping the headers from the
+   request outright when untrusted, before any other code (including the
+   outbound `X-Forwarded-For` chain sent to Tardigrade's own upstream) can
+   read them.
+5. Upstream response headers were copied into the client-facing response
+   with no validation at all -- unlike client *request* headers, which
+   `Headers.append()` validates against `isValidHeaderName()` /
+   `isValidHeaderValue()`. Because a header line is only split on an exact
+   `\r\n` boundary, a bare CR or embedded NUL inside what should be a
+   single header value survived parsing and was forwarded to the client
+   verbatim, letting a hostile or compromised upstream inject control
+   characters into a response header. Fixed by validating every upstream
+   response header name/value the same way request headers already are,
+   rejecting the response as `error.UpstreamProtocolError` (502) if either
+   fails, at both the buffered (`parseBufferedUpstreamResponse()`) and
+   streamed (`readUpstreamHead()`) parse sites in `gateway_proxy.zig`.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
-`f06_tardigrade.conf`), and runs the probe engine in
-`tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
-results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials are
-synthetic and local-only; no production secrets or traffic were used. 92/92
-probes pass after the fix (Zig 0.16.0, macOS arm64; rerun the script for
-current evidence -- results are not committed).
+`f06_tardigrade.conf`, plus a symlink and an `alias`-rooted directory), and
+runs the probe engine in `tests/security/f06_live_campaign.py`, writing
+evidence (metadata, raw results, process logs) to
+`.zig-cache/f06-campaign-673/`. All credentials are synthetic and
+local-only; no production secrets or traffic were used. 116/116 probes pass
+after the fixes (Zig 0.16.0, macOS arm64; rerun the script for current
+evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference
 

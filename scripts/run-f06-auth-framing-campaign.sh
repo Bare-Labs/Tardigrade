@@ -67,11 +67,16 @@ cat "$metadata"
 upstream_pid=""
 tardi_pid=""
 
+# shellcheck disable=SC2317,SC2329 # invoked by trap
 cleanup() {
-  [ -n "$tardi_pid" ] && kill "$tardi_pid" >/dev/null 2>&1 || true
-  [ -n "$upstream_pid" ] && kill "$upstream_pid" >/dev/null 2>&1 || true
-  wait "$tardi_pid" 2>/dev/null || true
-  wait "$upstream_pid" 2>/dev/null || true
+  if [ -n "$tardi_pid" ]; then
+    kill "$tardi_pid" >/dev/null 2>&1 || :
+    wait "$tardi_pid" 2>/dev/null || :
+  fi
+  if [ -n "$upstream_pid" ]; then
+    kill "$upstream_pid" >/dev/null 2>&1 || :
+    wait "$upstream_pid" 2>/dev/null || :
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -97,6 +102,8 @@ TARDIGRADE_LISTEN_PORT="$TARDI_PORT" \
 TARDIGRADE_UPSTREAM_BASE_URL="http://127.0.0.1:$UPSTREAM_PORT" \
 TARDIGRADE_AUTH_TOKEN_HASHES="$token_hash" \
 TARDIGRADE_JWT_SECRET="$JWT_SECRET" \
+TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true \
+TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES=10.99.99.99 \
   "$tardi_bin" >"$tardi_log" 2>&1 &
 tardi_pid=$!
 

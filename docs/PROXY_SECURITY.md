@@ -99,6 +99,16 @@ Both `X-Foo` and `X-Bar` are removed before the upstream request is sent,
 in addition to `Connection` itself. The same holds symmetrically for an
 upstream response that sends `Connection: X-Foo` alongside `X-Foo: ...`.
 
+If `Connection` is itself repeated as multiple header fields, every field's
+tokens are unioned (#673): a nomination hiding in a second or later
+`Connection` field is honored exactly like one in the first, in both
+directions. RFC 7230 §3.2.2 treats duplicate fields with the same name as
+semantically equivalent to one comma-joined field, and the filtering logic
+must not silently fall back to only the first occurrence.
+
+Implementation: `joinHeaderValuesInList()` / `joinRawHeaderValues()` in
+`src/gateway_proxy_headers.zig`.
+
 ## 3. Transfer-Encoding vs Content-Length Conflict
 
 **RFC 7230 §3.3.3** states that a message with both `Transfer-Encoding` and
@@ -122,6 +132,21 @@ regardless of whether the values match. A single unambiguous value is required.
 
 See the regression corpus case `tests/corpus/http/request/duplicate_content_length.http`.
 
+## 4a. Duplicate Authorization (#673)
+
+HTTP defines no combination semantics for `Authorization`, so a request
+carrying more than one `Authorization` field is ambiguous in the same way a
+request with duplicate `Content-Length` fields is. Duplicate `Authorization`
+headers are rejected with `error.DuplicateAuthorizationHeader` (mapped to
+`400 Bad Request`) before routing or auth resolution ever runs -- regardless
+of field order, and even when one of the two duplicated values would
+otherwise have been a valid credential. A client cannot smuggle a second,
+attacker-controlled `Authorization` value past whichever single value a
+given code path happens to read.
+
+Implementation: `src/http/request.zig`, `Request.parse()` and
+`Request.parseHead()`.
+
 ## 5. Header Casing and Normalization
 
 All header names stored by Tardigrade's `Headers` collection are lowercased on
@@ -141,8 +166,19 @@ within a value. This prevents CRLF injection and log poisoning.
 Obs-fold (line continuation with LF + SP/HTAB) is rejected; folded headers
 produce `400 Bad Request`.
 
+The same name/value validation is applied to **upstream response** headers
+before they are forwarded to the client (#673): a header line is only split
+on an exact `\r\n` boundary, so without this check a bare CR or embedded NUL
+inside what should be a single value would survive parsing and be forwarded
+verbatim, letting a hostile or compromised upstream inject control
+characters into a response header the client receives. A response with an
+invalid header name or value is rejected as `error.UpstreamProtocolError`
+(`502 Bad Gateway`) rather than partially forwarded.
+
 Implementation: `isValidHeaderName()`, `isValidHeaderValue()`,
-`parseHeaders()` in `src/http/headers.zig`.
+`parseHeaders()` in `src/http/headers.zig`; the same two functions applied
+to upstream response headers in `parseBufferedUpstreamResponse()` and
+`readUpstreamHead()` in `src/gateway_proxy.zig`.
 
 ## 6. Absolute-Form vs Origin-Form Request Targets
 
@@ -184,8 +220,19 @@ behind a load balancer MUST set `trusted_upstream_identities` to the load
 balancer's address(es) and enable `trust_require_upstream_identity: true` to
 prevent clients from spoofing their source IP via `X-Forwarded-For`.
 
+The same trust decision also governs the `client_ip` Tardigrade uses
+internally: the identity rate limiting keys unauthenticated traffic on
+(`ip:{client_ip}` buckets) and the `client_ip` field written to access logs.
+Before #673, this internal resolution (`extractClientIp()`) had no trust
+gate at all -- any client could rewrite both just by sending
+`X-Forwarded-For`/`X-Real-IP`, live even behind a correctly configured
+`trusted_upstream_identities`, because that code path never consulted it.
+
 Implementation: `isTrustedUpstream()`, `buildForwardedFor()`,
-`appendProxyRequestHeaders()` in `src/gateway_proxy_headers.zig`.
+`appendProxyRequestHeaders()` in `src/gateway_proxy_headers.zig`;
+`extractClientIp()` in `src/http/request_context.zig`; the untrusted-path
+header strip in `edge_gateway.zig` (`handleConnection`, right before
+`extractClientIp()` is called).
 
 ## 8. Host Header Handling
 

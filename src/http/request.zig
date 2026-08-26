@@ -37,6 +37,12 @@ pub const ParseError = error{
     ConflictingHeaders,
     /// Transfer-Encoding: chunked body is malformed.
     InvalidChunkedBody,
+    /// More than one `Authorization` header field was present. HTTP does
+    /// not define combination semantics for `Authorization`, so accepting
+    /// either occurrence creates the same class of ambiguity risk as
+    /// duplicate `Content-Length` (WSTG-ATHZ-01/02, #673 F-06) -- reject
+    /// outright rather than silently preferring one field.
+    DuplicateAuthorizationHeader,
     OutOfMemory,
 };
 
@@ -114,6 +120,8 @@ pub const Request = struct {
         // RFC 7230 §3.3.3: If both Transfer-Encoding and Content-Length are
         // present, reject as a potential request-smuggling attack.
         if (has_te and has_cl) return error.ConflictingHeaders;
+
+        if (headers.countByName("authorization") > 1) return error.DuplicateAuthorizationHeader;
 
         var body: ?[]const u8 = null;
         var total_bytes = body_start;
@@ -210,6 +218,7 @@ pub const Request = struct {
         const cl_count = headers.countByName("content-length");
         if (cl_count > 1 or te_count > 1) return error.ConflictingHeaders;
         if (te_count > 0 and cl_count > 0) return error.ConflictingHeaders;
+        if (headers.countByName("authorization") > 1) return error.DuplicateAuthorizationHeader;
         if (cl_count == 1) {
             _ = std.fmt.parseInt(usize, headers.get("content-length").?, 10) catch {
                 return error.InvalidContentLength;
@@ -564,6 +573,27 @@ test "reject duplicate Content-Length headers" {
     const allocator = std.testing.allocator;
     const raw = "POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nhello!!";
     try std.testing.expectError(error.ConflictingHeaders, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+}
+
+test "reject duplicate Authorization headers even when one occurrence is well-formed (#673)" {
+    // Duplicate Authorization is ambiguous the same way duplicate
+    // Content-Length is: HTTP defines no combination semantics for it, so
+    // this must be rejected outright rather than silently preferring
+    // whichever occurrence a given code path happens to read first --
+    // regardless of which occurrence (first or second) would otherwise have
+    // been a valid credential.
+    const allocator = std.testing.allocator;
+
+    {
+        const raw = "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer garbage\r\nAuthorization: Bearer valid-token\r\n\r\n";
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parseHead(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+    }
+    {
+        const raw = "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer valid-token\r\nAuthorization: Bearer garbage\r\n\r\n";
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parseHead(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+    }
 }
 
 test "parse chunked body correctly" {

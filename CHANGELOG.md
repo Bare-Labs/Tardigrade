@@ -5,17 +5,33 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Upstream response `Connection` header could smuggle a header past hop-by-hop
-  stripping (#673)** — a malicious or misbehaving upstream sending
-  `Connection: X-Foo` alongside `X-Foo: ...` could ride `X-Foo` past the static
-  response hop-by-hop list straight through to the client. The request
-  direction already stripped headers nominated by the client's `Connection`
-  header (RFC 7230 §6.1); the response direction did not apply the same rule
-  to the upstream's own `Connection` header. Found by a live black-box F-06
-  auth/framing campaign (`scripts/run-f06-auth-framing-campaign.sh`) against a
-  real local edge with a deliberately hostile upstream. Fixed in
-  `shouldSkipUpstreamResponseHeader()` (`src/gateway_proxy_headers.zig`) at
-  all five upstream-response header-forwarding call sites.
+- **Five auth/framing defects found by a live F-06 black-box campaign (#673)** —
+  `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
+  real local edge fronting a disposable upstream (plus a deliberately
+  hostile one) and found:
+  - Upstream response `Connection` header could smuggle a header past
+    hop-by-hop stripping: a malicious/misbehaving upstream sending
+    `Connection: X-Foo` alongside `X-Foo: ...` could ride `X-Foo` through to
+    the client. The request direction already honored client-nominated
+    hop-by-hop headers (RFC 7230 §6.1); the response direction did not.
+  - That same nomination check only consulted the first `Connection` field
+    when the header was duplicated, in both directions.
+  - Duplicate `Authorization` fields were accepted whenever the field a
+    given code path happened to read first was valid, silently ignoring a
+    second, malformed field.
+  - The client identity used to key rate-limit buckets and access logs
+    could be freely rewritten via `X-Forwarded-For`/`X-Real-IP` from *any*
+    client, even behind a correctly configured `trusted_upstream_identities`
+    trust boundary, because that resolution never consulted it.
+  - Upstream response headers were forwarded to the client with no
+    control-character validation at all, unlike client request headers,
+    letting a hostile/compromised upstream inject a bare CR or NUL into a
+    header value the client received.
+
+  All five fixed with regression coverage in `gateway_proxy_headers.zig`,
+  `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
+  and `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the
+  full campaign writeup.
 
 ## [0.6.2] - 2026-08-25
 
