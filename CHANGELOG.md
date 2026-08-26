@@ -4,6 +4,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Testing
+- **Linux release archive compatibility verification (#671)** — adds a new blocking `verify-linux-archive` job to the release CI pipeline that ensures `linux-x86_64` `.tar.gz` release artifacts can successfully start, serve traffic, and gracefully shut down on the project's required older userlands (Ubuntu 22.04 LTS and Rocky Linux 9). Release builds remain pinned to the `x86_64-linux-gnu.2.28` target, and a pull-request `linux-release-smoke.yml` workflow catches linkage or runtime regressions before merge.
+
 ## [0.6.2] - 2026-08-25
 
 ### Fixed
