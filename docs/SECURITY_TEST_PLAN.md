@@ -118,6 +118,13 @@ IDs against the `tg-<decimal>-<lowercase-hex>` format. Arbitrary client values
 are discarded and a fresh ID is generated. Covered by unit tests in
 `correlation_id.zig`.
 
+**F-05 — Live native TLS surface pass** ✅ RESOLVED
+Issue #672 completed a live black-box pass against an isolated native
+`tardi` listener using synthetic credentials, OpenSSL probes, `nghttp`, and
+scanner tooling. The committed sanitized evidence, command matrix, public
+certificate metadata, and scanner-tool limitations are recorded in
+[`docs/F05_LIVE_TLS_SURFACE_672.md`](F05_LIVE_TLS_SURFACE_672.md).
+
 **F-07 — Static file serving via catch-all `location /` non-functional** ✅ RESOLVED
 A `location` block with `root` but no `index` or `try_files` directive used
 to 404 on directory requests because static serving had no default index
@@ -128,10 +135,6 @@ test in `src/http/config_file.zig` and an integration test in
 `tests/integration.zig`.
 
 ### Open Gaps
-
-**F-05 — TLS surface pass still pending**
-A dedicated TLS engagement against a Tardigrade instance with real TLS has not
-yet been completed with `tls_scan`. Run against an isolated lab target.
 
 **F-06 — Auth enforcement pass still pending**
 Bearer auth bypass, malformed bearer, token replay, and method-change bypass
