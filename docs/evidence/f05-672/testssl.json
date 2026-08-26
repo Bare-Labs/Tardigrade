@@ -1,0 +1,65 @@
+{
+          "clientProblem1" : [
+                            {
+                                "id"           : "engine_problem",
+                                "severity"     : "WARN",
+                                "finding"      : "No engine or GOST support via engine with your /opt/homebrew/bin/openssl"
+                           }
+          ],
+          "clientProblem2" : [
+                            {
+                                "id"           : "cmdline_ip-target",
+                                "severity"     : "WARN",
+                                "finding"      : "Target is not a server name: results may be completely wrong, at minimum trust may show false results."
+                           }
+          ],
+          "Invocation"  : "testssl.sh --protocols --server-preference --cipher-per-proto --jsonfile-pretty /tmp/tardigrade-f05-672.YhJ4lO/artifacts/testssl-2.json --logfile /tmp/tardigrade-f05-672.YhJ4lO/artifacts/testssl-2.log --warnings batch 127.0.0.1:18443",
+          "at"          : "Joes-MacBook-Air:/opt/homebrew/bin/openssl",
+          "version"     : "3.3dev d2bc042d",
+          "openssl"     : "OpenSSL 3.6.3 from Tue Jun 9 11:46:57 2026",
+          "startTime"   : "1787753205",
+          "scanResult"  : [
+          {
+                    "targetHost"      : "127.0.0.1",
+                    "ip"              : "127.0.0.1",
+                    "port"            : "18443",
+                    "rDNS"            : "localhost",
+                    "service"         : "Couldn't determine service, skipping all HTTP checks",
+                    "pretest"           : [
+                            {
+                                "id"           : "pre_128cipher",
+                                "severity"     : "INFO",
+                                "finding"      : "No 128 cipher limit bug"
+                           }
+                    ],
+                    "protocols"         : [
+                            {
+                                "id"           : "SSLv2",
+                                "severity"     : "OK",
+                                "finding"      : "not offered"
+                           },{
+                                "id"           : "SSLv3",
+                                "severity"     : "OK",
+                                "finding"      : "not offered"
+                           },{
+                                "id"           : "TLS1",
+                                "severity"     : "INFO",
+                                "finding"      : "not offered"
+                           },{
+                                "id"           : "TLS1_1",
+                                "severity"     : "INFO",
+                                "finding"      : "not offered"
+                           },{
+                                "id"           : "TLS1_2",
+                                "severity"     : "MEDIUM",
+                                "finding"      : "not offered"
+                           },{
+                                "id"           : "TLS1_3",
+                                "severity"     : "LOW",
+                                "finding"      : "not offered"
+                           }
+                    ]
+          }
+          ],
+                    "scanTime"  : "Scan interrupted"
+}

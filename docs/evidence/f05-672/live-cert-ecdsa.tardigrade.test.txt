@@ -1,0 +1,66 @@
+$ openssl s_client -connect 127.0.0.1:18443 -tls1_3 -servername ecdsa.tardigrade.test -alpn http/1.1 -showcerts </dev/null
+Connecting to 127.0.0.1
+depth=0 CN=ecdsa.tardigrade.test
+verify error:num=18:self-signed certificate
+verify return:1
+depth=0 CN=ecdsa.tardigrade.test
+verify return:1
+CONNECTED(00000003)
+---
+Certificate chain
+ 0 s:CN=ecdsa.tardigrade.test
+   i:CN=ecdsa.tardigrade.test
+   a:PKEY: EC, (prime256v1); sigalg: ecdsa-with-SHA256
+   v:NotBefore: Aug 26 14:03:43 2026 GMT; NotAfter: Sep  2 14:03:43 2026 GMT
+-----BEGIN CERTIFICATE-----
+MIIBqDCCAU2gAwIBAgIUeXf6BHoFiBRE6Vfznklw1ETQkjYwCgYIKoZIzj0EAwIw
+IDEeMBwGA1UEAwwVZWNkc2EudGFyZGlncmFkZS50ZXN0MB4XDTI2MDgyNjE0MDM0
+M1oXDTI2MDkwMjE0MDM0M1owIDEeMBwGA1UEAwwVZWNkc2EudGFyZGlncmFkZS50
+ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZdaLkmfcBnxu50snZrqaD0m4
+7lfdH1zgn74PHq+2dFZzwr2IwBaxGhYlDwZU5EIj7QsNikQwhlXMg7A4LkY4EaNl
+MGMwIAYDVR0RBBkwF4IVZWNkc2EudGFyZGlncmFkZS50ZXN0MAsGA1UdDwQEAwIH
+gDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQU+0EbtcLTHhQURVGDq6Fh
+sigAXgQwCgYIKoZIzj0EAwIDSQAwRgIhAMO4GB+z9KtCh8q1axQExukwcKlknG7n
++i7dW/TMWnZ9AiEAl4yoOVPHnfsGowQYZahd4mlqR0N0nIeDBv6/ZWV6K2k=
+-----END CERTIFICATE-----
+---
+Server certificate
+subject=CN=ecdsa.tardigrade.test
+issuer=CN=ecdsa.tardigrade.test
+---
+No client certificate CA names sent
+Peer signing digest: SHA256
+Peer signature type: ecdsa_secp256r1_sha256
+Peer Temp Key: X25519, 253 bits
+---
+SSL handshake has read 748 bytes and written 1558 bytes
+Verification error: self-signed certificate
+---
+New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256
+Protocol: TLSv1.3
+Server public key is 256 bit
+This TLS version forbids renegotiation.
+Compression: NONE
+Expansion: NONE
+ALPN protocol: http/1.1
+Early data was not sent
+Verify return code: 18 (self-signed certificate)
+---
+DONE
+
+$ openssl s_client ... | openssl x509 -noout -subject -issuer -dates -ext subjectAltName -fingerprint -sha256 -text
+subject=CN=ecdsa.tardigrade.test
+issuer=CN=ecdsa.tardigrade.test
+notBefore=Aug 26 14:03:43 2026 GMT
+notAfter=Sep  2 14:03:43 2026 GMT
+X509v3 Subject Alternative Name: 
+    DNS:ecdsa.tardigrade.test
+sha256 Fingerprint=C2:A8:5D:75:E9:5D:06:FB:71:86:D2:54:08:77:9C:24:A2:C6:21:80:26:9C:17:9F:CE:5A:B2:36:A0:98:E8:8E
+        Signature Algorithm: ecdsa-with-SHA256
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+            X509v3 Subject Alternative Name: 
+                DNS:ecdsa.tardigrade.test
+    Signature Algorithm: ecdsa-with-SHA256

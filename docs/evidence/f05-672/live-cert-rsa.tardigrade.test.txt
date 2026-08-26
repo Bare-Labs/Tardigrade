@@ -1,0 +1,25 @@
+$ openssl s_client -connect 127.0.0.1:18443 -tls1_3 -servername rsa.tardigrade.test -alpn http/1.1 -showcerts </dev/null
+Connecting to 127.0.0.1
+8030D2FF01000000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:ssl/record/rec_layer_s3.c:918:SSL alert number 80
+CONNECTED(00000003)
+---
+no peer certificate available
+---
+No client certificate CA names sent
+Negotiated TLS1.3 group: <NULL>
+---
+SSL handshake has read 7 bytes and written 1492 bytes
+Verification: OK
+---
+New, (NONE), Cipher is (NONE)
+Protocol: TLSv1.3
+This TLS version forbids renegotiation.
+Compression: NONE
+Expansion: NONE
+No ALPN negotiated
+Early data was not sent
+Verify return code: 0 (ok)
+---
+8030D2FF01000000:error:0A000197:SSL routines:SSL_shutdown:shutdown while in init:ssl/ssl_lib.c:2804:
+
+$ openssl s_client ... | openssl x509 -noout -subject -issuer -dates -ext subjectAltName -fingerprint -sha256 -text

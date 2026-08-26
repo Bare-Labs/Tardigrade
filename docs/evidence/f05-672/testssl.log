@@ -1,0 +1,22 @@
+## Scan started as: "testssl.sh --protocols --server-preference --cipher-per-proto --jsonfile-pretty /tmp/tardigrade-f05-672.YhJ4lO/artifacts/testssl-2.json --logfile /tmp/tardigrade-f05-672.YhJ4lO/artifacts/testssl-2.log --warnings batch 127.0.0.1:18443"
+## at Joes-MacBook-Air:/opt/homebrew/bin/openssl
+## version testssl: 3.3dev d2bc042d from 2026-08-26
+## version openssl: "3.6.3" from "Tue Jun 9 11:46:57 2026")
+
+[1mTesting all IPv4 addresses (port 18443): [m127.0.0.1
+-----------------------------------------------------
+[7m Start 2026-08-26 10:06:47        -->> 127.0.0.1:18443 (127.0.0.1) <<--[m
+
+[1m rDNS [m(127.0.0.1):       localhost
+[1m Service detected:[m       Couldn't determine what's running on port 18443, assuming no HTTP service => skipping all HTTP checks
+
+[1m[4m Testing protocols [m[4mvia sockets except NPN+ALPN [m
+
+[1m SSLv2      [m[1;32mnot offered (OK)[m
+[1m SSLv3      [m[1;32mnot offered (OK)[m
+[1m TLS 1      [mnot offered
+[1m TLS 1.1    [mnot offered
+[1m TLS 1.2    [m[0;33mnot offered[m
+[1m TLS 1.3    [m[1;33mnot offered[m
+
+
