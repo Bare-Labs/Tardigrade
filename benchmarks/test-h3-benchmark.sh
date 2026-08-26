@@ -834,6 +834,65 @@ check "--remote --help still prints usage (proves the flag's value was consumed,
     "Usage" "$REMOTE_FLAG_OUTPUT"
 
 echo ""
+echo "==> Test 26: _remote_wrk_error_count sums Non-2xx and Socket errors, not just Non-2xx (PR #681 round-2 review)"
+REMOTE_ERROR_FNS="$(source_functions "$REMOTE_RUN_SH" _remote_wrk_error_count)"
+SOCKET_ERRORS_ONLY="$(printf '%s\n' 'Running 15s test' 'Requests/sec: 1000.00' 'Socket errors: connect 0, read 3, write 0, timeout 0' | bash -c "
+${REMOTE_ERROR_FNS}
+_remote_wrk_error_count
+")"
+check "Socket errors alone (read 3) are counted, not ignored" \
+    "3" "$SOCKET_ERRORS_ONLY"
+COMBINED_ERRORS="$(printf '%s\n' 'Non-2xx or 3xx responses: 2' 'Socket errors: connect 0, read 5, write 0, timeout 1' | bash -c "
+${REMOTE_ERROR_FNS}
+_remote_wrk_error_count
+")"
+check "Non-2xx (2) and Socket errors (5+1=6) are summed together (8), not just Non-2xx alone" \
+    "8" "$COMBINED_ERRORS"
+
+echo ""
+echo "==> Test 27: run_wrk_remote fails loudly on a failed SSH/wrk execution instead of reporting a fabricated 0 (PR #681 round-2 review)"
+# run_wrk_remote calls `exit` (not `return`) on failure, terminating the
+# bash -c subshell immediately — nothing scripted *after* the call inside
+# that subshell would ever run. So the subshell's own exit status (captured
+# here via $? right after the command substitution) is the only reliable
+# failure signal; there's no way to also echo something from inside after
+# the failing call.
+REMOTE_RUNNER_FNS="$(source_functions "$REMOTE_RUN_SH" sq _remote_wrk_error_count run_wrk_remote add_result)"
+FAILED_SSH_STATUS=0
+FAILED_SSH_OUT="$(bash -c "
+set -uo pipefail
+ssh() { echo 'ssh: connect to host example: Connection refused' >&2; return 255; }
+THREADS=4; CONNECTIONS=32; DURATION=15; HOST_HEADER=''; WRK_PATH=wrk; REMOTE_HOST=example
+RESULTS_JSON='{}'
+${REMOTE_RUNNER_FNS}
+run_wrk_remote 'http://example/health' 'static-http1'
+" 2>&1)" || FAILED_SSH_STATUS=$?
+check "a failed SSH connection is reported as a failure, not silently swallowed" \
+    "remote ssh/wrk exited" "$FAILED_SSH_OUT"
+check_not "a failed SSH connection does not print a fabricated success line" \
+    "req/s" "$FAILED_SSH_OUT"
+check_not "run_wrk_remote does not exit 0 on a failed SSH connection" \
+    "status=0" "status=${FAILED_SSH_STATUS}"
+
+echo ""
+echo "==> Test 28: run_wrk_remote fails loudly on unparseable wrk output instead of reporting a fabricated 0 (PR #681 round-2 review)"
+UNPARSEABLE_STATUS=0
+UNPARSEABLE_OUT="$(bash -c "
+set -uo pipefail
+ssh() { echo 'wrk: command not found'; return 0; }
+THREADS=4; CONNECTIONS=32; DURATION=15; HOST_HEADER=''; WRK_PATH=wrk; REMOTE_HOST=example
+RESULTS_JSON='{}'
+${REMOTE_RUNNER_FNS}
+run_wrk_remote 'http://example/health' 'static-http1'
+" 2>&1)" || UNPARSEABLE_STATUS=$?
+check "wrk output with no 'Requests/sec' line (ssh exited 0, but wrk itself never ran) is reported as a failure" \
+    "could not parse wrk output" "$UNPARSEABLE_OUT"
+check_not "unparseable output does not print a fabricated success line" \
+    "req/s" "$UNPARSEABLE_OUT"
+check_not "run_wrk_remote does not exit 0 on unparseable wrk output" \
+    "status=0" "status=${UNPARSEABLE_STATUS}"
+
+echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"
 HELP_OUTPUT="$("$RUN_SH" --help 2>&1)"
 check "static-http1 still documented"   "static-http1" "$HELP_OUTPUT"
