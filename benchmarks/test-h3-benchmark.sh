@@ -928,7 +928,7 @@ JSON
     CONNECTIONS=1
     # shellcheck disable=SC2034
     THREADS=1
-    # shellcheck disable=SC2329 # called indirectly by write_combined_outputs, sourced via eval below
+    # shellcheck disable=SC2329,SC2317 # called indirectly by write_combined_outputs, sourced via eval below (SC2329/SC2317 vary by shellcheck version for the same "unreachable/never invoked" finding)
     host_metadata_json() { printf '{}'; }
     eval "$(source_functions "$COMPETITIVE_RUN_SH" write_combined_outputs)"
     write_combined_outputs >/dev/null
