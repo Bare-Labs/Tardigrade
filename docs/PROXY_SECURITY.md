@@ -46,7 +46,7 @@ Additionally, any header named by the inbound `Connection` header value is
 treated as hop-by-hop and removed. Example: if the client sends
 `Connection: X-My-Custom-Header`, Tardigrade strips `X-My-Custom-Header`
 before forwarding (RFC 7230 §6.1). See `connectionHeaderReferencesHeader()`
-in `src/gateway_proxy.zig`.
+in `src/gateway_proxy_headers.zig`.
 
 ### Response direction (upstream → client)
 
@@ -68,17 +68,26 @@ Removed before the client response is written:
 | `X-Request-ID` | Prevents upstream from spoofing correlation IDs |
 | `X-Correlation-ID` | Same; Tardigrade emits authoritative IDs |
 
+Additionally, any header named by the upstream response's own `Connection`
+header value is treated as hop-by-hop and removed before the response
+reaches the client (#673), mirroring the request-direction handling in §2.
+
 Implementation: `shouldSkipUpstreamRequestHeader()` and
-`shouldSkipUpstreamResponseHeader()` in `src/gateway_proxy.zig`.
+`shouldSkipUpstreamResponseHeader()` in `src/gateway_proxy_headers.zig`.
 
 ## 2. Connection Header Token Handling
 
-When the inbound `Connection` header lists additional header names (RFC 7230
-§6.1), Tardigrade splits the value on commas, trims whitespace around each
-token, and strips the named headers from the forwarded request. Token
-comparison is case-insensitive.
+When a `Connection` header lists additional header names (RFC 7230 §6.1),
+Tardigrade splits the value on commas, trims whitespace around each token,
+and strips the named headers before forwarding. Token comparison is
+case-insensitive. This applies in **both directions**: an inbound client
+`Connection` header nominates headers to drop before the upstream request is
+sent, and an upstream response's own `Connection` header nominates headers to
+drop before the response reaches the client (#673) -- a malicious or
+misbehaving upstream cannot use this mechanism to smuggle an arbitrary header
+past the static hop-by-hop list.
 
-Example:
+Example (request direction):
 
 ```
 Connection: X-Foo, X-Bar
@@ -87,7 +96,8 @@ X-Bar: client-value
 ```
 
 Both `X-Foo` and `X-Bar` are removed before the upstream request is sent,
-in addition to `Connection` itself.
+in addition to `Connection` itself. The same holds symmetrically for an
+upstream response that sends `Connection: X-Foo` alongside `X-Foo: ...`.
 
 ## 3. Transfer-Encoding vs Content-Length Conflict
 
@@ -175,7 +185,7 @@ balancer's address(es) and enable `trust_require_upstream_identity: true` to
 prevent clients from spoofing their source IP via `X-Forwarded-For`.
 
 Implementation: `isTrustedUpstream()`, `buildForwardedFor()`,
-`appendProxyRequestHeaders()` in `src/gateway_proxy.zig`.
+`appendProxyRequestHeaders()` in `src/gateway_proxy_headers.zig`.
 
 ## 8. Host Header Handling
 
@@ -315,7 +325,7 @@ Tardigrade after authentication resolves. Any client-supplied header with the
 `X-Tardigrade-` prefix is stripped before the upstream request is forwarded,
 preventing clients from impersonating authenticated identities.
 
-Implementation: `shouldSkipUpstreamRequestHeader()` in `src/gateway_proxy.zig`.
+Implementation: `shouldSkipUpstreamRequestHeader()` in `src/gateway_proxy_headers.zig`.
 
 ## Safe Deployment Checklist
 
@@ -347,7 +357,7 @@ Implementation: `shouldSkipUpstreamRequestHeader()` in `src/gateway_proxy.zig`.
 - `docs/SECURITY_TEST_PLAN.md` — test coverage map and release gate
 - `docs/PENTEST_PLAYBOOK.md` — internal pentest procedures
 - `docs/CODE_REVIEW_CHECKLIST.md` — per-PR security checklist
-- `src/gateway_proxy.zig` — hop-by-hop filtering implementation
+- `src/gateway_proxy_headers.zig` — hop-by-hop filtering implementation
 - `src/http/request.zig` — request parser with smuggling defenses
 - `src/http/headers.zig` — header validation and limits
 - `src/http/correlation_id.zig` — correlation ID validation

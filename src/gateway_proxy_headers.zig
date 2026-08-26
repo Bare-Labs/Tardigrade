@@ -60,7 +60,15 @@ pub fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]c
 /// Strips the RFC 7230 hop-by-hop set and technology-disclosure headers
 /// (WSTG-INFO-02, ASVS-14.3.3).  Tardigrade emits its own `Server` header
 /// and re-calculates `Content-Length` from the materialized body.
-pub fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
+///
+/// `connection_header` is the upstream response's own `Connection` value (if
+/// any). RFC 7230 §6.1 lets *either* end of a hop nominate extra headers as
+/// hop-by-hop via `Connection`; a malicious or misbehaving upstream must not
+/// be able to ride a nominated header past this filter to the client the way
+/// `shouldSkipUpstreamRequestHeader` already blocks it on the request side.
+pub fn shouldSkipUpstreamResponseHeader(name: []const u8, connection_header: ?[]const u8) bool {
+    if (connectionHeaderReferencesHeader(connection_header, name)) return true;
+
     return std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "content-encoding") or
         std.ascii.eqlIgnoreCase(name, http.early_data.HEADER_NAME) or
@@ -93,6 +101,32 @@ pub fn connectionHeaderReferencesHeader(connection_header: ?[]const u8, name: []
         if (std.ascii.eqlIgnoreCase(token, name)) return true;
     }
     return false;
+}
+
+/// Finds the value of `name` in an already-parsed list of `{name, value}`
+/// headers (case-insensitive). Used to recover an upstream response's own
+/// `Connection` value before filtering the rest of its headers.
+pub fn findHeaderValueInList(headers: anytype, name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
+}
+
+/// Finds the value of `name` within a raw `\r\n`-separated header block
+/// (status/request line included -- lines without a colon are skipped).
+/// Used to recover the upstream response's `Connection` value during a
+/// single streaming parse pass, before per-header filtering decisions.
+pub fn findRawHeaderValue(header_block: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, header_block, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const hname = std.mem.trim(u8, line[0..colon], " \t");
+        if (std.ascii.eqlIgnoreCase(hname, name)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
 }
 
 /// Copy safe client request headers into `extra_headers`, omitting all
@@ -380,14 +414,14 @@ test "shouldSkipUpstreamRequestHeader drops Connection-listed custom hop-by-hop 
 }
 
 test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding", null));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type", null));
 }
 
 test "shouldSkipUpstreamResponseHeader strips Early-Data response headers" {
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Early-Data"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("early-data"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Early-Data", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("early-data", null));
 }
 
 test "appendCanonicalEarlyDataHeader emits exactly one RFC 8470 marker when enabled" {
@@ -427,16 +461,16 @@ test "appendProxyRequestHeaders normalizes duplicate inbound Early-Data through 
 test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
     // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
     // to external clients — Tardigrade emits its own Server header instead.
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("server", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY", null));
     // Must not suppress unrelated headers.
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type", null));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header", null));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie", null));
 }
 
 test "shouldSkipUpstreamResponseHeader strips all hop-by-hop and disclosure headers" {
@@ -451,7 +485,7 @@ test "shouldSkipUpstreamResponseHeader strips all hop-by-hop and disclosure head
         "X-Powered-By",     "x-powered-by",
     };
     for (strip_cases) |name| {
-        try std.testing.expect(shouldSkipUpstreamResponseHeader(name));
+        try std.testing.expect(shouldSkipUpstreamResponseHeader(name, null));
     }
 }
 
@@ -466,8 +500,37 @@ test "shouldSkipUpstreamResponseHeader passes safe application response headers"
         "Last-Modified",
     };
     for (pass_cases) |name| {
-        try std.testing.expect(!shouldSkipUpstreamResponseHeader(name));
+        try std.testing.expect(!shouldSkipUpstreamResponseHeader(name, null));
     }
+}
+
+test "shouldSkipUpstreamResponseHeader strips headers nominated by the upstream's own Connection value (#673)" {
+    // RFC 7230 §6.1 lets either end of a hop nominate extra hop-by-hop
+    // headers via `Connection`. A hostile or misbehaving upstream sending
+    // `Connection: X-Hostile-Secret` alongside `X-Hostile-Secret: ...` must
+    // not be able to ride that header past the proxy to the client -- this
+    // mirrors the request-direction protection already covered by
+    // `shouldSkipUpstreamRequestHeader drops Connection-listed custom
+    // hop-by-hop headers`.
+    const conn = "X-Hostile-Secret, X-Also-Hostile";
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Hostile-Secret", conn));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-also-hostile", conn));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Safe-Header", conn));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie", conn));
+}
+
+test "findHeaderValueInList and findRawHeaderValue locate Connection case-insensitively" {
+    const Header = struct { name: []const u8, value: []const u8 };
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "CONNECTION", .value = "X-Foo" },
+    };
+    try std.testing.expectEqualStrings("X-Foo", findHeaderValueInList(&headers, "connection").?);
+    try std.testing.expect(findHeaderValueInList(&headers, "missing") == null);
+
+    const raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: X-Foo\r\n";
+    try std.testing.expectEqualStrings("X-Foo", findRawHeaderValue(raw, "connection").?);
+    try std.testing.expect(findRawHeaderValue(raw, "missing") == null);
 }
 
 test "connectionHeaderReferencesHeader handles whitespace around tokens" {

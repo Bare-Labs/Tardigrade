@@ -102,9 +102,9 @@ non-GET/HEAD methods on non-redirect static-return directives with 405
 behavior.
 
 **F-02 — Upstream Server header passthrough (WSTG-INFO-02, ASVS-14.3.3)** ✅ RESOLVED
-`shouldSkipUpstreamResponseHeader()` in `gateway_proxy.zig` strips upstream
-`Server` and `X-Powered-By` headers. Tardigrade emits its own `Server:
-tardigrade` header. Covered by unit tests in `gateway_proxy.zig`.
+`shouldSkipUpstreamResponseHeader()` in `gateway_proxy_headers.zig` strips
+upstream `Server` and `X-Powered-By` headers. Tardigrade emits its own
+`Server: tardigrade` header. Covered by unit tests in `gateway_proxy_headers.zig`.
 
 **F-03 — Missing Host header not rejected (WSTG-CONF-07, ASVS-14.5.1)** ✅ RESOLVED
 HTTP/1.1 requests missing `Host` are rejected with `400 Bad Request` in
@@ -134,11 +134,58 @@ for the full `root`/`index`/`try_files` resolution order. Covered by a unit
 test in `src/http/config_file.zig` and an integration test in
 `tests/integration.zig`.
 
-### Open Gaps
+**F-06 — Auth enforcement and hostile HTTP/1.1 framing pass (WSTG-ATHZ-01/02, WSTG-INPV-15, ASVS-4.1/4.3, RFC 7230 §6.1) (#673)** ✅ RESOLVED
+A live black-box campaign runs raw, byte-exact HTTP/1.1 requests against a
+real local `tardi` process fronting a disposable marker-recording upstream,
+with one bearer/JWT-protected route and one deliberately hostile upstream
+route. Assertions are made from the upstream's own hit log, not just the
+client-visible status code, so "denied" means the protected upstream was
+never invoked, not merely that the client got a 4xx.
 
-**F-06 — Auth enforcement pass still pending**
-Bearer auth bypass, malformed bearer, token replay, and method-change bypass
-have not been probed against a live edge with auth configured.
+Coverage (92 live cases):
+- missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
+  oversized token, malformed/invalid-signature JWT, duplicate/comma-joined
+  `Authorization`, NUL/CR injection attempts);
+- `X-Tardigrade-*` / `X-Forwarded-*` / `Connection`-nominated identity
+  spoofing cannot become trusted identity;
+- method-change bypass across GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS/TRACE/CONNECT;
+- path/Host canonicalization variants (trailing slash, duplicate/encoded
+  slashes, dot segments, single/double percent-encoding, absolute-form
+  target, conflicting Host) cannot move a request off the protected boundary;
+- positive control plus sequential and concurrent bearer/JWT reuse;
+- the issue's own TE+CL and duplicate-conflicting-`Content-Length` smuggling
+  probes, plus the wider CL/TE/chunked matrix, proven with upstream marker
+  evidence that no smuggled follow-up request is ever dispatched;
+- request header syntax limits (obs-fold, NUL/CTL, oversized line/header,
+  header-count and aggregate-size limits, malformed version/method);
+- the static traversal boundary;
+- a hostile upstream response matrix (duplicate/conflicting CL, TE+CL,
+  malformed status line, CRLF injection, `Connection`-nominated header,
+  truncated body, extra bytes after the framed response, unusual 1xx chain,
+  invalid 204/304 framing), including a dedicated check that a "ghost" second
+  response smuggled by the hostile upstream never leaks into a later,
+  unrelated proxied response over a reused upstream connection.
+
+The campaign found and fixed one real defect: `shouldSkipUpstreamResponseHeader()`
+in `src/gateway_proxy_headers.zig` did not honor the upstream response's own
+`Connection` header nomination (RFC 7230 §6.1) the way the request-direction
+`shouldSkipUpstreamRequestHeader()` already did. A malicious or misconfigured
+upstream sending `Connection: X-Hostile-Secret` alongside
+`X-Hostile-Secret: ...` could ride an arbitrary header past the static
+response hop-by-hop list straight through to the client. Fixed at all five
+call sites (buffered and streamed proxy response paths, HTTP/2 upstream
+header forwarding in `edge_gateway.zig`). Regression: `shouldSkipUpstreamResponseHeader
+strips headers nominated by the upstream's own Connection value (#673)` in
+`src/gateway_proxy_headers.zig`.
+
+Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
+the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
+`f06_tardigrade.conf`), and runs the probe engine in
+`tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
+results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials are
+synthetic and local-only; no production secrets or traffic were used. 92/92
+probes pass after the fix (Zig 0.16.0, macOS arm64; rerun the script for
+current evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference
 

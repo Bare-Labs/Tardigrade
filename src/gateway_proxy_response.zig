@@ -123,8 +123,9 @@ pub fn writeStreamedUpstreamResponseHeadFromHeaders(
     try writer.writeAll("Connection: close\r\n");
     if (body_allowed) try writer.writeAll("Transfer-Encoding: chunked\r\n");
     try gph.writeRequestIdHeaders(writer, correlation_id);
+    const connection_header = gph.findHeaderValueInList(upstream_headers, "connection");
     for (upstream_headers) |header| {
-        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(header.name, connection_header)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {
@@ -329,11 +330,12 @@ pub fn writeBufferedUpstreamResponseHead(
     try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     try writer.print("Content-Length: {d}\r\n", .{upstream_response.body.len});
     try gph.writeRequestIdHeaders(writer, correlation_id);
+    const connection_header = gph.findHeaderValueInList(upstream_response.headers, "connection");
     for (upstream_response.headers) |header| {
         // Defense-in-depth: skip any upstream header that should not be
         // forwarded even if parse-time filtering missed it (e.g. headers
         // populated through a code path that bypasses shouldSkipUpstreamResponseHeader).
-        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(header.name, connection_header)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {

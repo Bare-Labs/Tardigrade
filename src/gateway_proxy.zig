@@ -358,13 +358,15 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
     const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
     const reason = line_parts.rest();
 
+    const connection_header = gph.findRawHeaderValue(headers_raw, "connection");
+
     var resp_headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
     while (hdr_lines.next()) |line| {
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const hname = std.mem.trim(u8, line[0..colon], " \t");
         const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (gph.shouldSkipUpstreamResponseHeader(hname)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(hname, connection_header)) continue;
         try resp_headers.append(.{
             .name = try metadata_allocator.dupe(u8, hname),
             .value = try metadata_allocator.dupe(u8, hval),
@@ -2072,6 +2074,8 @@ fn readUpstreamHead(
     const status_code = std.fmt.parseInt(u16, sp.next() orelse "0", 10) catch 0;
     const reason = try arena.dupe(u8, sp.rest());
 
+    const connection_header = gph.findRawHeaderValue(header_block, "connection");
+
     var headers = std.array_list.Managed(UpstreamHeader).init(arena);
     var connection_close = false;
     var lines = std.mem.splitSequence(u8, header_block[@min(first_line_end + 2, header_block.len)..], "\r\n");
@@ -2085,7 +2089,7 @@ fn readUpstreamHead(
                 if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " \t"), "close")) connection_close = true;
             }
         }
-        if (gph.shouldSkipUpstreamResponseHeader(name)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(name, connection_header)) continue;
         try headers.append(.{ .name = try arena.dupe(u8, name), .value = try arena.dupe(u8, value) });
     }
     const framing = detectResponseFraming(header_block, method);

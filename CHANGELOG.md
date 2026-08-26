@@ -4,6 +4,19 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Upstream response `Connection` header could smuggle a header past hop-by-hop
+  stripping (#673)** — a malicious or misbehaving upstream sending
+  `Connection: X-Foo` alongside `X-Foo: ...` could ride `X-Foo` past the static
+  response hop-by-hop list straight through to the client. The request
+  direction already stripped headers nominated by the client's `Connection`
+  header (RFC 7230 §6.1); the response direction did not apply the same rule
+  to the upstream's own `Connection` header. Found by a live black-box F-06
+  auth/framing campaign (`scripts/run-f06-auth-framing-campaign.sh`) against a
+  real local edge with a deliberately hostile upstream. Fixed in
+  `shouldSkipUpstreamResponseHeader()` (`src/gateway_proxy_headers.zig`) at
+  all five upstream-response header-forwarding call sites.
+
 ## [0.6.2] - 2026-08-25
 
 ### Fixed
