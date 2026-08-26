@@ -48,6 +48,13 @@ RESEARCH*
 # Local benchmark baselines (laptop-fallback runs, not canonical)
 benchmarks/results/baseline-pre-change/
 
+# benchmarks/competitive/run.sh's transient default --out-dir (one
+# timestamped directory of raw per-pass output per invocation). This is NOT
+# the same tree as benchmarks/results/, which is the repo's existing durable
+# dated-results archive (see benchmarks/results/2026-*/ for precedent) —
+# reports/combined artifacts worth keeping belong there, committed normally.
+benchmarks/competitive/results/
+
 # Deployment symlink
 suite/
 blink/

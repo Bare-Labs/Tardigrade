@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_SH="${SCRIPT_DIR}/run.sh"
+REMOTE_RUN_SH="${SCRIPT_DIR}/remote-run.sh"
 COMPETITIVE_DIR="${SCRIPT_DIR}/competitive"
 COMPETITIVE_RUN_SH="${COMPETITIVE_DIR}/run.sh"
 NETEM_SH="${COMPETITIVE_DIR}/netem-impair.sh"
@@ -187,9 +188,16 @@ echo "==> Test 2c: --runs > 1 aggregates each run's scenario-local quic delta in
     RESULTS_JSON='{}'
     declare -A _run_quic_list=()
     declare -A _run_rps_list=()
+    declare -A _run_p50_list=()
+    declare -A _run_p95_list=()
     declare -A _run_p99_list=()
+    declare -A _run_p999_list=()
     declare -A _run_errors_list=()
-    eval "$(source_functions "$RUN_SH" _stats_from_space_list attach_quic_transport_state flush_multirun_result)"
+    declare -A _run_mbps_list=()
+    declare -A _run_cpu_list=()
+    declare -A _run_rss_list=()
+    declare -A _run_fds_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list _max_from_space_list attach_quic_transport_state flush_multirun_result)"
 
     _run_rps_list[static-http3]='100 110 '
     _run_p99_list[static-http3]='5 6 '
@@ -563,9 +571,16 @@ echo "==> Test 17: multi-run scenario accounting distinguishes attempted runs fr
     RESULTS_JSON='{}'
     declare -A _run_quic_list=()
     declare -A _run_rps_list=()
+    declare -A _run_p50_list=()
+    declare -A _run_p95_list=()
     declare -A _run_p99_list=()
+    declare -A _run_p999_list=()
     declare -A _run_errors_list=()
-    eval "$(source_functions "$RUN_SH" _stats_from_space_list attach_quic_transport_state flush_multirun_result)"
+    declare -A _run_mbps_list=()
+    declare -A _run_cpu_list=()
+    declare -A _run_rss_list=()
+    declare -A _run_fds_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list _max_from_space_list attach_quic_transport_state flush_multirun_result)"
     _run_rps_list[static-http3]='100 110 '
     _run_p99_list[static-http3]='5 6 '
     _run_errors_list[static-http3]='0 0 '
@@ -745,6 +760,189 @@ check "validation doc does not document nonexistent netem apply/clear subcommand
     "$(printf '%s' "$VALIDATION_TEXT" | grep -Ec 'netem-impair\\.sh (apply|clear)')" "0"
 check "validation doc uses numeric netem percentages without literal percent signs" \
     "--loss 1 --reorder 2 --delay 20" "$VALIDATION_TEXT"
+
+echo ""
+echo "==> Test 24: --runs > 1 aggregates rps/p50/p95/p99/p999/throughput/CPU/RSS/FDs correctly, excludes null samples instead of coercing them to 0 (#668 review)"
+(
+    # shellcheck disable=SC2034 # read by flush_multirun_result, sourced via eval below — shellcheck can't see across that
+    RUNS=3
+    RESULTS_JSON='{}'
+    declare -A _run_quic_list=()
+    declare -A _run_rps_list=()
+    declare -A _run_p50_list=()
+    declare -A _run_p95_list=()
+    declare -A _run_p99_list=()
+    declare -A _run_p999_list=()
+    declare -A _run_errors_list=()
+    declare -A _run_mbps_list=()
+    declare -A _run_cpu_list=()
+    declare -A _run_rss_list=()
+    declare -A _run_fds_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list _max_from_space_list attach_quic_transport_state flush_multirun_result)"
+
+    # Third run's p50 sample is "null" (that run produced no usable p50, e.g.
+    # a scenario that failed to parse latency for one pass) — everything else
+    # has three real samples. A coercion bug would average in a phantom 0.0
+    # and drag the p50 mean down to 0.733 instead of excluding it.
+    _run_rps_list[static-http1]='100 110 105 '
+    _run_p50_list[static-http1]='1.0 1.2 null '
+    _run_p95_list[static-http1]='2.0 2.2 2.1 '
+    _run_p99_list[static-http1]='5 6 5.5 '
+    _run_p999_list[static-http1]='10 11 10.5 '
+    _run_errors_list[static-http1]='0 2 1 '
+    _run_mbps_list[static-http1]='1.5 1.6 1.55 '
+    _run_cpu_list[static-http1]='50 55 52 '
+    _run_rss_list[static-http1]='10 12 11 '
+    _run_fds_list[static-http1]='40 45 42 '
+
+    flush_multirun_result "static-http1"
+    echo "$RESULTS_JSON" > /tmp/tardi-multirun-metrics-test.json
+)
+MULTIRUN_METRICS_JSON="$(jq . /tmp/tardi-multirun-metrics-test.json)"
+check "rps mean is computed across all 3 runs (105.0)" \
+    '"rps": 105' "$MULTIRUN_METRICS_JSON"
+check "p50 excludes the null sample instead of coercing it to 0 (mean of 1.0/1.2 = 1.1, not 0.733)" \
+    '"p50_ms": 1.1' "$MULTIRUN_METRICS_JSON"
+check_not "p50 is not silently dropped from multi-run output" \
+    '"p50_ms": null' "$MULTIRUN_METRICS_JSON"
+check "p95 survives --runs > 1 aggregation (mean 2.1)" \
+    '"p95_ms": 2.1' "$MULTIRUN_METRICS_JSON"
+check "p999 survives --runs > 1 aggregation (mean 10.5)" \
+    '"p999_ms": 10.5' "$MULTIRUN_METRICS_JSON"
+check "throughput_mbps survives --runs > 1 aggregation, not dropped (mean 1.55)" \
+    '"throughput_mbps": 1.55' "$MULTIRUN_METRICS_JSON"
+check "cpu_pct_avg survives --runs > 1 aggregation, not dropped (mean 52.333)" \
+    '"cpu_pct_avg": 52.333' "$MULTIRUN_METRICS_JSON"
+check "rss_mb_peak uses the run-to-run maximum (12), not a mean or the last sample" \
+    '"rss_mb_peak": 12' "$MULTIRUN_METRICS_JSON"
+check "open_fds_peak uses the run-to-run maximum (45), not a mean or the last sample" \
+    '"open_fds_peak": 45' "$MULTIRUN_METRICS_JSON"
+check "errors sums across all runs (0+2+1=3), not just the last run" \
+    '"errors": 3' "$MULTIRUN_METRICS_JSON"
+rm -f /tmp/tardi-multirun-metrics-test.json
+
+echo ""
+echo "==> Test 25: remote-run.sh's documented --remote flag is actually parsed, not an unknown option (PR #681 review)"
+# --help exits inside the arg-parsing loop before any SSH connectivity check
+# runs, so this is a side-effect-free way to prove --remote doesn't hit the
+# "Unknown option" branch — it must be consumed (and its value shifted away)
+# before --help is reached.
+REMOTE_FLAG_OUTPUT="$("$REMOTE_RUN_SH" --remote some-other-host --help 2>&1)"
+check_not "--remote is a recognized option, not rejected as unknown" \
+    "Unknown option: --remote" "$REMOTE_FLAG_OUTPUT"
+check "--remote --help still prints usage (proves the flag's value was consumed, not left for --help to misparse)" \
+    "Usage" "$REMOTE_FLAG_OUTPUT"
+
+echo ""
+echo "==> Test 26: _remote_wrk_error_count sums Non-2xx and Socket errors, not just Non-2xx (PR #681 round-2 review)"
+REMOTE_ERROR_FNS="$(source_functions "$REMOTE_RUN_SH" _remote_wrk_error_count)"
+SOCKET_ERRORS_ONLY="$(printf '%s\n' 'Running 15s test' 'Requests/sec: 1000.00' 'Socket errors: connect 0, read 3, write 0, timeout 0' | bash -c "
+${REMOTE_ERROR_FNS}
+_remote_wrk_error_count
+")"
+check "Socket errors alone (read 3) are counted, not ignored" \
+    "3" "$SOCKET_ERRORS_ONLY"
+COMBINED_ERRORS="$(printf '%s\n' 'Non-2xx or 3xx responses: 2' 'Socket errors: connect 0, read 5, write 0, timeout 1' | bash -c "
+${REMOTE_ERROR_FNS}
+_remote_wrk_error_count
+")"
+check "Non-2xx (2) and Socket errors (5+1=6) are summed together (8), not just Non-2xx alone" \
+    "8" "$COMBINED_ERRORS"
+
+echo ""
+echo "==> Test 27: run_wrk_remote fails loudly on a failed SSH/wrk execution instead of reporting a fabricated 0 (PR #681 round-2 review)"
+# run_wrk_remote calls `exit` (not `return`) on failure, terminating the
+# bash -c subshell immediately — nothing scripted *after* the call inside
+# that subshell would ever run. So the subshell's own exit status (captured
+# here via $? right after the command substitution) is the only reliable
+# failure signal; there's no way to also echo something from inside after
+# the failing call.
+REMOTE_RUNNER_FNS="$(source_functions "$REMOTE_RUN_SH" sq _remote_wrk_error_count run_wrk_remote add_result)"
+FAILED_SSH_STATUS=0
+FAILED_SSH_OUT="$(bash -c "
+set -uo pipefail
+ssh() { echo 'ssh: connect to host example: Connection refused' >&2; return 255; }
+THREADS=4; CONNECTIONS=32; DURATION=15; HOST_HEADER=''; WRK_PATH=wrk; REMOTE_HOST=example
+RESULTS_JSON='{}'
+${REMOTE_RUNNER_FNS}
+run_wrk_remote 'http://example/health' 'static-http1'
+" 2>&1)" || FAILED_SSH_STATUS=$?
+check "a failed SSH connection is reported as a failure, not silently swallowed" \
+    "remote ssh/wrk exited" "$FAILED_SSH_OUT"
+check_not "a failed SSH connection does not print a fabricated success line" \
+    "req/s" "$FAILED_SSH_OUT"
+check_not "run_wrk_remote does not exit 0 on a failed SSH connection" \
+    "status=0" "status=${FAILED_SSH_STATUS}"
+
+echo ""
+echo "==> Test 28: run_wrk_remote fails loudly on unparseable wrk output instead of reporting a fabricated 0 (PR #681 round-2 review)"
+UNPARSEABLE_STATUS=0
+UNPARSEABLE_OUT="$(bash -c "
+set -uo pipefail
+ssh() { echo 'wrk: command not found'; return 0; }
+THREADS=4; CONNECTIONS=32; DURATION=15; HOST_HEADER=''; WRK_PATH=wrk; REMOTE_HOST=example
+RESULTS_JSON='{}'
+${REMOTE_RUNNER_FNS}
+run_wrk_remote 'http://example/health' 'static-http1'
+" 2>&1)" || UNPARSEABLE_STATUS=$?
+check "wrk output with no 'Requests/sec' line (ssh exited 0, but wrk itself never ran) is reported as a failure" \
+    "could not parse wrk output" "$UNPARSEABLE_OUT"
+check_not "unparseable output does not print a fabricated success line" \
+    "req/s" "$UNPARSEABLE_OUT"
+check_not "run_wrk_remote does not exit 0 on unparseable wrk output" \
+    "status=0" "status=${UNPARSEABLE_STATUS}"
+
+echo ""
+echo "==> Test 29: write_combined_outputs preserves explicit supported:false/covered:false through actual CSV/Markdown rendering (PR #681 round-4 review)"
+# Runs the real write_combined_outputs, not a copied jq expression, so a
+# future reintroduction of the `// true`-style false-coercion bug this round
+# found and fixed would fail this test even if nothing else changed.
+FIXTURE_DIR="$(mktemp -d /tmp/tardi-competitive-render-XXXX)"
+cat > "${FIXTURE_DIR}/haproxy.json" <<'JSON'
+{
+  "_meta": {"competitive_server":"haproxy"},
+  "static-large-http1": {"supported":false,"reason":"fixture unsupported"}
+}
+JSON
+cat > "${FIXTURE_DIR}/upstream-pool-matrix.json" <<'JSON'
+{
+  "scenarios": {
+    "uneven-route-distribution": {
+      "covered": false,
+      "reason": "fixture uncovered",
+      "routes": {}
+    },
+    "many-origins-low-volume": {"measurements":[]},
+    "pool-contention": {"measurements":[]}
+  }
+}
+JSON
+(
+    # shellcheck disable=SC2034 # read by write_combined_outputs, sourced via eval below — shellcheck can't see across that
+    OUT_DIR="$FIXTURE_DIR"
+    # shellcheck disable=SC2034 # read by write_combined_outputs, sourced via eval below
+    TOOL=wrk
+    # shellcheck disable=SC2034
+    DURATION=1
+    # shellcheck disable=SC2034
+    CONNECTIONS=1
+    # shellcheck disable=SC2034
+    THREADS=1
+    # shellcheck disable=SC2329,SC2317 # called indirectly by write_combined_outputs, sourced via eval below (SC2329/SC2317 vary by shellcheck version for the same "unreachable/never invoked" finding)
+    host_metadata_json() { printf '{}'; }
+    eval "$(source_functions "$COMPETITIVE_RUN_SH" write_combined_outputs)"
+    write_combined_outputs >/dev/null
+)
+FIXTURE_CSV="$(cat "${FIXTURE_DIR}/competitive-results.csv")"
+FIXTURE_MD="$(cat "${FIXTURE_DIR}/competitive-summary.md")"
+check "server supported:false survives real CSV rendering (not reverted to true)" \
+    '"haproxy","static-large-http1",false' "$FIXTURE_CSV"
+check "upstream covered:false survives real CSV rendering (not reverted to true)" \
+    '"tardigrade","upstream-pool/uneven-route-distribution",false' "$FIXTURE_CSV"
+# shellcheck disable=SC2016 # backticks are literal Markdown code-fence syntax, not command substitution
+check "upstream covered:false survives real Markdown rendering (not reverted to true)" \
+    '| `uneven-route-distribution` | false |' "$FIXTURE_MD"
+rm -rf "$FIXTURE_DIR"
 
 echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"

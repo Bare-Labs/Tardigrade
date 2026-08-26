@@ -278,29 +278,51 @@ check_machine_idle() {
 }
 
 # ── Multi-run variance helpers ─────────────────────────────────────────────────
-# awk-based mean/stddev so jq is not required for the math.
+# awk-based mean/stddev so jq is not required for the math. Tokens equal to the
+# literal string "null" (a run that produced no usable sample for this metric)
+# are excluded from the sample rather than coerced to 0 by awk's numeric
+# context — otherwise a single failed run silently drags the mean/min down.
 _stats_from_space_list() {
     local values="$1"
     awk -v vals="$values" 'BEGIN {
         n = split(vals, a, " ")
-        if (n == 0) { print "null null null null"; exit }
+        valid = 0
         sum = 0; sum2 = 0
-        min = a[1]; max = a[1]
         for (i = 1; i <= n; i++) {
+            if (a[i] == "null" || a[i] == "") continue
+            valid++
             v = a[i] + 0
             sum += v
             sum2 += v * v
-            if (v < min) min = v
-            if (v > max) max = v
+            if (valid == 1 || v < min) min = v
+            if (valid == 1 || v > max) max = v
         }
-        mean = sum / n
-        if (n > 1) {
-            variance = (sum2 - sum * sum / n) / (n - 1)
+        if (valid == 0) { print "null null null null"; exit }
+        mean = sum / valid
+        if (valid > 1) {
+            variance = (sum2 - sum * sum / valid) / (valid - 1)
             stddev = (variance > 0) ? sqrt(variance) : 0
         } else {
             stddev = 0
         }
         printf "%.3f %.3f %.3f %.3f", mean, stddev, min, max
+    }'
+}
+
+# Max-of-space-list, "null"-safe, for peak metrics (rss/fds) where the
+# meaningful multi-run aggregate is the worst observed peak, not a mean.
+_max_from_space_list() {
+    local values="$1"
+    awk -v vals="$values" 'BEGIN {
+        n = split(vals, a, " ")
+        found = 0
+        for (i = 1; i <= n; i++) {
+            if (a[i] == "null" || a[i] == "") continue
+            v = a[i] + 0
+            if (!found || v > max) { max = v; found = 1 }
+        }
+        if (!found) { print "null"; exit }
+        printf "%.3f", max
     }'
 }
 
@@ -674,8 +696,15 @@ TOOL_HEADERS=()
 # Per-scenario run accumulators (space-separated lists, populated by add_result
 # when RUNS>1 and cleared by flush_multirun_result at the end of each scenario).
 declare -A _run_rps_list=()
+declare -A _run_p50_list=()
+declare -A _run_p95_list=()
 declare -A _run_p99_list=()
+declare -A _run_p999_list=()
 declare -A _run_errors_list=()
+declare -A _run_mbps_list=()
+declare -A _run_cpu_list=()
+declare -A _run_rss_list=()
+declare -A _run_fds_list=()
 # #256-G review: per-run scenario-local QUIC transport deltas (JSON array,
 # one element per completed run), so `--runs > 1` doesn't silently drop the
 # transport evidence every H3 result is supposed to carry. Aggregated into
@@ -687,9 +716,19 @@ add_result() {
 
     if [[ "$RUNS" -gt 1 ]]; then
         # Accumulate for this run; flush_multirun_result builds the final entry.
+        # "null"/empty samples (a metric a given run couldn't produce) are kept
+        # as literal "null" tokens — _stats_from_space_list/_max_from_space_list
+        # exclude them from the aggregate rather than treating them as 0.
         _run_rps_list["$scenario"]+="${rps} "
-        _run_p99_list["$scenario"]+="${p99_ms:-0} "
+        _run_p50_list["$scenario"]+="${p50_ms:-null} "
+        _run_p95_list["$scenario"]+="${p95_ms:-null} "
+        _run_p99_list["$scenario"]+="${p99_ms:-null} "
+        _run_p999_list["$scenario"]+="${p999_ms:-null} "
         _run_errors_list["$scenario"]+="${errors} "
+        _run_mbps_list["$scenario"]+="${mbps:-null} "
+        _run_cpu_list["$scenario"]+="${cpu_pct_avg:-null} "
+        _run_rss_list["$scenario"]+="${rss_mb_peak:-null} "
+        _run_fds_list["$scenario"]+="${open_fds_peak:-null} "
         return
     fi
 
@@ -716,21 +755,46 @@ add_result() {
 # write a single result entry enriched with variance fields.
 flush_multirun_result() {
     local scenario="$1"
-    local rps_vals p99_vals err_vals
+    local rps_vals p99_vals err_vals p50_vals p95_vals p999_vals mbps_vals cpu_vals rss_vals fds_vals
     rps_vals="${_run_rps_list[$scenario]:-}"
     p99_vals="${_run_p99_list[$scenario]:-}"
     err_vals="${_run_errors_list[$scenario]:-}"
+    p50_vals="${_run_p50_list[$scenario]:-}"
+    p95_vals="${_run_p95_list[$scenario]:-}"
+    p999_vals="${_run_p999_list[$scenario]:-}"
+    mbps_vals="${_run_mbps_list[$scenario]:-}"
+    cpu_vals="${_run_cpu_list[$scenario]:-}"
+    rss_vals="${_run_rss_list[$scenario]:-}"
+    fds_vals="${_run_fds_list[$scenario]:-}"
 
     [[ -z "$rps_vals" ]] && return
 
-    local rps_stats p99_stats
+    local rps_stats p99_stats p50_stats p95_stats p999_stats mbps_stats cpu_stats
     rps_stats=$(_stats_from_space_list "${rps_vals% }")
     p99_stats=$(_stats_from_space_list "${p99_vals% }")
+    p50_stats=$(_stats_from_space_list "${p50_vals% }")
+    p95_stats=$(_stats_from_space_list "${p95_vals% }")
+    p999_stats=$(_stats_from_space_list "${p999_vals% }")
+    mbps_stats=$(_stats_from_space_list "${mbps_vals% }")
+    cpu_stats=$(_stats_from_space_list "${cpu_vals% }")
 
     local rps_mean rps_stddev rps_min rps_max
     read -r rps_mean rps_stddev rps_min rps_max <<<"$rps_stats"
     local p99_mean p99_stddev p99_min p99_max
     read -r p99_mean p99_stddev p99_min p99_max <<<"$p99_stats"
+    local p50_mean _p50_stddev _p50_min _p50_max
+    read -r p50_mean _p50_stddev _p50_min _p50_max <<<"$p50_stats"
+    local p95_mean _p95_stddev _p95_min _p95_max
+    read -r p95_mean _p95_stddev _p95_min _p95_max <<<"$p95_stats"
+    local p999_mean _p999_stddev _p999_min _p999_max
+    read -r p999_mean _p999_stddev _p999_min _p999_max <<<"$p999_stats"
+    local mbps_mean _mbps_stddev _mbps_min _mbps_max
+    read -r mbps_mean _mbps_stddev _mbps_min _mbps_max <<<"$mbps_stats"
+    local cpu_mean _cpu_stddev _cpu_min _cpu_max
+    read -r cpu_mean _cpu_stddev _cpu_min _cpu_max <<<"$cpu_stats"
+    local rss_peak fds_peak
+    rss_peak=$(_max_from_space_list "${rss_vals% }")
+    fds_peak=$(_max_from_space_list "${fds_vals% }")
 
     local total_errors
     total_errors=$(echo "${err_vals% }" | awk '{s=0; for(i=1;i<=NF;i++) s+=$i; print s}')
@@ -740,18 +804,29 @@ flush_multirun_result() {
     RESULTS_JSON=$(jq --arg s "$scenario" \
         --argjson rps "$rps_mean" \
         --argjson rps_stddev "$rps_stddev" --argjson rps_min "$rps_min" --argjson rps_max "$rps_max" \
+        --argjson p50 "$p50_mean" --argjson p95 "$p95_mean" \
         --argjson p99 "$p99_mean" \
         --argjson p99_stddev "$p99_stddev" --argjson p99_min "$p99_min" --argjson p99_max "$p99_max" \
+        --argjson p999 "$p999_mean" \
+        --argjson mbps "$mbps_mean" --argjson cpu "$cpu_mean" \
+        --argjson rss "$rss_peak" --argjson fds "$fds_peak" \
         --argjson err "$total_errors" --argjson runs "$RUNS" \
         '.[$s] = {
             rps: $rps,
             rps_stddev: $rps_stddev,
             rps_min: $rps_min,
             rps_max: $rps_max,
+            p50_ms: $p50,
+            p95_ms: $p95,
             p99_ms: $p99,
             p99_ms_stddev: $p99_stddev,
             p99_ms_min: $p99_min,
             p99_ms_max: $p99_max,
+            p999_ms: $p999,
+            throughput_mbps: $mbps,
+            cpu_pct_avg: $cpu,
+            rss_mb_peak: $rss,
+            open_fds_peak: $fds,
             errors: $err,
             runs: $runs
         }' \
@@ -811,8 +886,15 @@ flush_multirun_result() {
     fi
 
     unset "_run_rps_list[$scenario]"
+    unset "_run_p50_list[$scenario]"
+    unset "_run_p95_list[$scenario]"
     unset "_run_p99_list[$scenario]"
+    unset "_run_p999_list[$scenario]"
     unset "_run_errors_list[$scenario]"
+    unset "_run_mbps_list[$scenario]"
+    unset "_run_cpu_list[$scenario]"
+    unset "_run_rss_list[$scenario]"
+    unset "_run_fds_list[$scenario]"
 }
 
 build_tool_headers() {
@@ -1330,18 +1412,28 @@ run_k6_scenario() {
     local script="$1" label="$2"
     shift 2
     local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXXXX)
+    local errfile; errfile=$(mktemp /tmp/k6-stderr-XXXXXX)
     local extra_flags=()
     $INSECURE && extra_flags+=(--insecure-skip-tls-verify)
 
     start_process_monitor
+    local k6_status=0
     BASE_URL="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}" \
         K6_HOST_HEADER="$HOST_HEADER" \
         k6 run --no-color --quiet \
             --summary-export "$tmpfile" \
             ${extra_flags[@]+"${extra_flags[@]}"} \
             "$@" \
-            "$(dirname "$0")/scenarios/${script}.js" 2>/dev/null || true
+            "$(dirname "$0")/scenarios/${script}.js" 2>"$errfile" || k6_status=$?
     stop_process_monitor
+
+    if [[ $k6_status -ne 0 ]]; then
+        echo "  ${label}: k6 exited ${k6_status}, no valid result — not reporting a fabricated 0" >&2
+        cat "$errfile" >&2
+        rm -f "$tmpfile" "$errfile"
+        return 1
+    fi
+    rm -f "$errfile"
 
     _k6_parse_summary "$tmpfile" "$label"
     rm -f "$tmpfile"
@@ -1517,7 +1609,7 @@ scenario_keepalive_starvation() {
         -e "IDLE_VUS=${KEEPALIVE_STARVATION_IDLE_VUS:-20}" \
         -e "ACTIVE_VUS=${KEEPALIVE_STARVATION_ACTIVE_VUS:-10}" \
         -e "IDLE_SLEEP_S=${KEEPALIVE_STARVATION_IDLE_SLEEP_S:-10}" \
-        -e "K6_DURATION=${DURATION}s"
+        -e "SCENARIO_DURATION=${DURATION}s"
 }
 
 scenario_proxy_payload_64k() {

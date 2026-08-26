@@ -81,9 +81,14 @@ fi
 cmd+=("${RUN_ARGS[@]}")
 "${cmd[@]}"
 
-"${BENCH_DIR}/report.sh" "${SAVE_FILE}" > "${REPORT_FILE}"
+report_args=("${SAVE_FILE}")
+if [[ -n "${BASELINE_FILE}" ]]; then
+    report_args+=(--compare "${BASELINE_FILE}")
+fi
+
+"${BENCH_DIR}/report.sh" "${report_args[@]}" > "${REPORT_FILE}"
 echo "Wrote report: ${REPORT_FILE}"
 
 if [[ -n "${README_FILE}" ]]; then
-    "${BENCH_DIR}/report.sh" "${SAVE_FILE}" --update-readme "${README_FILE}"
+    "${BENCH_DIR}/report.sh" "${report_args[@]}" --update-readme "${README_FILE}"
 fi

@@ -42,6 +42,20 @@
 
 set -euo pipefail
 
+# POSIX single-quote escaping for safe embedding of an arbitrary value into a
+# remote shell command string built as text and handed to `ssh`. Values like
+# --wrk-path, --host-header, and the target URL are spliced unquoted into
+# that string below; without this, a value containing a single quote breaks
+# out of the intended quoting on the remote host.
+sq() {
+    local s=$1
+    local q="'"
+    local esc="'\\''"
+    printf '%s' "$q"
+    printf '%s' "${s//$q/$esc}"
+    printf '%s' "$q"
+}
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 TARGET_HOST="127.0.0.1"
 TARGET_PORT="8069"
@@ -82,10 +96,29 @@ while [[ $# -gt 0 ]]; do
         --threshold)      REGRESSION_THRESHOLD="$2";  shift 2 ;;
         --wrk-path)       WRK_PATH="$2";              shift 2 ;;
         --meta-file)      META_FILE="$2";             shift 2 ;;
-        --help)           sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
+        --remote)         REMOTE_HOST="$2";           shift 2 ;;
+        # `head -n -1` is a GNU extension BSD/macOS head doesn't support;
+        # `sed '$d'` (drop the last line) is the portable equivalent.
+        --help)           sed -n '/^# Usage/,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# THREADS/CONNECTIONS/DURATION are interpolated unquoted into the remote SSH
+# command string below (as wrk's -t/-c/-d flags), unlike the sq()-quoted
+# path/URL/header values — a non-numeric value here would let its contents
+# execute as shell on the remote host. Reject anything that isn't a positive
+# integer before it ever reaches that string.
+require_positive_int() {
+    local name="$1" value="$2"
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Invalid --${name}: '${value}' (must be a positive integer)" >&2
+        exit 1
+    fi
+}
+require_positive_int "threads" "$THREADS"
+require_positive_int "connections" "$CONNECTIONS"
+require_positive_int "duration" "$DURATION"
 
 BASE_URL="http://${TARGET_HOST}:${TARGET_PORT}"
 
@@ -97,14 +130,16 @@ if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" true 2>/dev/null; t
 fi
 
 echo "Verifying wrk at ${WRK_PATH} on ${REMOTE_HOST}..."
-if ! ssh "$REMOTE_HOST" "test -x ${WRK_PATH}" 2>/dev/null; then
+# shellcheck disable=SC2029 # sq() is meant to expand client-side, quoting the value for the remote shell
+if ! ssh "$REMOTE_HOST" "test -x $(sq "$WRK_PATH")" 2>/dev/null; then
     echo "wrk not found or not executable at ${WRK_PATH} on ${REMOTE_HOST}." >&2
     echo "Build it with: ssh ${REMOTE_HOST} 'cd ~/tools/wrk && make'" >&2
     exit 1
 fi
 
 echo "Verifying target ${BASE_URL}/health from ${REMOTE_HOST}..."
-if ! ssh "$REMOTE_HOST" "curl -sf --max-time 5 '${BASE_URL}/health' >/dev/null" 2>/dev/null; then
+# shellcheck disable=SC2029 # sq() is meant to expand client-side, quoting the value for the remote shell
+if ! ssh "$REMOTE_HOST" "curl -sf --max-time 5 $(sq "${BASE_URL}/health") >/dev/null" 2>/dev/null; then
     echo "Target ${BASE_URL}/health did not respond from ${REMOTE_HOST}." >&2
     exit 1
 fi
@@ -120,24 +155,61 @@ add_result() {
 }
 
 # ── wrk runner (executes on remote host via SSH) ─────────────────────────────
+# wrk's combined error count: HTTP-level Non-2xx responses plus transport-
+# level Socket errors (connect/read/write/timeout). Counting only Non-2xx
+# (as this function used to) misses every connection-level failure — the
+# same class of gap #668 fixed in benchmarks/run.sh's wrk_error_count.
+_remote_wrk_error_count() {
+    awk '
+        /Non-2xx/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        /Socket errors:/ {
+            for (i = 1; i <= NF; i++) {
+                gsub(/,/, "", $i)
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        END { print total + 0 }
+    '
+}
+
 run_wrk_remote() {
     local url="$1" label="$2"
     local header_flags=""
     if [[ -n "$HOST_HEADER" ]]; then
-        header_flags="-H 'Host: ${HOST_HEADER}'"
+        header_flags="-H $(sq "Host: ${HOST_HEADER}")"
     fi
 
-    local raw
+    local raw ssh_status=0
+    # shellcheck disable=SC2029 # sq() is meant to expand client-side, quoting each value for the remote shell
     raw=$(ssh "$REMOTE_HOST" \
-        "${WRK_PATH} -t${THREADS} -c${CONNECTIONS} -d${DURATION}s -L ${header_flags} '${url}'" \
-        2>&1) || true
+        "$(sq "$WRK_PATH") -t${THREADS} -c${CONNECTIONS} -d${DURATION}s -L ${header_flags} $(sq "$url")" \
+        2>&1) || ssh_status=$?
+
+    if [[ $ssh_status -ne 0 ]]; then
+        echo "  ${label}: remote ssh/wrk exited ${ssh_status}, no valid result — not reporting a fabricated 0" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
 
     local rps p50 p99 errors
-    rps=$(echo "$raw" | grep -E "Requests/sec" | awk '{print $2}' | tr -d ',' || echo 0)
-    p50=$(echo "$raw" | awk '/50%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0}' || echo 0)
-    p99=$(echo "$raw" | awk '/99%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0}' || echo 0)
-    errors=$(echo "$raw" | grep -E "Non-2xx" | grep -oE '[0-9]+' | head -1 || echo 0)
-    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    rps=$(echo "$raw" | grep -E "Requests/sec" | awk '{print $2}' | tr -d ',')
+    if [[ -z "$rps" ]]; then
+        echo "  ${label}: could not parse wrk output (ssh succeeded but no 'Requests/sec' line), no valid result — not reporting a fabricated 0" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
+    # wrk prints latency with a ms/us/s suffix depending on magnitude (e.g.
+    # "1.11s" for anything >= 1 second, exactly the slow-client/overload
+    # scenarios this metric matters most for). ms/us must be checked before
+    # the bare "s" suffix since both also end in "s".
+    p50=$(echo "$raw" | awk '/50%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}')
+    p99=$(echo "$raw" | awk '/99%/{v=$2; if(v~/ms$/){sub(/ms$/,"",v)}else if(v~/us$/){sub(/us$/,"",v);v=v/1000}else if(v~/s$/){sub(/s$/,"",v);v=v*1000}; print v+0}')
+    errors=$(printf '%s\n' "$raw" | _remote_wrk_error_count)
+    p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
     echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
     add_result "$label" "$rps" "$p50" "$p99" "$errors"
 }
