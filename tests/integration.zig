@@ -16861,6 +16861,68 @@ test "idle keepalive connections parked off the worker pool do not starve active
     }
 }
 
+test "max_requests_per_connection sends Connection: close on the response that hits the limit (#682)" {
+    // Before the fix, the server picked keep_alive purely from the request's
+    // own Connection header/version, so the response that tripped
+    // max_requests_per_connection still went out with `Connection: keep-alive`
+    // even though the caller was about to close the socket right after. The
+    // client would then reuse the connection and lose its next request
+    // (RemoteDisconnected) instead of seeing a standard `Connection: close`.
+    const allocator = std.testing.allocator;
+
+    var fixture = try GenericFixtureDir.create(allocator, "max-requests-per-connection");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "ok\n");
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    const max_requests = 3;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_MAX_REQUESTS_PER_CONNECTION", .value = "3" },
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    for (0..max_requests) |i| {
+        try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/index.html");
+        var resp = try readHttpResponse(allocator, stream);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+
+        const connection_header = resp.header("connection") orelse "";
+        if (i + 1 < max_requests) {
+            try std.testing.expect(std.ascii.eqlIgnoreCase(connection_header, "keep-alive"));
+        } else {
+            // This is the max_requests_per_connection-th response: the server
+            // is about to close the physical connection, so it must say so.
+            try std.testing.expect(std.ascii.eqlIgnoreCase(connection_header, "close"));
+        }
+    }
+
+    // The server closed after the limiting response — the client sees a clean
+    // EOF on a further read rather than the connection silently swallowing
+    // the next request. Do not swallow read errors here: a stalled or reset
+    // connection must fail this assertion, not be mistaken for a clean FIN.
+    var probe: [1]u8 = undefined;
+    const n = try stream.read(&probe);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
 // ---------------------------------------------------------------------------
 // Failure-mode / chaos harness (#169)
 //
