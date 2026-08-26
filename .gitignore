@@ -48,11 +48,12 @@ RESEARCH*
 # Local benchmark baselines (laptop-fallback runs, not canonical)
 benchmarks/results/baseline-pre-change/
 
-# Benchmark run output — large raw artifacts, not meant to live in git.
-# Summarize findings in the PR/issue instead of committing this tree.
-# (Individual report/combined-result files can still be force-added when a
-# run's findings are worth keeping — see benchmarks/results/2026-08-25-*/.)
-benchmarks/results/
+# benchmarks/competitive/run.sh's transient default --out-dir (one
+# timestamped directory of raw per-pass output per invocation). This is NOT
+# the same tree as benchmarks/results/, which is the repo's existing durable
+# dated-results archive (see benchmarks/results/2026-*/ for precedent) —
+# reports/combined artifacts worth keeping belong there, committed normally.
+benchmarks/competitive/results/
 
 # Deployment symlink
 suite/
