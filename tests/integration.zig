@@ -16324,9 +16324,10 @@ test "max_requests_per_connection sends Connection: close on the response that h
 
     // The server closed after the limiting response — the client sees a clean
     // EOF on a further read rather than the connection silently swallowing
-    // the next request.
+    // the next request. Do not swallow read errors here: a stalled or reset
+    // connection must fail this assertion, not be mistaken for a clean FIN.
     var probe: [1]u8 = undefined;
-    const n = stream.read(&probe) catch 0;
+    const n = try stream.read(&probe);
     try std.testing.expectEqual(@as(usize, 0), n);
 }
 
