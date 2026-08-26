@@ -682,7 +682,7 @@ is_allowed_metadata_dependency_statement() {
             case "$token" in
             '&&' | ';' | '|' | '||') break ;;
             -*) continue ;;
-            ca-certificates | curl | xz-utils | rpm)
+            ca-certificates | curl | xz-utils | rpm | file | binutils)
                 seen_package=true
                 ;;
             *)

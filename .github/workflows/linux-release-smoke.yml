@@ -1,0 +1,122 @@
+name: Linux Release Smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-release-smoke.yml"
+      - ".github/workflows/release.yml"
+      - "build.zig"
+      - "build.zig.zon"
+      - "src/**"
+      - "scripts/install-zig.sh"
+      - "scripts/verify-linux-compatibility.sh"
+      - "scripts/audit-release-binary.sh"
+      - "scripts/package-release-archive.sh"
+      - "packaging/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to verify
+        required: true
+        default: v0.6.2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-release-smoke:
+    name: Linux release smoke (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - archive_name: tardigrade-linux-x86_64
+            zig_target: x86_64-linux-gnu.2.28
+            distro: ubuntu:22.04
+          - archive_name: tardigrade-linux-x86_64
+            zig_target: x86_64-linux-gnu.2.28
+            distro: rockylinux:9
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        if: github.event_name == 'pull_request'
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Print Zig version
+        if: github.event_name == 'pull_request'
+        run: zig version
+
+      - name: Build native release binary
+        if: github.event_name == 'pull_request'
+        env:
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcpu=baseline "-Dtarget=$ZIG_TARGET" -Dversion=0.0.0-ci-smoke
+
+      - name: Audit native release binary linkage
+        if: github.event_name == 'pull_request'
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardi \
+            --profile general \
+            --output "$RUNNER_TEMP/dependency-inventory-${{ matrix.archive_name }}.json"
+
+      - name: Package artifact
+        if: github.event_name == 'pull_request'
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          ./scripts/package-release-archive.sh \
+            --archive-name "$ARCHIVE_NAME" \
+            --binary zig-out/bin/tardi \
+            --staging-dir dist \
+            --output-dir "$RUNNER_TEMP/release-artifacts"
+
+      - name: Setup PR expected version
+        if: github.event_name == 'pull_request'
+        run: echo "EXPECTED_VERSION=0.0.0-ci-smoke" >> "$GITHUB_ENV"
+
+      - name: Resolve published release identity
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          release_sha="$(git rev-list -n 1 "$TAG")"
+          expected_version="${TAG#v}"
+          printf 'published_tag=%s\n' "$TAG"
+          printf 'expected_version=%s\n' "$expected_version"
+          printf 'source_commit_sha=%s\n' "$release_sha"
+          printf 'EXPECTED_VERSION=%s\n' "$expected_version" >> "$GITHUB_ENV"
+
+      - name: Download published release asset
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-artifacts"
+          gh release download "$TAG" -p "${ARCHIVE_NAME}.tar.gz" -D "$RUNNER_TEMP/release-artifacts"
+
+      - name: Verify compatibility on ${{ matrix.distro }}
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          ./scripts/verify-linux-compatibility.sh \
+            "$DISTRO" \
+            "$RUNNER_TEMP/release-artifacts/$ARCHIVE_NAME.tar.gz" \
+            "$EXPECTED_VERSION"
