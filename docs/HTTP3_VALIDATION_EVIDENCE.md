@@ -55,6 +55,14 @@ NGTCP2_EXAMPLES_DIR=/path/to/ngtcp2/build/examples \
   scripts/interop/run-interop.sh
 ```
 
+For the #677 release-artifact HTTP/2 + HTTP/3 sweep, run the selected native
+artifact through the reusable wrapper added for the post-#680 closeout pass:
+
+```bash
+TARDI_BIN=/path/to/installed-or-release-candidate/tardi \
+  scripts/run-http-release-sweep.sh
+```
+
 PR-safe evidence may record `"supported": false` H3 benchmark rows when the
 local `h2load` is not genuinely QUIC-capable. That proves the harness rejects a
 false-positive client; it is not final performance evidence.

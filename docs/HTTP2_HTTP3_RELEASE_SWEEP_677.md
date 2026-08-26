@@ -47,6 +47,32 @@ Observed identity:
 - file type: `Mach-O 64-bit executable arm64`
 - size: `4.6M`
 
+## Repeatable Release-Artifact Sweep Path
+
+this PR adds a reusable sweep entrypoint that can target an installed or
+release-candidate binary directly:
+
+```sh
+TARDI_BIN="$(command -v tardi)" \
+  scripts/run-http-release-sweep.sh
+```
+
+For local ReleaseFast fallback validation when no installed package is
+available:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dversion=issue-677-release-sweep
+TARDI_BIN="$PWD/zig-out/bin/tardi" \
+  scripts/run-http-release-sweep.sh
+```
+
+The script records `tardi version`, the source SHA, executable path, SHA-256,
+OS/architecture, Zig, curl, nghttp, h2load, OpenSSL, GnuTLS, and configured H3
+peer paths into `.zig-cache/http-release-sweep-677/metadata.txt`, then runs
+the focused H2/H3 deterministic rows with `-Dtardigrade-bin-path` so
+integration tests exercise the selected artifact instead of silently using the
+freshly built debug binary.
+
 ## Passed Local Gates
 
 ```sh
@@ -455,14 +481,15 @@ the example targets. That produced:
 
 This workaround was local to `/tmp` and is not a Tardigrade product change.
 
-## Failed Local Gate
+## Historical Full Integration Gate Attempt
 
 ```sh
 zig build test-integration --summary all --error-style verbose
 ```
 
-Result: failed. Build summary reported `6/8 steps succeeded`; the integration
-test binary reported `160 pass, 19 skip, 3 fail (182 total)`.
+Historical result from the early #680 evidence pass: failed. Build summary
+reported `6/8 steps succeeded`; the integration test binary reported
+`160 pass, 19 skip, 3 fail (182 total)`.
 
 Failing tests:
 
@@ -486,11 +513,52 @@ A focused rerun was attempted with:
 zig build test-integration -- --test-filter bearclaw
 ```
 
-That invocation produced no output for several minutes and was interrupted.
-The full integration failure above is the actionable evidence for this slice;
-a follow-up should isolate the curl stderr/stdout for the three Bearclaw HTTPS
-cases and decide whether the failure is environment-specific, test flakiness,
-or a product regression.
+That invocation produced no output for several minutes and was interrupted in
+the early pass.
+
+Current status after merged PR #680: these Bearclaw HTTPS failures were fixed
+by replacing the fragile curl/OpenSSL probe path with SNI-aware pure-Zig TLS
+requests and by correcting the Bearclaw fixture/mocking setup. The final #680
+validation reported:
+
+```sh
+zig build test-integration --summary all --error-style verbose
+```
+
+Result: passed. The stale failure above is retained only as historical
+diagnostic context; it is not an outstanding #677 product defect.
+
+## Additional Malformed H2 Coverage From This PR
+
+this PR extends the downstream H2 frame loop and integration tests with direct
+failure-scope assertions for malformed rows that were still only partially
+covered:
+
+- SETTINGS ACK carrying a payload now returns connection-scope `GOAWAY` with
+  `FRAME_SIZE_ERROR`.
+- invalid SETTINGS payload length now returns connection-scope `GOAWAY` with
+  `FRAME_SIZE_ERROR`.
+- connection-level WINDOW_UPDATE increment zero now returns connection-scope
+  `GOAWAY` with `FLOW_CONTROL_ERROR`.
+- stream-level WINDOW_UPDATE increment zero now returns stream-scope
+  `RST_STREAM` with `FLOW_CONTROL_ERROR`, and a later unrelated stream on the
+  same connection remains usable.
+- HEADERS on stream 0 now returns connection-scope `GOAWAY` with
+  `PROTOCOL_ERROR`.
+- stray CONTINUATION and DATA interleaved while CONTINUATION is required now
+  return connection-scope `GOAWAY` with `PROTOCOL_ERROR`.
+- malformed/truncated HPACK integer encoding now returns connection-scope
+  `GOAWAY` with `COMPRESSION_ERROR`.
+
+Validation:
+
+```sh
+zig build test-integration -Dintegration-test-filter='interop.h2.' \
+  --summary all --error-style verbose
+```
+
+Result on 2026-08-25: passed. Build summary reported `8/8 steps succeeded;
+27/27 tests passed`.
 
 ## Independent H2 Client Attempts
 
@@ -523,7 +591,8 @@ Covered by this slice:
 - TLS interop CI profile passed with OpenSSL/GnuTLS record rows, an explicit
   OpenSSL `h2` ALPN entrypoint, and QUIC loopback `h3` tuples
 - OpenSSL H2 external-client rows passed
-- HTTP/2 malformed/proxy/flow-control filtered integration rows passed
+- HTTP/2 malformed/proxy/flow-control filtered integration rows passed,
+  including this PR's failure-scope rows listed above
 - ReleaseFast HTTP/2 malformed/proxy/flow-control filtered integration rows
   passed
 - native upstream H2 best-effort proxied request row passed
@@ -542,14 +611,19 @@ Covered by this slice:
 - production `h3interop.quic.*` rows passed with the ngtcp2/GnuTLS client
 - resumption/restart/rotation/soak filtered integration rows passed 49/49 with
   the ngtcp2/GnuTLS client wired in
-- required `zig build test-integration` gate was run and produced concrete
-  failures for triage
+- required `zig build test-integration` gate passed in final #680 validation;
+  the earlier Bearclaw failures are historical and fixed
 
 Not covered by this slice:
 
-- release artifact identity from an installed/release candidate `tardi`
+- execution against an actual installed/Homebrew release-candidate `tardi`
+  artifact; the repeatable `TARDI_BIN=... scripts/run-http-release-sweep.sh`
+  path exists, and local ReleaseFast fallback validation is acceptable only
+  when no installed candidate is available
 - independent HTTP/2 TLS/ALPN/application exchange using `nghttp` specifically
-- HTTP/2 malformed frame and HPACK failure-scope matrix
+- malformed/truncated H2 frame-header and declared-payload-shorter-than-frame
+  rows where the peer cannot send a complete frame; these are currently
+  connection-close/read-boundary cases rather than GOAWAY-proven protocol rows
 - browser protocol attempts
 - real external HTTP/3 peer proof with quiche or aioquic
 - H3 Alt-Svc proof against a usable advertised endpoint
