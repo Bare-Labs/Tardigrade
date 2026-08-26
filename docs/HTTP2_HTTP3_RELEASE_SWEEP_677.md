@@ -556,6 +556,9 @@ covered:
 - valid fragmented HEADERS/CONTINUATION blocks are buffered, decoded once
   `END_HEADERS` arrives, and dispatched only after the complete field section
   is available.
+- over-limit encoded HEADERS/CONTINUATION accumulation resets only the
+  offending stream and leaves a later unrelated stream on the same connection
+  usable.
 - malformed/truncated HPACK integer encoding now returns connection-scope
   `GOAWAY` with `COMPRESSION_ERROR`.
 
@@ -567,7 +570,7 @@ zig build test-integration -Dintegration-test-filter='interop.h2.' \
 ```
 
 Result on 2026-08-25: passed. Build summary reported `8/8 steps succeeded;
-29/29 tests passed`.
+30/30 tests passed`.
 
 ## Independent H2 Client Attempts
 

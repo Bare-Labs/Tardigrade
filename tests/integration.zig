@@ -5421,11 +5421,14 @@ test "interop.h2.window_update_zero_increment_connection_goaway_and_stream_rst" 
         };
         const request_block = try hpack.encodeLiteralHeaderBlock(allocator, headers[0..]);
         defer allocator.free(request_block);
-        try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, request_block);
+        try client.writeHttp2Frame(0x1, 0x4, 1, request_block); // END_HEADERS only; body never completes before reset
 
         var inc_zero: [4]u8 = .{ 0, 0, 0, 0 };
         try client.writeHttp2Frame(0x8, 0, 1, inc_zero[0..]);
         try expectH2RstStream(client, allocator, 1, 0x1); // PROTOCOL_ERROR
+
+        try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, request_block);
+        try expectH2RstStream(client, allocator, 1, 0x5); // STREAM_CLOSED
 
         const headers3 = [_]hpack.HeaderField{
             .{ .name = ":method", .value = "GET" },
@@ -5456,6 +5459,8 @@ test "interop.h2.window_update_zero_increment_connection_goaway_and_stream_rst" 
         }
         try std.testing.expect(done);
         try assertContains(body.items, "zero-window-stream-ok");
+        try waitForUpstreamCount(&upstream, 1, 2_000);
+        try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
     }
 }
 
@@ -5659,6 +5664,94 @@ test "interop.h2.valid_headers_continuation_block_dispatches_after_end_headers" 
     }
     try std.testing.expect(done);
     try assertContains(body.items, "fragmented-h2-headers-ok");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
+test "interop.h2.continuation_header_block_limit_resets_stream_without_dispatch" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "continuation-limit-stream3-ok", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-continuation-limit {{
+        \\    proxy_pass http://{s}:{d}/h2-continuation-limit;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_MAX_HEADERS_TOTAL_SIZE", .value = "128" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    const first_fragment = [_]u8{0x82}; // indexed :method GET; intentionally incomplete field section
+    try client.writeHttp2Frame(0x1, 0x1, 1, first_fragment[0..]); // END_STREAM, no END_HEADERS
+
+    const continuation_fragment = try allocator.alloc(u8, 64);
+    defer allocator.free(continuation_fragment);
+    @memset(continuation_fragment, 0);
+    try client.writeHttp2Frame(0x9, 0, 1, continuation_fragment);
+    try client.writeHttp2Frame(0x9, 0, 1, continuation_fragment);
+    try expectH2RstStream(client, allocator, 1, 0xb); // ENHANCE_YOUR_CALM
+
+    const headers3 = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-continuation-limit" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const request_block3 = try hpack.encodeLiteralHeaderBlock(allocator, headers3[0..]);
+    defer allocator.free(request_block3);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 3, request_block3);
+
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    var done = false;
+    var frame_count: usize = 0;
+    while (frame_count < 16 and !done) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x0 => {
+                if (frame.stream_id == 3) {
+                    try body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) done = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(done);
+    try assertContains(body.items, "continuation-limit-stream3-ok");
     try waitForUpstreamCount(&upstream, 1, 2_000);
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
