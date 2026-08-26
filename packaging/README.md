@@ -350,6 +350,26 @@ brew install tardigrade
 tardi version
 ```
 
+Validate the published tap itself after release publication with the black-box
+public-tap smoke:
+
+```bash
+./scripts/test-public-homebrew-tap.sh --install-mode qualified --expected-version X.Y.Z
+./scripts/test-public-homebrew-tap.sh --install-mode tap-short --expected-version X.Y.Z
+```
+
+The first mode runs `brew install bare-systems/tap/tardigrade`. The second mode
+runs the explicit tap/trust flow Homebrew currently requires for non-official
+taps before `brew install tardigrade`. Both modes run from a temporary directory
+outside the checkout, verify `tardi` and the `tardigrade` alias resolve under
+the Homebrew prefix, check the public tap formula and installed binary against
+the expected release identity, audit installed-binary linkage, and exercise
+`init static`, `check`, `run`, a static GET, `/health`, and clean SIGINT
+shutdown. If `--expected-version` is omitted, the script resolves the latest
+stable GitHub release independently of the tap under test.
+`.github/workflows/public-homebrew-smoke.yml` runs this as a manual/scheduled
+post-release smoke on macOS and Linux.
+
 ## Service files
 
 Pre-built service files for host-native installs:

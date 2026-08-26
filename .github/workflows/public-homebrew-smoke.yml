@@ -1,0 +1,75 @@
+name: Public Homebrew Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: "Expected public Tardigrade release version, with or without leading v. Defaults to the latest stable GitHub release."
+        required: false
+        type: string
+  schedule:
+    - cron: "37 11 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-homebrew-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  public-homebrew-smoke:
+    name: Public Homebrew smoke (${{ matrix.os }}, ${{ matrix.install_mode }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            install_mode: qualified
+          - os: macos-15
+            install_mode: tap-short
+          - os: macos-15-intel
+            install_mode: qualified
+          - os: macos-15-intel
+            install_mode: tap-short
+          - os: ubuntu-latest
+            install_mode: qualified
+          - os: ubuntu-latest
+            install_mode: tap-short
+          - os: ubuntu-24.04-arm
+            install_mode: qualified
+          - os: ubuntu-24.04-arm
+            install_mode: tap-short
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y build-essential curl file git procps ruby
+
+      - name: Install Linuxbrew
+        if: runner.os == 'Linux'
+        env:
+          NONINTERACTIVE: "1"
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew --version
+
+      - name: Smoke public Homebrew tap install
+        env:
+          INSTALL_MODE: ${{ matrix.install_mode }}
+          EXPECTED_VERSION: ${{ inputs.expected_version || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          ./scripts/test-public-homebrew-tap.sh --install-mode "$INSTALL_MODE"
