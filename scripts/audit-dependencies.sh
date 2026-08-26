@@ -159,7 +159,7 @@ resolve_build_sources() {
 is_nonproduction_file() {
     case "$1" in
     .git/* | .zig/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh | scripts/profile.sh) return 0 ;;
-    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
+    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-public-homebrew-tap.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
 }
@@ -167,20 +167,20 @@ is_nonproduction_file() {
 is_nonproduction_zig_file() {
     case "$1" in
     .git/* | .zig/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/*) return 0 ;;
-    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
+    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-public-homebrew-tap.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
 }
 
 is_explicit_nonproduction_helper() {
     case "$1" in
-    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
+    scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-public-homebrew-tap.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
 }
 
 explicit_nonproduction_helper_pattern() {
-    printf '%s\n' 'scripts/test-deb-package\.sh|scripts/test-rpm-package\.sh|scripts/test-homebrew-formula\.sh|scripts/test-homebrew-release-formula\.sh|scripts/test-homebrew-tap-sync\.sh|scripts/test-install\.sh|scripts/test-docker-image\.sh|scripts/test-launchd-service\.sh|scripts/interop/[A-Za-z0-9_./@-]+|scripts/remote-bench\.sh|scripts/profile\.sh|benchmarks/[A-Za-z0-9_./@-]+|\./\.github/workflows/[A-Za-z0-9_.@/-]+\.ya?ml'
+    printf '%s\n' 'scripts/test-deb-package\.sh|scripts/test-rpm-package\.sh|scripts/test-homebrew-formula\.sh|scripts/test-homebrew-release-formula\.sh|scripts/test-homebrew-tap-sync\.sh|scripts/test-public-homebrew-tap\.sh|scripts/test-install\.sh|scripts/test-docker-image\.sh|scripts/test-launchd-service\.sh|scripts/interop/[A-Za-z0-9_./@-]+|scripts/remote-bench\.sh|scripts/profile\.sh|benchmarks/[A-Za-z0-9_./@-]+|\./\.github/workflows/[A-Za-z0-9_.@/-]+\.ya?ml'
 }
 
 forbidden_dependency_pattern() {
