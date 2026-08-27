@@ -5,6 +5,130 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Bare-Systems/Tardigrade/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Bare-Systems/Tardigrade/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Bare-Systems/Tardigrade/actions/workflows/scorecard.yml"><img alt="OSSF Scorecard" src="https://github.com/Bare-Systems/Tardigrade/actions/workflows/scorecard.yml/badge.svg"></a>
+  <a href="https://github.com/Bare-Systems/Tardigrade/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/Bare-Systems/Tardigrade?include_prereleases"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Bare-Systems/Tardigrade"></a>
+</p>
+
+---
+
+Tardigrade is a lightweight HTTP/1.1 server and reverse proxy for deployments
+that want a small native binary, config-driven routing, observable runtime
+behavior, and predictable reloads.
+
+## Install
+
+```bash
+brew tap bare-systems/tap
+brew install tardigrade
+```
+
+Then confirm the command is available:
+
+```bash
+tardi version
+```
+
+## Start with the simplest setup
+
+```bash
+mkdir -p public
+printf '%s\n' '<h1>Hello from Tardigrade</h1>' > public/index.html
+
+tardi init static > tardigrade.conf
+tardi check
+tardi run
+```
+
+Open:
+
+- http://localhost:8080/
+- http://localhost:8080/health
+
+This serves the static site and includes a health endpoint.
+
+## Common ways to run Tardigrade
+
+### 1. Static site
+
+```bash
+tardi init static > tardigrade.conf
+tardi run
+```
+
+Use this for serving local assets or a simple website.
+
+### 2. Reverse proxy
+
+```bash
+tardi init proxy > tardigrade.conf
+tardi run
+```
+
+This creates a basic upstream proxy config. The default local setup points at a local upstream service.
+
+### 3. Use a specific config file
+
+```bash
+tardi check ./my-site.conf
+tardi run -c ./my-site.conf
+```
+
+This is useful when you want to keep multiple config files for different environments.
+
+### 4. Run in the background
+
+```bash
+tardi run --daemon
+```
+
+This starts Tardigrade as a daemonized process.
+
+### 5. TLS termination example
+
+```bash
+tardi init tls > tardigrade.conf
+tardi check
+tardi run
+```
+
+Use this when you want Tardigrade to handle TLS at the edge.
+
+## Useful commands
+
+```bash
+tardi --help
+tardi check ./tardigrade.conf
+tardi run -c ./tardigrade.conf
+tardi version
+```
+
+## Features
+
+- Static file serving with normalized paths, range requests, cache validation, and
+  symlink escape protection.
+- Reverse proxying with config-driven routing, upstream health checks, retries
+  for safe connection drops, and bounded streaming for larger transfers.
+- TLS termination for the stable HTTP/1.1 edge path.
+- Hot reloads and graceful drain behavior for operator-managed deployments.
+- Structured access logs, request IDs, W3C `traceparent` forwarding, and
+  Prometheus metrics at `/status/metrics` by default.
+- Request limits, rate limiting, security headers, and release-gated security
+  regression tests.
+- Native packaging with release archives, DEB/RPM packages, service files,
+  checksums, SBOMs, and provenance attestation.
+
+HTTP/2, HTTP/3/QUIC, WebSocket/SSE, ACME, FastCGI, uWSGI, SCGI, memcached,
+and BearClaw-specific flows exist in-tree, but they are not all part of the
+stable Core v1 contract. Check the [support matrix](docs/SUPPORT_MATRIX.md)
+before depending on a specific surface.
+
+## More info
+
+For full configuration details and advanced deployment options, see:
+
+<p align="center">
   <a href="docs/QUICKSTART.md"><strong>Quickstart</strong></a> |
   <a href="https://github.com/Bare-Systems/Tardigrade/releases">Releases</a> |
   <a href="docs/SUPPORT_MATRIX.md">Support Matrix</a> |
@@ -16,285 +140,4 @@
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/Bare-Systems/Tardigrade/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Bare-Systems/Tardigrade/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://github.com/Bare-Systems/Tardigrade/actions/workflows/scorecard.yml"><img alt="OSSF Scorecard" src="https://github.com/Bare-Systems/Tardigrade/actions/workflows/scorecard.yml/badge.svg"></a>
-  <a href="https://github.com/Bare-Systems/Tardigrade/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/Bare-Systems/Tardigrade?include_prereleases"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Bare-Systems/Tardigrade"></a>
-</p>
-
----
-
-### Host-native edge serving in Zig
-
-Tardigrade is a lightweight HTTP/1.1 server and reverse proxy for deployments
-that want a small native binary, config-driven routing, observable runtime
-behavior, and predictable reloads.
-
-It is early-stage software with a deliberately narrow stable core. The official
-compatibility promise is documented in the [Core v1 support matrix](docs/SUPPORT_MATRIX.md).
-
----
-
-### Menu
-
-- [Features](#features)
-- [Install](#install)
-- [Build from source](#build-from-source)
-- [Quick start](#quick-start)
-- [Overview](#overview)
-- [Full documentation](#full-documentation)
-- [Performance](#performance)
-- [Development](#development)
-- [Getting help](#getting-help)
-- [About](#about)
-
-## Features
-
-- Static file serving with normalized path handling, range support, cache
-  validation, and symlink escape protection.
-- Reverse proxying with config-driven `location` routing, upstream health checks,
-  retries for safe connection-drop cases, and optional bounded streaming for
-  larger HTTP transfers.
-- TLS termination for the stable HTTP/1.1 edge path.
-- Hot reloads and graceful drain behavior for operator-managed deployments.
-- JSON access logs, request IDs, W3C `traceparent` forwarding, and Prometheus
-  metrics at `/status/metrics` by default.
-- Request limits, rate limiting, security headers, and release-gated security
-  regression tests.
-- A native packaging path with release archives, published DEB/RPM packages,
-  service files, checksums, SBOMs, and provenance attestation.
-
-HTTP/2, HTTP/3/QUIC, WebSocket/SSE, ACME, FastCGI, uWSGI, SCGI, memcached, and
-BearClaw-specific flows exist in-tree, but they are not all part of the stable
-Core v1 contract. Check the [support matrix](docs/SUPPORT_MATRIX.md) before
-depending on a specific surface.
-
-## Install
-
-The fastest way to install the latest release is the official install script:
-
-```bash
-curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
-```
-
-The installer downloads the matching release archive, verifies it against
-`tardigrade-checksums.txt`, and installs the `tardi` binary (with a
-`tardigrade` compatibility alias) into `$HOME/.local/bin` by default. The
-currently published latest release provides Linux x86_64/aarch64 archives
-plus Intel and Apple Silicon Darwin archives. See
-[packaging/README.md](packaging/README.md#current-status) for exact status.
-
-The release workflow builds official Linux and Darwin archives (and Linux
-DEB/RPM packages) with the general-purpose native Zig TLS profile
-(`-Dtls-profile=general`, the default), an explicit portable CPU baseline,
-and — for Linux — an explicit portable glibc floor, so the published
-artifact runs on real hardware and distros beyond the exact CI runner that
-built it. Those artifacts do not require OpenSSL as a Tardigrade build or
-runtime dependency at all, and their release dependency inventory is
-audited to reject `libssl`, `libcrypto`, and other foreign TLS/crypto/QUIC/H3
-implementations. Older already-published releases (`v0.5.0` and earlier)
-predate the #649 cutover and used the retired OpenSSL-backed profile.
-
-The Darwin archives are unsigned and not notarized; see the Gatekeeper
-note in [packaging/README.md](packaging/README.md) before redistributing
-browser-downloaded artifacts. Launchd lifecycle validation (#467) is a
-separate follow-up.
-
-Other install paths:
-
-- Download release archives directly from [GitHub Releases](https://github.com/Bare-Systems/Tardigrade/releases).
-- Native DEB/RPM packages (published on every release) and systemd/launchd
-  service files — see [packaging/README.md](packaging/README.md) for
-  current status and install/build instructions.
-- Homebrew formula generation and tap publication workflow — see
-  [packaging/README.md](packaging/README.md#homebrew-macos-and-linux).
-- Build from source (see below).
-
-For running Tardigrade as a managed service — systemd unit, filesystem
-layout, permissions, and a locally built Docker image — see the
-[production deployment guide](docs/DEPLOYMENT.md).
-
-## Build from source
-
-Requirements:
-
-- [Zig](https://ziglang.org/) 0.16.0
-- Both TLS profiles (`general`, the default, and `appliance`) are pure-Zig
-  native and do **not** require OpenSSL or any other foreign TLS/crypto
-  library to compile or run Tardigrade.
-- HTTP/3 is served by the built-in native Zig QUIC/H3 stack and requires no
-  additional system libraries.
-- OpenSSL is only needed to build the optional out-of-process
-  differential/interop test tooling (`zig build test-crypto-openssl` and
-  similar) — never to build or run `tardi` itself.
-
-For development with the default profile:
-
-```bash
-git clone https://github.com/Bare-Systems/Tardigrade.git
-cd Tardigrade
-zig build run
-```
-
-For a shipping-equivalent release-mode binary:
-
-```bash
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/tardi --help
-```
-
-With explicit version metadata:
-
-```bash
-zig build -Doptimize=ReleaseFast -Dversion="$(git describe --tags --always)"
-```
-
-Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-options).
-
-## Quick start
-
-`tardi init <profile>` below requires [building from source](#build-from-source)
-until a release containing it is published; the latest published release
-predates it. Once `tardi` is on your `PATH`:
-
-```bash
-mkdir -p public
-printf '%s\n' '<h1>Hello from Tardigrade</h1>' > public/index.html
-
-tardi init static > tardigrade.conf
-tardi check
-tardi run
-```
-
-Then open `http://localhost:8080/` and `http://localhost:8080/health`.
-
-See the **[Quickstart guide](docs/QUICKSTART.md)** for the full walkthrough,
-including installing `tardi`, a reverse-proxy happy path, and explicit
-config paths. For the full `tardi init`/`config`/`explain` command
-reference, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). For
-copy/paste-runnable examples of common deployments (static file serving,
-reverse proxy, TLS termination, rate limiting, and more), see the
-[examples/](examples/README.md) directory.
-
-## Overview
-
-Tardigrade's stable Core v1 identity is intentionally focused: a host-native
-Zig HTTP/1.1 edge server and reverse proxy with predictable operator behavior.
-The main thread handles the non-blocking accept/event loop, while accepted
-connections move through a bounded worker pool for blocking TLS, parsing,
-proxying, and response writes.
-
-Idle HTTP/1.1 keep-alive connections are parked off the worker pool between
-requests, so idle clients do not consume worker capacity. HTTP/2 multiplexes
-internally, and HTTP/3 is served over a built-in native Zig QUIC/H3 stack that
-needs no external QUIC libraries. Both HTTP/2 and HTTP/3 are tracked as
-experimental surfaces rather than part of the default stable release contract.
-
-Configuration is nginx-inspired and can be checked before startup with
-`tardi check <config>`. Runtime inspection commands such as `status` and
-`print-config` are designed to make package and service deployments easier to
-operate without guessing which config file or pid file is active.
-
-## Full documentation
-
-| Topic | Location |
-| --- | --- |
-| Quickstart | [docs/QUICKSTART.md](docs/QUICKSTART.md) |
-| Core v1 support matrix | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) |
-| Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
-| HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |
-| HTTP/3 validation evidence | [docs/HTTP3_VALIDATION_EVIDENCE.md](docs/HTTP3_VALIDATION_EVIDENCE.md) |
-| Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
-| Hot-path allocation ownership | [docs/ALLOCATION_OWNERSHIP.md](docs/ALLOCATION_OWNERSHIP.md) |
-| Event-loop backend evaluation (epoll/kqueue vs libxev/std.Io/io_uring) | [docs/EVENT_LOOP_BACKENDS.md](docs/EVENT_LOOP_BACKENDS.md) |
-| Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
-| Reload, drain, and shutdown | [docs/RELOAD_SHUTDOWN.md](docs/RELOAD_SHUTDOWN.md) |
-| Production deployment (systemd and Docker) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
-| Troubleshooting runbook | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
-| Proxy security | [docs/PROXY_SECURITY.md](docs/PROXY_SECURITY.md) |
-| Security test plan | [docs/SECURITY_TEST_PLAN.md](docs/SECURITY_TEST_PLAN.md) |
-| TLS interop & conformance matrix | [docs/TLS_INTEROP_MATRIX.md](docs/TLS_INTEROP_MATRIX.md) |
-| Certificate-status policy (revocation/OCSP/CRL) | [docs/PKI_REVOCATION.md](docs/PKI_REVOCATION.md) |
-| Pentest playbook | [docs/PENTEST_PLAYBOOK.md](docs/PENTEST_PLAYBOOK.md) |
-| Code review checklist | [docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md) |
-| Release checklist | [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) |
-| Packaging | [packaging/README.md](packaging/README.md) |
-| Benchmarks | [benchmarks/README.md](benchmarks/README.md) |
-| Examples | [examples/README.md](examples/README.md) |
-| BearClaw example | [examples/bearclaw/README.md](examples/bearclaw/README.md) |
-| Security policy | [SECURITY.md](SECURITY.md) |
-| Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
-| Release history | [CHANGELOG.md](CHANGELOG.md) |
-
-## Performance
-
-Canonical benchmark runs are captured from a dedicated benchmark target, not a
-local laptop fallback run. Saved benchmark JSON records latency percentiles,
-throughput, errors, and optional target CPU/RSS samples.
-
-<!-- BENCHMARK_REPORT_START -->
-| Scenario | req/s | p50 (ms) | p95 (ms) | p99 (ms) | p999 (ms) | CPU % | Peak RSS (MiB) | MB/s | Errors |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `keepalive` | 4700 | 0.4 | - | 41.8 | - | - | - | - | 0 |
-| `proxy-http1` | 1724 | 1.3 | - | 114.9 | - | - | - | - | 0 |
-| `static-http1` | 4586 | 0.4 | - | 46.1 | - | - | - | - | 0 |
-
-> **v0.32.0-18-gb44f8c1** · 2026-05-02 · tool: `wrk` · 4 connections · 30s per scenario · host: `127.0.0.1`
-> driver: `loopback (dedicated benchmark target)` · env: `release-baseline` · workers: `2` · config: `release-baseline config`
-> CPU/RSS columns are sampled from the target Tardigrade process only when the run used `--pid` or `--pid-file`; otherwise they remain `-`.
->
-> Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-readme README.md` to refresh this table.
-<!-- BENCHMARK_REPORT_END -->
-
-## Development
-
-Use Zig `0.16.0` for local validation.
-
-```bash
-# Format check
-zig fmt --check build.zig src/ tests/
-
-# Unit tests
-zig build test --summary all --error-style verbose
-
-# Stable Web PKI differential corpus (requires OpenSSL and Go)
-zig build test-pki-differential --summary all --error-style verbose
-
-# Security corpus replay
-zig build test-security-corpus
-
-# Integration tests
-zig build test-integration
-
-# Failure-mode / chaos suite (broken origins, aborting clients, reloads)
-zig build test-failure
-
-# Pure-Zig QUIC/HTTP-3 package tests (no system libraries)
-zig build test-quic
-
-# Allocation budget report
-zig build bench-allocations
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and
-[docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md) before making
-larger changes.
-
-## Getting help
-
-- Start with the [troubleshooting runbook](docs/TROUBLESHOOTING.md) — it
-  covers config validation failures, listener/routing problems, static
-  404/403s, upstream 502/504/503s, TLS errors, health checks, metrics, logs,
-  reload, and performance, and ends with a copy/paste issue-report template.
-- Use [GitHub Issues](https://github.com/Bare-Systems/Tardigrade/issues) for
-  actionable bug reports and feature requests.
-- Use [SECURITY.md](SECURITY.md) for vulnerability reporting instructions.
-- Include the config, command, logs, platform, and whether the affected surface
-  is listed as stable or experimental in the support matrix.
-
-## About
-
-Tardigrade is developed by Bare Systems as a host-native edge component for
-small services, internal platforms, and controlled deployments. It is licensed
-under the [Apache License 2.0](LICENSE).
+This project is licensed under the Apache License 2.0.

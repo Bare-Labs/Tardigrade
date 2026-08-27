@@ -2,7 +2,7 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
-## [Unreleased]
+## [0.6.3] - 2026-08-26
 
 ### Fixed
 - **Twenty-eight auth/framing defects found by a live F-06 black-box campaign (#673)** —
