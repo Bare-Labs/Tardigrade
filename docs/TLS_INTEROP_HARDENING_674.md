@@ -38,7 +38,7 @@ Darwin mac.lan 25.3.0 Darwin Kernel Version 25.3.0: Wed Jan 28 20:49:24 PST 2026
 zig build build-tls-interop build-h3-interop \
   --summary all --error-style verbose
 
-scripts/interop/run-tls-interop.sh --list
+scripts/interop/run-tls-interop.sh --list --profile full
 
 mkdir -p artifacts/tls-interop
 TLS_INTEROP_WORKDIR="$PWD/artifacts/tls-interop" \
@@ -48,9 +48,14 @@ zig build test-tls-interop-matrix --summary all --error-style verbose
 ```
 
 All four commands completed successfully. The build step produced
-`tls_interop_tool` and `h3_interop_tool`; `--list` enumerated 137 rows before
-any peer connected; `test-tls-interop-matrix` (the #338 vocabulary-vs-engine
-unit check) passed 16/16.
+`tls_interop_tool` and `h3_interop_tool`. `--list --profile full` enumerated
+**116 matrix rows** (118 output lines, including the `profile:` and `engine
+capabilities:` header lines) before any peer connected — the same 116 rows
+that executed and passed below. The retained, source-SHA-matched row list is
+[`evidence/674-tls-interop-hardening/rows.txt`](evidence/674-tls-interop-hardening/rows.txt).
+`test-tls-interop-matrix` (the #338 vocabulary-vs-engine unit check) passed
+16/16, confirming the row list is derived from the engine's own
+`native_capabilities` rather than a second, driftable copy.
 
 ## Full-profile result
 
@@ -127,40 +132,85 @@ itself (see `run_negative_server_row` / `--expect-error` /
 `--expect-alert` in `tests/tls_interop_tool.zig`), not inferred from a
 generic disconnect.
 
-## H3 external peer (ngtcp2/quiche) — environment limitation
+### Explicit row-name verification
+
+A superficially green `pass=N fail=0 skip=0` summary line could in principle
+hide a runner bug that stopped enumerating one of the special-case sections
+while the aggregate count still looked healthy. Each of the following exact
+row names was independently grep-verified against the retained log to end in
+` PASS`:
+
+```
+record/server/openssl/http2_entrypoint
+record/server/openssl/hrr
+record/client/openssl/hrr
+record/server/gnutls/record-size-limit
+record/client/gnutls/record-size-limit
+record/server/openssl/key-update/reciprocal
+record/client/openssl/key-update/reciprocal
+record/client/openssl/key-update/one-way
+record/server/openssl/close_notify
+record/server/openssl/truncation
+record/negative/alpn_no_overlap
+record/negative/tls12_downgrade
+record/negative/cipher_no_overlap
+record/negative/group_no_overlap
+record/negative/signature_no_overlap
+record/negative/sni_absent
+record/negative/malformed_ordering
+record/negative/ccs_before_clienthello
+record/negative/wrong_pinned_certificate
+record/selection/sni_ed25519
+record/selection/sni_ecdsa_p256
+record/selection/sni_rsa
+record/selection/unknown_sni_uses_default
+record/selection/sigalgs_ed25519
+record/selection/sigalgs_rsa_pss
+record/selection/no_applicable_credential
+```
+
+All 26 rows: present, and PASS.
+
+## Repeatable full-profile hardening gate
+
+The `full`-profile record/TLS run above was executed by hand on this Darwin
+host. `run-tls-interop.sh` intentionally exits success on `SKIP` (so a
+contributor without GnuTLS installed can still run it locally), which is too
+permissive to be the canonical hardening gate on its own. #674 requires an
+intentional manual/scheduled entrypoint that also enforces `fail=0 skip=0` and
+runs the pinned external H3/QUIC peer matrix. That entrypoint is
+[`.github/workflows/tls-conformance-full.yml`](../.github/workflows/tls-conformance-full.yml):
+`workflow_dispatch` plus a weekly schedule, running on `ubuntu-latest` (so
+both installers — `install-tls-peer-deps-ci.sh` and the H3 peer's
+`install-h3-peer-deps-ci.sh`/`build-h3-peer-ci.sh` — apply), installing both
+peers, running `--list --profile full` and `--profile full`, parsing the
+final `pass=/fail=/skip=` line and failing the job if `fail` or `skip` is
+non-zero, then running `scripts/interop/run-h3-peer-ci.sh` against the pinned
+external H3 peer, and uploading the row list, matrix logs, and H3 peer log as
+a 90-day retained Actions artifact (never the generated `certs/`
+directories).
+
+## H3 external peer — pinned peer, real QUIC/UDP/H3 exchange
 
 `scripts/interop/install-h3-peer-deps-ci.sh` and
-`scripts/interop/build-h3-peer-ci.sh` build the pinned ngtcp2/nghttp3 GnuTLS
+`scripts/interop/build-h3-peer-ci.sh` build the pinned external H3/QUIC
 example peer from source, and are written specifically for a Debian/Ubuntu CI
-runner: they call `apt-get`, install `clang-19` from `apt.llvm.org`, and
-depend on `libstdc++-14-dev`, none of which exist on this hardening host
-(Darwin 25.3.0 / arm64). This is a genuine environment limitation under #674's
-skip policy ("the independent peer lacks the required capability and the
-limitation is documented") — the peer itself is not missing by oversight, its
-build pipeline targets a different OS.
+runner (`apt-get`, a pinned `clang` toolchain, and Debian-only C++ standard
+library packages), none of which exist on this Darwin/arm64 hardening host.
+The `tls-conformance-full.yml` workflow above runs this exact pipeline on
+`ubuntu-latest` instead, giving #674 a real, repeatable external-peer run
+rather than a permanently-deferred one.
 
-This does not leave the H3/QUIC/UDP exchange unproven:
-
-- The native QUIC loopback rows above (18/18 tuples PASS) prove the same
-  engine's QUIC transport negotiates every supported tuple correctly.
-- The exact external-peer pipeline this run could not execute
-  (`install-h3-peer-deps-ci.sh` → `build-h3-peer-ci.sh` →
-  `scripts/interop/run-h3-peer-ci.sh` and
-  `zig build test-integration-resumption-interop`) already runs on **every
-  PR** via the `h3-resumption-interop` job in
-  [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on
-  `ubuntu-latest`, building the same pinned ngtcp2 `v1.25.0`/nghttp3 `v1.18.0`
-  GnuTLS peer and exercising real QUIC/UDP/H3 exchange, including the two
-  focused HRR peer-matrix rows described in
-  [`scripts/interop/README.md`](../scripts/interop/README.md). That job was
-  green at the source SHA recorded above.
-
-**Follow-up**: to co-locate literal external-peer transcripts with a future
-hardening pass, run `scripts/interop/run-interop.sh` (after
-`install-h3-peer-deps-ci.sh` and `build-h3-peer-ci.sh`) on a Linux host or CI
-runner rather than this Darwin host. Tracked as follow-up rather than blocking
-#674, since the peer/build combination is continuously proven in CI and #674
-scopes H3 peer proof to "where run".
+- Native QUIC loopback rows (18/18 tuples PASS, in the full-profile run
+  above) prove the same engine's QUIC transport negotiates every supported
+  tuple correctly.
+- The external-peer run (`install-h3-peer-deps-ci.sh` →
+  `build-h3-peer-ci.sh` → `scripts/interop/run-h3-peer-ci.sh`, which drives
+  `scripts/interop/run-interop.sh` against the pinned peer and additionally
+  asserts the two `#333` HRR peer-matrix rows by name) is captured in
+  [`evidence/674-tls-interop-hardening/h3-external-peer-run.md`](evidence/674-tls-interop-hardening/h3-external-peer-run.md),
+  with the peer version/build identity, the workflow run link, and the
+  sanitized matrix log.
 
 ## Failure handling
 
@@ -178,10 +228,11 @@ added.
 - Zero unexplained applicable SKIP rows. ✅
 - HRR, KeyUpdate, record-size-limit, shutdown/truncation, and negative
   negotiation rows are explicitly covered. ✅
-- H3 external-peer rows prove real QUIC/UDP exchange **where run**: not run on
-  this Darwin hardening host (documented environment limitation above); run
-  and green on every PR in the `h3-resumption-interop` CI job on
-  `ubuntu-latest` at the recorded source SHA. ⚠️ documented, not blocking
+- H3 external-peer rows prove real QUIC/UDP exchange: run via
+  `tls-conformance-full.yml` on `ubuntu-latest` against the pinned external
+  peer; see
+  [`evidence/674-tls-interop-hardening/h3-external-peer-run.md`](evidence/674-tls-interop-hardening/h3-external-peer-run.md)
+  for the run link, peer version, and result. ✅
 - Every discovered defect has a focused regression and rerun evidence: N/A,
   zero defects discovered in this pass.
 - This result is linked from [`docs/RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md)

@@ -1,0 +1,131 @@
+name: TLS conformance/interop hardening (full profile)
+
+# #674 release-hardening gate. Distinct from the PR-blocking
+# `tls-conformance-matrix` job in ci.yml, which runs the `ci` profile (every
+# tuple against OpenSSL, one representative tuple per suite against GnuTLS)
+# to keep PR latency bounded. This workflow deliberately runs the deeper,
+# slower `full` profile (every tuple against both OpenSSL and GnuTLS) plus
+# the pinned external H3/QUIC peer matrix, and enforces zero SKIP as well as
+# zero FAIL -- `run-tls-interop.sh` intentionally exits success on SKIP so
+# contributors without GnuTLS installed can still run it locally, which is
+# too permissive for canonical hardening evidence. The external peer's own
+# name/packages are confined to scripts/interop/ (the audited external-peer
+# boundary -- scripts/audit-dependencies.sh) and never appear in this file.
+# See docs/TLS_INTEROP_HARDENING_674.md.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tls-conformance-full-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-matrix:
+    name: Full TLS interop matrix (OpenSSL + GnuTLS) + H3 external peer
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-tls-conformance-full-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-tls-conformance-full-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-tls-conformance-full-${{ runner.os }}-${{ runner.arch }}-
+
+      # The matrix drives two independent implementations as out-of-process
+      # peers. Their package names live in scripts/interop/, the audited
+      # external-peer boundary (scripts/audit-dependencies.sh), and must not
+      # appear in this file.
+      - name: Install external TLS peers (OpenSSL + GnuTLS)
+        run: ./scripts/interop/install-tls-peer-deps-ci.sh
+
+      - name: Install external H3 peer build dependencies
+        run: ./scripts/interop/install-h3-peer-deps-ci.sh
+
+      - name: Build pinned external H3 peer
+        id: build-h3-peer
+        run: ./scripts/interop/build-h3-peer-ci.sh
+
+      - name: Print tool/peer versions
+        run: |
+          zig version
+          openssl version
+          gnutls-cli --version | head -1
+          uname -a
+
+      - name: Build the interop tools
+        run: zig build build-tls-interop build-h3-interop --summary all --error-style verbose
+
+      - name: Check the matrix vocabulary stays in step with the engine
+        run: zig build test-tls-interop-matrix --summary all --error-style verbose
+
+      - name: Retain the full-profile row list
+        run: |
+          mkdir -p artifacts/tls-interop
+          ./scripts/interop/run-tls-interop.sh --list --profile full \
+            | tee artifacts/tls-interop/rows.txt
+
+      - name: Run the full conformance matrix (fail=0 skip=0 required)
+        env:
+          TLS_INTEROP_WORKDIR: ${{ github.workspace }}/artifacts/tls-interop/work
+        run: |
+          set -o pipefail
+          ./scripts/interop/run-tls-interop.sh --profile full \
+            | tee artifacts/tls-interop/full-matrix.log
+
+          summary="$(grep -E '^pass=[0-9]+ fail=[0-9]+ skip=[0-9]+$' artifacts/tls-interop/full-matrix.log | tail -1)"
+          if [ -z "$summary" ]; then
+            echo "no pass/fail/skip summary line found in full-matrix.log"
+            exit 1
+          fi
+          echo "summary: $summary"
+          fail="$(printf '%s\n' "$summary" | sed -E 's/.* fail=([0-9]+).*/\1/')"
+          skip="$(printf '%s\n' "$summary" | sed -E 's/.* skip=([0-9]+).*/\1/')"
+          if [ "$fail" -ne 0 ] || [ "$skip" -ne 0 ]; then
+            echo "canonical hardening run requires fail=0 skip=0, got fail=$fail skip=$skip"
+            exit 1
+          fi
+
+      - name: Run the external H3 peer matrix (pinned peer, #333 HRR asserted)
+        env:
+          H3_PEER_EXAMPLES_DIR: ${{ steps.build-h3-peer.outputs.examples_dir }}
+          INTEROP_WORKDIR: ${{ github.workspace }}/artifacts/h3-peer-interop
+          INTEROP_OUTPUT_LOG: ${{ github.workspace }}/artifacts/h3-peer-interop/matrix.log
+        run: ./scripts/interop/run-h3-peer-ci.sh
+
+      # Transcripts are secret-free by construction (see the redaction
+      # contract in docs/TLS_INTEROP_MATRIX.md), but the certs/ directories
+      # generated for each run contain private keys, so only logs,
+      # transcripts, and the row list/summary are uploaded.
+      - name: Upload sanitized hardening evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tls-conformance-full-${{ github.run_id }}
+          path: |
+            artifacts/tls-interop/rows.txt
+            artifacts/tls-interop/full-matrix.log
+            artifacts/tls-interop/work/logs
+            artifacts/tls-interop/work/transcripts
+            artifacts/h3-peer-interop/matrix.log
+            artifacts/h3-peer-interop/logs
+          retention-days: 90
