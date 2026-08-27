@@ -154,7 +154,7 @@ cat >"$config" <<EOF
 listen $tcp_port;
 server_name tardigrade.test;
 root $public_dir;
-try_files \$uri /index.html;
+try_files \$uri;
 
 location = /healthz {
     return 200 alive;
@@ -287,16 +287,36 @@ else
 fi
 
 if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ] && [ -n "$alt_port" ]; then
-  "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$alt_port" "https://localhost:$alt_port/healthz" \
+  # The URI host below becomes both the TLS SNI and HTTP :authority that
+  # gtlsclient sends. It must match the config's `server_name` (not just any
+  # SNI name credentialed via TARDIGRADE_TLS_SNI_CERTS): the gateway's
+  # virtual-host resolution matches on :authority/Host the same way it does
+  # for HTTP/1.1, so an authority the TLS layer accepts (e.g. "localhost",
+  # which has its own SNI credential here) can still 404 at the routing layer
+  # if it doesn't match `server_name`. Discovered via this exact row (#677).
+  "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$alt_port" "https://tardigrade.test:$alt_port/healthz" \
     --exit-on-first-stream-close >"$logs/gtlsclient-altsvc.log" 2>&1 || status=1
+  # `/`, not just `/index.html`: this config has no `index` directive, so
+  # (like the H2 static row) the static-file proof must name the file
+  # directly -- bare `/` has no automatic index.html fallback and 404s.
   "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" \
-    "https://localhost:$udp_port/" "https://localhost:$udp_port/proxy" \
+    "https://tardigrade.test:$udp_port/index.html" "https://tardigrade.test:$udp_port/proxy" \
     --exit-on-all-streams-close >"$logs/gtlsclient-h3-multi.log" 2>&1 || status=1
+  # gtlsclient logs the received body as a hexdump wrapped at 16 bytes per
+  # line, so a literal response-body needle longer than one wrapped segment
+  # (e.g. 19-byte "blackbox-static-ok\n" splits across two dump lines) can
+  # silently fail a plain single-line `grep`, even though the byte-for-byte
+  # content is correct -- proven by this exact row before this fix (#677).
+  # Simply stripping newlines is not enough either: each dump line's own
+  # offset/hex columns would then be spliced between the two halves of the
+  # needle. Extract just the ASCII column (`|...|`) from every dump line and
+  # concatenate those before searching.
+  log_contains() { sed -n 's/^[0-9a-f]\{8\}  .*|\(.*\)|$/\1/p' "$1" | tr -d '\n' | grep -Fq "$2"; }
   if grep -Fq ':status: 200' "$logs/gtlsclient-altsvc.log" &&
-     grep -q 'alive' "$logs/gtlsclient-altsvc.log" &&
+     log_contains "$logs/gtlsclient-altsvc.log" 'alive' &&
      grep -Fq ':status: 200' "$logs/gtlsclient-h3-multi.log" &&
-     grep -q 'blackbox-static-ok' "$logs/gtlsclient-h3-multi.log" &&
-     grep -q 'proxy-ok' "$logs/gtlsclient-h3-multi.log"; then
+     log_contains "$logs/gtlsclient-h3-multi.log" 'blackbox-static-ok' &&
+     log_contains "$logs/gtlsclient-h3-multi.log" 'proxy-ok'; then
     say "PASS black-box ngtcp2/GnuTLS H3 proof"
     printf 'blackbox_h3_ngtcp2=PASS\n' >>"$summary"
   else
@@ -310,7 +330,7 @@ else
 fi
 
 if [ -n "${AIOQUIC_PYTHON:-}" ] && [ -x "${AIOQUIC_PYTHON:-}" ]; then
-  "$AIOQUIC_PYTHON" "$here/interop/aioquic_client.py" 127.0.0.1 "$udp_port" /healthz \
+  "$AIOQUIC_PYTHON" "$here/interop/aioquic_client.py" 127.0.0.1 "$udp_port" /healthz tardigrade.test \
     >"$logs/aioquic-client-artifact.log" 2>&1 || status=1
   if grep -q 'alive' "$logs/aioquic-client-artifact.log"; then
     say "PASS second H3 implementation aioquic proof"
@@ -342,7 +362,7 @@ for i in $(seq 1 "$cycles"); do
     nghttp -y -n "https://127.0.0.1:$tcp_port/healthz" >/dev/null 2>>"$logs/resource-nghttp.err" || status=1
   fi
   if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
-    "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" "https://localhost:$udp_port/healthz" \
+    "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" "https://tardigrade.test:$udp_port/healthz" \
       --exit-on-first-stream-close >/dev/null 2>>"$logs/resource-gtlsclient.err" || status=1
   fi
   if [ "$i" = "$((cycles / 2))" ] || [ "$i" = "$cycles" ]; then

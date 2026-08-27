@@ -533,6 +533,11 @@ const H2cUpstreamServer = struct {
     body: []u8,
     request_count: u32,
     response_body: []const u8,
+    /// Overrides the `content-length` response header when non-null, instead
+    /// of deriving it from `response_body.len`. Lets a test simulate a
+    /// HEAD-style representation length (a non-zero declared length with an
+    /// empty `response_body`, i.e. no DATA payload actually sent).
+    declared_content_length: ?usize = null,
 
     fn start(allocator: std.mem.Allocator, response_body: []const u8) !H2cUpstreamServer {
         return .{
@@ -716,10 +721,11 @@ fn handleH2cUpstreamConnection(server: *H2cUpstreamServer, conn: compat.NetConne
     server.headers_raw = try allocator.dupe(u8, headers_raw.items);
     server.request_count += 1;
     const response_body = server.response_body;
+    const declared_content_length = server.declared_content_length;
     server.mutex.unlock();
 
     var length_buf: [24]u8 = undefined;
-    const length_value = try std.fmt.bufPrint(&length_buf, "{d}", .{response_body.len});
+    const length_value = try std.fmt.bufPrint(&length_buf, "{d}", .{declared_content_length orelse response_body.len});
     const response_headers = [_]hpack.HeaderField{
         .{ .name = ":status", .value = "200" },
         .{ .name = "content-type", .value = "text/plain" },
@@ -7224,6 +7230,125 @@ test "interop.h2.proxy_head_preserves_upstream_content_length_without_data" {
     try std.testing.expectEqualStrings("8", resp.header("content-length") orelse "");
     try std.testing.expectEqual(@as(usize, 0), resp.body.len);
     try waitForUpstreamCount(&upstream, 1, 2_000);
+}
+
+test "interop.h2.proxy_head_upstream_connection_nominated_content_length_is_not_preserved" {
+    // #673-style hostile-origin regression for the representation-length
+    // fix above: an origin that nominates `content-length` via its own
+    // `Connection` header value is asking for that field to be treated as
+    // hop-by-hop. The ordinary forwarding path already strips such a
+    // nominated header; the representation-length capture must respect the
+    // same trust boundary rather than smuggling the value through as a
+    // hidden side channel.
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+        .body = "ignored",
+        .omit_body = true,
+        .declared_content_length = 8,
+        .connection_header = "close, content-length",
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /proxy-head {{
+        \\    proxy_pass http://{s}:{d}/proxy-head;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "HEAD" },
+        .{ .name = ":path", .value = "/proxy-head" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    var resp = try pureZigH2GetResponse(allocator, tardigrade.port, headers[0..]);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    // The nominated upstream Content-Length must not survive to the client;
+    // the gateway falls back to synthesizing it from the (empty) body.
+    try std.testing.expectEqualStrings("0", resp.header("content-length") orelse "");
+    try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+}
+
+test "interop.h2.proxy_head_h2_origin_preserves_content_length_without_data" {
+    // The representation-length capture added for the HTTP/1 upstream path
+    // must also apply to `h2ResponseToBuffered()` -- a downstream H2 HEAD
+    // proxied to a native H2 (h2c) upstream must not lose the origin's
+    // `content-length` and fall back to a synthesized `0`.
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var upstream = try H2cUpstreamServer.start(allocator, "");
+    upstream.declared_content_length = 8;
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /proxy-head {{
+        \\    proxy_pass http://{s}:{d}/proxy-head;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_UPSTREAM_PROTOCOL", .value = "h2c" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "HEAD" },
+        .{ .name = ":path", .value = "/proxy-head" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    var resp = try pureZigH2GetResponse(allocator, tardigrade.port, headers[0..]);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("8", resp.header("content-length") orelse "");
+    try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "interop.h2.proxy_circuit_breaker_fails_closed" {

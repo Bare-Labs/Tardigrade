@@ -3626,7 +3626,15 @@ fn appendHttp2UpstreamResponseHeaders(
 ) !void {
     if (preserve_content_length) {
         if (response.representation_content_length) |value| {
-            try headers.append(.{ .name = "content-length", .value = value });
+            // `value` is owned by `response.metadata_arena`, which the caller
+            // deinitializes at the end of the `.response` switch prong -- before
+            // `headers` is HPACK-encoded later in `respondHttp2Stream`. Duplicate
+            // it into `owned_values` for the same reason every other upstream
+            // response header below is duplicated rather than borrowed.
+            const owned = try allocator.dupe(u8, value);
+            errdefer allocator.free(owned);
+            try owned_values.append(owned);
+            try headers.append(.{ .name = "content-length", .value = owned });
         }
     }
     for (response.headers) |header| {

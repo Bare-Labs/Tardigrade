@@ -8,7 +8,13 @@ endpoint is built by hand on an IPv4 socket because
 `aioquic.asyncio.connect` hardcodes an IPv6 dual-stack socket, which
 IPv4-only CI sandboxes cannot create.
 
-usage: aioquic_client.py HOST PORT PATH
+usage: aioquic_client.py HOST PORT PATH [AUTHORITY]
+
+AUTHORITY (SNI + `:authority`) defaults to HOST when omitted. Pass the
+server's configured `server_name` explicitly when HOST is a bare IP: the
+gateway's virtual-host resolution (like plain HTTP/1.1) matches on
+`:authority`/Host, not on the connection's IP address, so an IP-authority
+request to a name-based vhost 404s exactly as it would over HTTP/1.1.
 """
 
 import asyncio
@@ -44,10 +50,10 @@ class ClientProtocol(QuicConnectionProtocol):
                     self.done.set()
 
 
-async def main(host: str, port: int, path: str) -> int:
+async def main(host: str, port: int, path: str, authority: str) -> int:
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     configuration.verify_mode = ssl.CERT_NONE
-    configuration.server_name = host
+    configuration.server_name = authority
     connection = QuicConnection(configuration=configuration)
 
     loop = asyncio.get_running_loop()
@@ -66,7 +72,7 @@ async def main(host: str, port: int, path: str) -> int:
             [
                 (b":method", b"GET"),
                 (b":scheme", b"https"),
-                (b":authority", host.encode()),
+                (b":authority", authority.encode()),
                 (b":path", path.encode()),
             ],
             end_stream=True,
@@ -84,4 +90,5 @@ async def main(host: str, port: int, path: str) -> int:
 
 if __name__ == "__main__":
     host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-    sys.exit(asyncio.run(main(host, port, path)))
+    authority = sys.argv[4] if len(sys.argv) > 4 else host
+    sys.exit(asyncio.run(main(host, port, path, authority)))

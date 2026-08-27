@@ -2533,6 +2533,156 @@ fn handleHttp3StaticLocation(
     return true;
 }
 
+/// Serve a request from the top-level `root`/`try_files` when no `location {}`
+/// block matched the path -- the nginx-style implicit "location /" that H1
+/// (`edge_gateway.zig`'s `resolveRequestConfig`-driven static path) and H2
+/// (`buildHttp2StaticResponse`) already fall back to, but that
+/// `routeHttp3Location` never did: it only ever served static files through an
+/// explicit `location { root ...; }` block, so a native H3 client requesting
+/// `/index.html` (or any other unmatched path) 404'd even with a top-level
+/// `root` configured, while the identical request over H1/H2 served the file
+/// (#677 black-box discovery). Deliberately does not consult
+/// `maybeResolveStaticErrorPage` for custom error pages, matching
+/// `buildHttp2StaticResponse`'s scope for this same top-level case.
+fn handleHttp3TopLevelStaticFallback(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    request_path: []const u8,
+    correlation_id: []const u8,
+) !bool {
+    if (!(std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD"))) return false;
+    if (ctx.cfg.doc_root.len == 0) return false;
+    const effective_try_files = if (ctx.cfg.try_files.len > 0) ctx.cfg.try_files else "$uri";
+
+    var served = (try http.static_file.serve(allocator, .{
+        .root = ctx.cfg.doc_root,
+        .request_path = request_path,
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = effective_try_files,
+        .autoindex = false,
+        .headers = &request.headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse return false;
+    defer served.deinit(allocator);
+
+    const is_head_req = std.mem.eql(u8, request.method, "HEAD");
+    const raw_body: []const u8 = if (is_head_req) "" else (served.body orelse "");
+    var compress_result: http.compression.CompressionResult = .{ .body = null, .compressed = false };
+    defer if (compress_result.body) |b| allocator.free(b);
+    if (!is_head_req and raw_body.len > 0) {
+        compress_result = http.compression.compressResponse(
+            allocator,
+            raw_body,
+            served.content_type,
+            request.headers.get("accept-encoding"),
+            ctx.state.compression_config,
+        );
+    }
+    const out_body: []const u8 = compress_result.body orelse raw_body;
+    _ = response
+        .setStatus(served.status_code)
+        .setBodyOwned(try allocator.dupe(u8, out_body))
+        .setContentType(served.content_type)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
+    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
+    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
+    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    if (compress_result.compressed) {
+        if (compress_result.encoding) |enc| _ = response.setHeader("Content-Encoding", enc.headerValue());
+        _ = response.setHeader("Vary", "Accept-Encoding");
+    }
+    _ = response
+        .setHeader("server", http.SERVER_NAME)
+        .setContentLength(out_body.len);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(@intFromEnum(served.status_code));
+    return true;
+}
+
+test "handleHttp3Connection serves the top-level static root when no location matches" {
+    // #677 black-box discovery: H1 and H2 both fall back to a top-level
+    // `root`/`try_files` for a path no `location {}` block matches; H3 only
+    // ever served static files through an explicit `location { root ...; }`
+    // and 404'd everything else, even with a top-level `root` configured.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "blackbox-static-ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.doc_root = root_path;
+    cfg.try_files = "$uri";
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/index.html"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Connection(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("blackbox-static-ok", response.body orelse "");
+}
+
+test "handleHttp3Connection still 404s an unmatched path when no top-level root is configured" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.doc_root = "";
+    cfg.try_files = "";
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/missing"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Connection(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 404), @intFromEnum(response.status));
+}
+
 fn rejectHttp3AuthRequiredLocation(
     allocator: std.mem.Allocator,
     response: *http.Response,
@@ -3659,6 +3809,8 @@ fn handleHttp3Connection(
             },
         }
     }
+
+    if (try handleHttp3TopLevelStaticFallback(allocator, request, response, ctx, http3_path, correlation_id)) return;
 
     const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
     _ = response

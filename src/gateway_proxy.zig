@@ -393,10 +393,6 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         if (!http.headers.isValidHeaderName(hname) or !http.headers.isValidHeaderValue(hval)) {
             return error.UpstreamProtocolError;
         }
-        if (std.ascii.eqlIgnoreCase(hname, "content-length") and representation_content_length == null) {
-            representation_content_length = try metadata_allocator.dupe(u8, hval);
-        }
-        if (gph.shouldSkipUpstreamResponseHeader(hname, null)) continue;
         // Scan the SAME header-lines view this loop itself iterates
         // (starting after the status line), not the whole `headers_raw`
         // from byte 0 (#673 review). Scanning from byte 0 let a status
@@ -406,7 +402,12 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         // Connection-nominated header from this scanner even though the
         // main loop above (which already starts past the status line)
         // parsed that same header correctly.
-        if (gph.anyRawConnectionHeaderReferencesHeader(headers_raw[status_line.header_lines_start..], hname)) continue;
+        const connection_nominated = gph.anyRawConnectionHeaderReferencesHeader(headers_raw[status_line.header_lines_start..], hname);
+        if (std.ascii.eqlIgnoreCase(hname, "content-length") and representation_content_length == null and !connection_nominated) {
+            representation_content_length = try metadata_allocator.dupe(u8, hval);
+        }
+        if (gph.shouldSkipUpstreamResponseHeader(hname, null)) continue;
+        if (connection_nominated) continue;
         try resp_headers.append(.{
             .name = try metadata_allocator.dupe(u8, hname),
             .value = try metadata_allocator.dupe(u8, hval),
@@ -1456,8 +1457,15 @@ fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.
 
     const reason = try aa.dupe(u8, gpres.upstreamReasonPhrase(@enumFromInt(h2resp.status)));
     var headers = try aa.alloc(UpstreamHeader, h2resp.headers.len);
+    var representation_content_length: ?[]const u8 = null;
     for (h2resp.headers, 0..) |h, i| {
         headers[i] = .{ .name = try aa.dupe(u8, h.name), .value = try aa.dupe(u8, h.value) };
+        if (representation_content_length == null and
+            std.ascii.eqlIgnoreCase(h.name, "content-length") and
+            !gph.anyConnectionHeaderReferencesHeader(h2resp.headers, h.name))
+        {
+            representation_content_length = try aa.dupe(u8, h.value);
+        }
     }
     const body = try allocator.dupe(u8, h2resp.body);
     return .{
@@ -1466,6 +1474,7 @@ fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.
         .reason = reason,
         .headers = headers,
         .body = body,
+        .representation_content_length = representation_content_length,
     };
 }
 
