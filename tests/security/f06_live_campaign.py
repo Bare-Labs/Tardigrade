@@ -589,6 +589,10 @@ def run_hostile_framing(up: Upstream, port: int) -> None:
                          b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcdXXXX0\r\n\r\n" + tail)
     framing_marker_case(up, "malformed_chunk_trailers", cat, port, lambda tail:
                          b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Trailer No Colon\r\n\r\n" + tail)
+    # #673 review round 8: a colon-only trailer check would have accepted
+    # this (colon present, but the name contains a space).
+    framing_marker_case(up, "chunk_trailer_colon_but_invalid_name", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Name: x\r\n\r\n" + tail)
 
     # #673 review round 7 point 3: every case above tests one MALFORMED or
     # ambiguous framing combination and asserts it is rejected (zero
@@ -839,6 +843,9 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         # #673 review round 6: RFC 9110 §15 status-code range enforcement.
         "status_code_too_low",
         "status_code_too_high",
+        # #673 review round 8: trailer lines must be valid header-field
+        # syntax, not merely "contain a colon somewhere".
+        "chunk_trailer_invalid_name",
     ]
     for scenario in core_scenarios:
         up.reset()
@@ -1013,7 +1020,17 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
     # representative pair against /hostile-streaming to prove the fix
     # actually reaches this path too, not just the buffered one the rest of
     # this suite exercises by default.
-    for scenario in ["duplicate_te", "upgrade_101_attempt", "status_code_too_low", "status_code_too_high"]:
+    # #673 review round 8: consumeChunkTrailers() (streaming) is a separate
+    # implementation from the buffered decoder's trailer validation and had
+    # no validation at all before this round -- replay against
+    # /hostile-streaming to prove the fix reaches this path too.
+    for scenario in [
+        "duplicate_te",
+        "upgrade_101_attempt",
+        "status_code_too_low",
+        "status_code_too_high",
+        "chunk_trailer_invalid_name",
+    ]:
         up.reset()
         raw = send_raw(port, hostile(scenario, "/hostile-streaming"))
         followup = send_raw(port, req("GET", "/health", []))

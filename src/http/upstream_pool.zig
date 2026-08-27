@@ -360,19 +360,21 @@ pub const UpstreamPool = struct {
     /// essentially every freshly-pooled TLS connection as "stale" and
     /// defeat TLS connection pooling outright (caught by an integration
     /// test asserting a second proxied HTTPS request reuses the pooled
-    /// connection). Use `UpstreamTlsConn.readReady()` instead: it reports
-    /// only already-decrypted, buffered plaintext the record layer has
-    /// promoted to application data (`pending() > 0`), or a completed
-    /// clean TLS shutdown (`close_notify`) — genuine signals that this
-    /// connection actually has something an unrelated caller should not
-    /// see, without decoding the mere presence of encrypted bytes as
-    /// staleness. This does not catch every conceivable timing of a
-    /// hostile TLS origin's ghost bytes (raw ciphertext that has arrived
-    /// but not yet been fed through the record layer looks the same as
-    /// "nothing pending" here), but it is a strict improvement over the
-    /// prior behavior of never checking a TLS pooled connection at all.
+    /// connection). A first fix used `UpstreamTlsConn.readReady()`, which
+    /// only reflects what a *prior* `read()` call already decrypted into
+    /// `inbound_plaintext` -- but a hostile TLS origin's ghost
+    /// application-data record can already be queued as raw ciphertext on
+    /// the fd, not yet fed through the record layer, and `readReady()`
+    /// reports "nothing pending" for that just as it would for a harmless
+    /// session ticket (#673 review round 8). `drainQueuedRecordsAndCheckReady()`
+    /// closes that gap: it nonblockingly drives the record layer through
+    /// everything currently queued (the fd is already nonblocking, so this
+    /// never waits on the network) and reports true only if genuine
+    /// application plaintext or a clean shutdown actually emerged --
+    /// distinguishing a real ghost from ordinary post-handshake chatter
+    /// instead of conflating "bytes arrived" with "unsafe to reuse".
     fn hasUnexpectedReadableBytes(conn: PooledConn) bool {
-        if (conn.tls) |tls| return tls.readReady();
+        if (conn.tls) |tls| return tls.drainQueuedRecordsAndCheckReady();
         var pfds = [_]std.posix.pollfd{.{
             .fd = conn.stream.handle,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,

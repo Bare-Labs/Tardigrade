@@ -4,6 +4,7 @@ const Method = @import("method.zig").Method;
 const Version = @import("version.zig").Version;
 const Headers = @import("headers.zig").Headers;
 const parseHeaders = @import("headers.zig").parseHeaders;
+const isValidTrailerLine = @import("headers.zig").isValidTrailerLine;
 
 /// Maximum request line size
 pub const MAX_REQUEST_LINE_SIZE = 8 * 1024; // 8KB
@@ -383,14 +384,14 @@ fn decodeChunkedBody(allocator: Allocator, data: []const u8, max_body_size: usiz
             while (true) {
                 const tlen = std.mem.find(u8, data[tpos..], "\r\n") orelse return error.InvalidChunkedBody;
                 if (tlen == 0) return .{ .body = out.toOwnedSlice(allocator) catch return error.OutOfMemory, .consumed = tpos + 2 };
-                // RFC 7230 §4.1.2: the trailer part is `*( header-field CRLF
-                // )` -- a non-blank line must actually be `name ":" value`,
-                // not arbitrary text. Without this, unstructured bytes here
-                // (which could really be the start of a pipelined next
-                // request) were silently accepted as "a trailer" (#673
-                // review).
+                // RFC 9112 §7.1.2: the trailer part is `*( field-line CRLF
+                // )` -- a non-blank line must actually be valid
+                // `field-name ":" OWS field-value OWS` syntax, not merely
+                // "contains a colon somewhere" (#673 review round 8: a
+                // colon-only check still let a malformed name/value like
+                // "Bad Name: x" or "X-Good: bad\x00value" through).
                 const trailer_line = data[tpos .. tpos + tlen];
-                if (std.mem.findScalar(u8, trailer_line, ':') == null) return error.InvalidChunkedBody;
+                if (!isValidTrailerLine(trailer_line)) return error.InvalidChunkedBody;
                 tpos += tlen + 2;
             }
         }
@@ -760,6 +761,28 @@ test "chunked body's trailer lines must actually be header-field syntax (#673 re
     var req = result.request;
     defer req.deinit();
     try std.testing.expectEqual(@as(usize, 0), req.body.?.len);
+}
+
+test "chunked body's trailer lines must be a valid header field, not just contain a colon (#673 review round 8)" {
+    // A colon-only check (the round-7 version of this validation) would
+    // have accepted all of these: a colon is present, but the name or
+    // value is malformed.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Name: x\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Bad\x00Name: x\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Good: bad\x00value\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
 }
 
 test "fuzz: Request.parse never panics on arbitrary HTTP input" {

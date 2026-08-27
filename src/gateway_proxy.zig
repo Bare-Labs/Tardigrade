@@ -1884,13 +1884,15 @@ fn decodeChunkedBody(allocator: std.mem.Allocator, encoded: []const u8, max_byte
             while (true) {
                 const tlen = std.mem.find(u8, encoded[tpos..], "\r\n") orelse return null;
                 if (tlen == 0) return .{ .body = try out.toOwnedSlice(), .consumed = tpos + 2 }; // blank line → done
-                // RFC 7230 §4.1.2: the trailer part is `*( header-field CRLF
-                // )` -- a non-blank line must actually be `name ":" value`,
-                // not arbitrary text a hostile upstream could use to hide a
-                // pipelined ghost response inside what looks like "just a
-                // trailer" (#673 review).
+                // RFC 9112 §7.1.2: the trailer part is `*( field-line CRLF
+                // )` -- a non-blank line must actually be valid
+                // `field-name ":" OWS field-value OWS` syntax, not merely
+                // "contains a colon somewhere" a hostile upstream could use
+                // to hide a pipelined ghost response inside what looks like
+                // "just a trailer" (#673 review round 8: a colon-only check
+                // still let a malformed name/value through).
                 const trailer_line = encoded[tpos .. tpos + tlen];
-                if (std.mem.findScalar(u8, trailer_line, ':') == null) return error.UpstreamProtocolError;
+                if (!http.headers.isValidTrailerLine(trailer_line)) return error.UpstreamProtocolError;
                 tpos += tlen + 2;
             }
         }
@@ -2508,8 +2510,19 @@ fn consumeChunkTrailers(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd
         }
         const avail = rb.available();
         const eol = std.mem.find(u8, avail, "\r\n").?;
+        if (eol == 0) {
+            rb.consume(2);
+            return true; // blank line terminates the trailer section
+        }
+        // RFC 9112 §7.1.2: a non-blank trailer line must actually be valid
+        // `field-name ":" OWS field-value OWS` syntax, not arbitrary text a
+        // hostile upstream could use to hide a pipelined ghost response
+        // inside what looks like "just a trailer" (#673 review round 8):
+        // the streaming response-relay path consumed any CRLF-delimited
+        // line here with no validation at all, unlike the buffered
+        // decoder's equivalent.
+        if (!http.headers.isValidTrailerLine(avail[0..eol])) return error.UpstreamProtocolError;
         rb.consume(eol + 2);
-        if (eol == 0) return true; // blank line terminates the trailer section
     }
 }
 
@@ -3847,6 +3860,23 @@ test "exchange rejects an upstream chunked body whose trailer line has no colon 
     ));
 }
 
+test "exchange rejects an upstream chunked trailer that has a colon but is not a valid header field (#673 review round 8)" {
+    // A colon-only check (the round-7 version of this validation) would
+    // have accepted all of these: a colon is present, but the name or
+    // value is malformed.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UpstreamProtocolError, exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\nBad Name: x\r\n\r\n",
+    ));
+    try std.testing.expectError(error.UpstreamProtocolError, exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\nX-Good: bad\x00value\r\n\r\n",
+    ));
+}
+
 test "exchange rejects a chunk whose data is not terminated by CRLF (#673 review)" {
     // Mirrors "streaming relay rejects a chunk not terminated by CRLF":
     // the two bytes immediately after a chunk's data must be a literal
@@ -4130,6 +4160,30 @@ test "streaming relay rejects a chunk not terminated by CRLF" {
         allocator,
         "GET",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n",
+        false,
+        &body,
+    ));
+}
+
+test "streaming relay rejects a chunk trailer that is not a valid header field (#673 review round 8)" {
+    // consumeChunkTrailers() (the streaming response-relay's trailer
+    // consumer) used to accept any CRLF-delimited line here with no
+    // validation at all -- not even a colon check -- unlike the buffered
+    // decoder's equivalent.
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    try std.testing.expectError(error.UpstreamProtocolError, runStreamingRelay(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nBad Trailer No Colon\r\n\r\n",
+        false,
+        &body,
+    ));
+    try std.testing.expectError(error.UpstreamProtocolError, runStreamingRelay(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nBad Name: x\r\n\r\n",
         false,
         &body,
     ));

@@ -199,6 +199,28 @@ pub fn isValidHeaderValue(value: []const u8) bool {
     return true;
 }
 
+/// Whether a non-blank chunked-encoding trailer line is actually
+/// `field-name ":" OWS field-value OWS` syntax (RFC 9112 §7.1.2's
+/// trailer-part is `*( field-line CRLF )`), not merely "contains a colon
+/// somewhere". The single invariant every trailer-consuming implementation
+/// in this codebase (buffered request/response decoders, streaming
+/// request-upload reader, streaming response-relay trailer consumer) must
+/// use, so this cannot drift out of sync between them the way the
+/// status-line boundary once did (#673 review).
+///
+/// The field-name is validated on the bytes exactly as they appear before
+/// the colon -- a space or other invalid byte immediately before it is
+/// part of the name for this check and is NOT trimmed away first, since
+/// RFC 7230/9112 treat whitespace between the field name and the colon as
+/// invalid framing (a historical request/response-splitting ambiguity),
+/// not benign padding to tolerate.
+pub fn isValidTrailerLine(line: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    const name = line[0..colon];
+    const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+    return isValidHeaderName(name) and isValidHeaderValue(value);
+}
+
 /// Parse headers from a buffer
 /// Returns the headers and the position after the header block
 pub fn parseHeaders(allocator: Allocator, data: []const u8) !struct { headers: Headers, body_start: usize } {
@@ -428,6 +450,31 @@ test "isValidHeaderValue rejects CR LF and NUL but allows HTAB and printable cha
     try std.testing.expect(!isValidHeaderValue("val\x1Fue"));
     // DEL
     try std.testing.expect(!isValidHeaderValue("val\x7Fue"));
+}
+
+test "isValidTrailerLine requires an actual header-field, not just a colon anywhere (#673 review)" {
+    // Well-formed trailers are accepted.
+    try std.testing.expect(isValidTrailerLine("X-Checksum: abc123"));
+    try std.testing.expect(isValidTrailerLine("X-Checksum:abc123")); // OWS around value is optional
+    try std.testing.expect(isValidTrailerLine("X-Empty: "));
+
+    // No colon at all.
+    try std.testing.expect(!isValidTrailerLine("Bad Trailer No Colon"));
+
+    // A colon is present, but the name is malformed -- a colon-only check
+    // (the round-7 version of this validation) would have accepted all of
+    // these.
+    try std.testing.expect(!isValidTrailerLine("Bad Name: x")); // space in name
+    try std.testing.expect(!isValidTrailerLine("X-Bad\x00Name: x")); // NUL in name
+    try std.testing.expect(!isValidTrailerLine("X-Bad\x01Name: x")); // other CTL in name
+    // A space immediately before the colon is part of the name for this
+    // check, not trimmed away first (RFC 7230/9112 treat it as invalid
+    // framing, not benign padding).
+    try std.testing.expect(!isValidTrailerLine("X-Trailing-Space : x"));
+
+    // The name is fine, but the value is malformed.
+    try std.testing.expect(!isValidTrailerLine("X-Good: bad\x00value")); // NUL in value
+    try std.testing.expect(!isValidTrailerLine("X-Good: bad\rvalue")); // bare CR in value
 }
 
 test "parseHeaders rejects CRLF injection in header value" {

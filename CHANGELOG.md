@@ -5,7 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Twenty-five auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Twenty-seven auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
   hostile one, on both the buffered and a forced-streaming proxy route) and
@@ -131,14 +131,26 @@ All notable user-facing changes to Tardigrade are documented here.
     declared boundary (not just the already-covered bodiless case), could
     still poison a later, unrelated request over the same connection. Fixed
     with a transport-aware staleness check: a raw-fd poll for plain
-    connections, and `UpstreamTlsConn.readReady()` for TLS ones (a raw-fd
-    poll on TLS connections flagged routine post-handshake protocol chatter,
-    e.g. session tickets, as staleness and broke TLS connection pooling
-    outright -- caught before merge by the native-TLS integration suite).
+    connections (a raw-fd poll on TLS connections flagged routine
+    post-handshake protocol chatter, e.g. session tickets, as staleness and
+    broke TLS connection pooling outright -- caught before merge by the
+    native-TLS integration suite), and for TLS connections, nonblockingly
+    driving the record layer through everything already queued and checking
+    whether genuine application plaintext or a clean shutdown emerges (an
+    intermediate version checked only already-decrypted plaintext, which
+    missed a hostile origin's ghost record arriving as raw, not-yet-driven
+    ciphertext).
+  - The two newly-added chunked-body trailer checks validated only "does
+    this line contain a colon", not real `field-name: value` syntax -- and
+    two more production trailer-consuming implementations (the streaming
+    request-upload reader and the streaming response-relay's trailer
+    consumer) had no validation at all. Fixed with one shared validator
+    used by all four.
 
-  All twenty-five fixed with regression coverage in `gateway_proxy_headers.zig`,
+  All twenty-seven fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
-  `src/gateway_connection.zig`, `src/http/upstream_pool.zig`, and
+  `src/gateway_connection.zig`, `src/http/upstream_pool.zig`,
+  `src/http/upstream_tls.zig`, `src/http/chunked_upload.zig`, and
   `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the full
   campaign writeup.
 

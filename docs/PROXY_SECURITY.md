@@ -283,13 +283,28 @@ after a nonzero chunk, with no terminating zero-size chunk ever seen, is a
 truncated body and is rejected (`error.InvalidChunkedBody`) rather than
 accepted as if it ended there. The trailer section following the
 terminating chunk must reach its own blank-line terminator, and each
-non-blank trailer line must actually be `header-field` syntax (RFC 7230
-§4.1.2 — contain a colon); a trailer line with no colon is rejected rather
-than treated as free text. `Request.parse()` reports exactly how many bytes
-of the input a chunked body's encoding consumed, so a pipelined next
+non-blank trailer line must actually be valid `field-name ":" OWS
+field-value OWS` syntax (RFC 9112 §7.1.2), not merely "contains a colon
+somewhere" (#673 review round 8): the name is validated with the same
+`isValidHeaderName()` an ordinary request header uses, on the bytes exactly
+as they appear before the colon — a space immediately before it is part of
+the name for this check and is not trimmed away first, since RFC 7230/9112
+treat that as invalid framing rather than benign padding — and the value
+with `isValidHeaderValue()`. `Request.parse()` reports exactly how many
+bytes of the input a chunked body's encoding consumed, so a pipelined next
 request sitting immediately after the real terminator is left for the next
 parse rather than being silently swallowed into (or corrupting) the
 current request's consumed-bytes count.
+
+This trailer-line validation is one shared function, `isValidTrailerLine()`
+in `src/http/headers.zig`, used by all four chunked-trailer-consuming
+implementations in the codebase: the buffered request decoder just
+described, the buffered upstream-response decoder (§11 below), the
+streaming request-upload reader (`http.chunked_upload.Reader`), and the
+streaming upstream-response relay's trailer consumer (§11 below) — the
+first two originally shipped with only a colon-presence check, and the
+latter two originally had no validation at all, until round 8 closed all
+four onto the one invariant.
 
 This same completeness requirement is enforced *before* `Request.parse()`
 is even called: on the buffered H1 path, `firstRequestCompleteLen()`
@@ -417,7 +432,11 @@ reusable, on both proxy paths (#673). Each chunk's data must also be
 followed by a literal CRLF, not merely two arbitrary bytes the decoder
 skips past, and chunk-size arithmetic uses checked addition so a
 maliciously oversized hex chunk-size is rejected as a protocol error
-instead of overflowing.
+instead of overflowing. Each non-blank trailer line must be valid
+`field-name ":" OWS field-value OWS` syntax, the same `isValidTrailerLine()`
+invariant described in §9 above — on **both** the buffered decoder and the
+streaming path's separate trailer consumer (`consumeChunkTrailers()`),
+which originally had no trailer validation at all (#673 review round 8).
 
 All of the framing-correctness rules above only prove a connection was in
 sync *at the instant it was released* back to the keep-alive pool. A
@@ -444,11 +463,24 @@ send a `NewSessionTicket` (or other post-handshake, record-layer-only
 message) asynchronously right after the handshake, with no relationship to
 application data — that ciphertext shows up as immediately readable on the
 raw fd regardless, which would flag essentially every freshly-pooled TLS
-connection as stale and defeat TLS connection pooling outright. TLS
-connections instead check `UpstreamTlsConn.readReady()`: already-decrypted
-buffered plaintext, or a completed clean TLS shutdown — signals that
-distinguish genuine leftover application data from ordinary protocol
-chatter.
+connection as stale and defeat TLS connection pooling outright.
+
+TLS connections check `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`.
+An earlier version of this check used `readReady()` (already-decrypted
+buffered plaintext, or a completed clean TLS shutdown), but that only
+reflects what a *prior* `read()` call already decrypted — a hostile TLS
+origin's ghost application-data record can already be queued as raw
+ciphertext on the fd, not yet fed through the record layer, and
+`readReady()` would report "nothing pending" for that exactly as it would
+for a harmless session ticket (#673 review round 8).
+`drainQueuedRecordsAndCheckReady()` closes that gap: it nonblockingly
+drives the record layer through everything currently queued on the raw fd
+(the fd is already nonblocking for this client, so `drive()` never waits
+on the network — the same primitive `read()` itself uses before ever
+calling `waitForFd()`) and reports "do not reuse" only if genuine
+application plaintext or a clean shutdown actually emerges from that,
+correctly letting protocol-only traffic like a `NewSessionTicket` through
+without discarding a still-healthy connection.
 
 Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `parseBufferedUpstreamResponse()`, `detectResponseFraming()`,
@@ -456,8 +488,9 @@ Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `readUpstreamHead()`/`streamProxyOverTransport()`/`relayUpstreamBody()`
 (the streaming path's equivalents) in `src/gateway_proxy.zig`;
 `UpstreamPool.checkout()`/`hasUnexpectedReadableBytes()` in
-`src/http/upstream_pool.zig`; `UpstreamTlsConn.readReady()`/`pending()` in
-`src/http/upstream_tls.zig`.
+`src/http/upstream_pool.zig`;
+`UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`/`readReady()`/
+`pending()` in `src/http/upstream_tls.zig`.
 
 ## 12. Directory Traversal — Static File Serving
 

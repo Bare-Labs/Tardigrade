@@ -423,6 +423,46 @@ pub const UpstreamTlsConn = struct {
         return self.state.record.inbound_plaintext.len > 0 or self.state.record.peer_closed;
     }
 
+    /// Bounds `drainQueuedRecordsAndCheckReady`'s drive loop against a
+    /// pathologically fragmented record stream. A real TLS post-handshake
+    /// message (e.g. a `NewSessionTicket`) is a handful of records at most;
+    /// this is a generous upper bound on iterations, not a time budget --
+    /// `drive()` never blocks, so exceeding it can only mean an unexpectedly
+    /// long run of already-arrived records, not a slow peer.
+    const max_drain_iterations = 256;
+
+    /// Drains any TLS records already sitting on the raw fd (a
+    /// `NewSessionTicket`, key update, or other post-handshake,
+    /// record-layer-only traffic) without blocking, then reports whether
+    /// genuine application data or a clean shutdown emerged. Unlike
+    /// `readReady()`, which only reflects what a PRIOR `read()` call
+    /// already decrypted, this proactively drives newly-arrived-but-undriven
+    /// ciphertext through the record layer -- closing the gap where a
+    /// hostile origin's ghost application-data record has arrived on the
+    /// wire but has not yet been fed through it (#673 review round 8: a
+    /// pooled connection is only safe to reuse if nothing at all -- decrypted
+    /// or still-queued -- is waiting on it).
+    ///
+    /// Safe to call with nothing pending: the underlying fd is nonblocking
+    /// (see the module doc comment), so `drive()` never blocks waiting for
+    /// more bytes -- it either makes progress on what is already queued or
+    /// reports no progress immediately, the same primitive `read()` itself
+    /// uses before ever calling `waitForFd()`. Fails closed (reports
+    /// "ready", i.e. do not reuse) on a drive error or on hitting the
+    /// iteration bound, rather than risking a false "clean" result.
+    pub fn drainQueuedRecordsAndCheckReady(self: *UpstreamTlsConn) bool {
+        const record = &self.state.record;
+        var iterations: usize = 0;
+        while (true) {
+            if (record.inbound_plaintext.len > 0 or record.peer_closed) return true;
+            if (iterations >= max_drain_iterations) return true;
+            iterations += 1;
+            const result = record.drive() catch return true;
+            if (record.inbound_plaintext.len > 0 or record.peer_closed) return true;
+            if (!result.made_progress) return false;
+        }
+    }
+
     /// The ALPN protocol validated immediately after the handshake completed.
     pub fn negotiatedProtocol(self: *const UpstreamTlsConn) NegotiatedProtocol {
         return self.protocol;

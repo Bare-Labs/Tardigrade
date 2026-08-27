@@ -184,6 +184,13 @@ HOSTILE_SCENARIOS = {
     # digits alone also admits 000..099 and 600..999 (#673 review round 6).
     "status_code_too_low": b"HTTP/1.1 099 Weird\r\nContent-Length: 2\r\n\r\nok",
     "status_code_too_high": b"HTTP/1.1 600 Weird\r\nContent-Length: 2\r\n\r\nok",
+    # A colon is present, but the trailer name is malformed (RFC 9112
+    # §7.1.2's trailer part is *( field-line CRLF ), not "any line with a
+    # colon somewhere") -- a colon-only check (the round-7 version of this
+    # validation) would have accepted this (#673 review round 8).
+    "chunk_trailer_invalid_name": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nBad Name: x\r\n\r\n"
+    ),
     # #673 review round 7 point 4: a hostile origin drip-feeding interim
     # responses forever must not tie up the streaming path indefinitely or
     # grow its memory unbounded. 80 interim responses is comfortably past

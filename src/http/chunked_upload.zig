@@ -13,6 +13,7 @@
 //! connection, or a test fixture.
 
 const std = @import("std");
+const isValidTrailerLine = @import("headers.zig").isValidTrailerLine;
 
 pub const Error = error{
     /// The downstream chunk framing is malformed (bad size line, missing
@@ -135,11 +136,17 @@ pub fn Reader(comptime Conn: type) type {
         }
 
         /// Consume the (possibly empty) trailer section that closes the body.
+        /// Trailers are dropped rather than forwarded, but a non-blank line
+        /// must still be valid `field-name ":" OWS field-value OWS` syntax
+        /// (RFC 9112 §7.1.2), not arbitrary text -- otherwise a client could
+        /// hide bytes here that never get the same validation an ordinary
+        /// request header would (#673 review round 8).
         fn consumeTrailers(self: *Self) Error!void {
             var lines: usize = 0;
             while (lines <= max_trailer_lines) : (lines += 1) {
                 try self.readLine();
                 if (self.line_len == 0) return; // empty line terminates trailers
+                if (!isValidTrailerLine(self.line_buf[0..self.line_len])) return Error.InvalidChunkedUpload;
             }
             return Error.InvalidChunkedUpload;
         }
@@ -244,6 +251,29 @@ test "chunked upload reader consumes a trailer section" {
     const decoded = try decodeAll(allocator, "", "5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n", 1024, 64, 64);
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings("hello", decoded);
+}
+
+test "chunked upload reader rejects a trailer line that is not a valid header field (#673 review round 8)" {
+    // This reader used to accept ANY non-blank line here with no validation
+    // at all -- not even a colon check -- unlike the buffered decoder's
+    // equivalent (Request.parse()'s decodeChunkedBody()).
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(Error.InvalidChunkedUpload, decodeAll(
+        allocator,
+        "",
+        "5\r\nhello\r\n0\r\nBad Trailer No Colon\r\n\r\n",
+        1024,
+        64,
+        64,
+    ));
+    try std.testing.expectError(Error.InvalidChunkedUpload, decodeAll(
+        allocator,
+        "",
+        "5\r\nhello\r\n0\r\nBad Name: x\r\n\r\n",
+        1024,
+        64,
+        64,
+    ));
 }
 
 test "chunked upload reader leaves the connection positioned after the body" {

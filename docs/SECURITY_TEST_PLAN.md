@@ -146,7 +146,7 @@ client got a 4xx -- and every smuggling-shaped framing probe additionally
 appends a unique pipelined marker request to prove it is never dispatched,
 not just that the malformed probe itself was rejected.
 
-Coverage (154 live cases):
+Coverage (159 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
   oversized token, malformed/invalid-signature JWT, comma-joined
   `Authorization`, NUL/CR injection attempts), including a strict deny for
@@ -229,9 +229,13 @@ Coverage (154 live cases):
   chunked response that legitimately lands on its declared boundary (not
   just the already-covered bodiless case), never poisons a later, unrelated
   request over the same pooled upstream connection, on both the buffered
-  and streaming paths.
+  and streaming paths;
+- a chunked-body trailer line with a colon but a malformed name (e.g. a
+  space in it) is rejected on both the request direction (with valid auth,
+  so the parser rejection is what is actually proven) and the response
+  direction (both the buffered and forced-streaming hostile routes).
 
-The campaign found and fixed twenty-five real defects, all now covered by
+The campaign found and fixed twenty-seven real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -500,10 +504,71 @@ deterministic regression tests:
     fd regardless of whether any application data was ever sent, flagging
     essentially every freshly-pooled TLS connection as stale (caught by
     `zig build test-integration-native-tls`'s pooled-TLS-reuse assertion
-    failing in CI). Fixed by using `UpstreamTlsConn.readReady()` for TLS
-    connections instead -- already-decrypted buffered plaintext or a clean
-    TLS shutdown, which distinguishes genuine leftover application data
-    from ordinary post-handshake protocol chatter.
+    failing in CI). Fixed (first pass) by using `UpstreamTlsConn.readReady()`
+    for TLS connections instead -- already-decrypted buffered plaintext or a
+    clean TLS shutdown, which distinguishes genuine leftover application
+    data from ordinary post-handshake protocol chatter. **Still incomplete**,
+    per defect 27 below: `readReady()` only reflects what a *prior* `read()`
+    call already decrypted, not ciphertext that has arrived on the wire but
+    not yet been driven through the record layer.
+26. Both newly-added chunked-body trailer checks (defect 22, request and
+    response direction) validated only "does this non-blank line contain a
+    colon", not that it is actually valid `field-name ":" OWS field-value
+    OWS` syntax (RFC 9112 §7.1.2) -- so `Bad Name: x` (space in the name),
+    `X-Bad\x00Name: x` (NUL in the name), or `X-Good: bad\x00value` (NUL in
+    the value) all satisfied the check despite being malformed HTTP fields.
+    On top of that, two more production trailer-consuming implementations
+    had **no** validation at all, not even a colon check: the streaming
+    request-upload decoder (`http.chunked_upload.Reader.consumeTrailers()`)
+    and the streaming response-relay's trailer consumer
+    (`consumeChunkTrailers()` in `gateway_proxy.zig`) -- so defect 22 was not
+    actually closed on the production paths the campaign now exercises via
+    the forced-streaming route and the streaming upload path. Fixed by
+    adding one shared validator, `isValidTrailerLine()` in
+    `src/http/headers.zig` (splits on the first colon, validates the name
+    bytes exactly as they appear before it with `isValidHeaderName()` --
+    critically, without trimming a space immediately before the colon into
+    validity first, since RFC 7230/9112 treat that as invalid framing, not
+    padding -- and the value with `isValidHeaderValue()`), and switching all
+    four trailer-consuming implementations to call it, so this cannot drift
+    out of sync between them the way the status-line boundary once did.
+27. `UpstreamTlsConn.readReady()` (defect 25's fix) only reports
+    already-decrypted plaintext (`pending() > 0`) or an already-observed
+    clean shutdown -- it does not drive the record layer to process
+    ciphertext that has newly arrived on the raw fd but has not yet been
+    fed through it. A hostile TLS origin can send a second application-data
+    TLS record immediately after a legitimate first response and before the
+    connection is next checked out; that record can already be queued on
+    the fd while `inbound_plaintext` is still empty, so `readReady()`
+    reports "nothing pending" for it exactly as it would for a harmless
+    session ticket -- the poisoned connection gets reused, and the next
+    `read()`/`writeAll()` drive decrypts the ghost as if it were the
+    unrelated next request's response. Fixed with
+    `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`: it nonblockingly
+    drives the record layer through everything currently queued on the raw
+    fd (the fd is already nonblocking for this client, so `drive()` never
+    waits on the network -- the same primitive `read()` itself uses before
+    ever calling `waitForFd()`) and reports "do not reuse" only if genuine
+    application plaintext or a clean shutdown actually emerges from that,
+    correctly letting protocol-only traffic like a `NewSessionTicket`
+    through without discarding a still-healthy connection.
+
+    **Known coverage gap**: this fix's correctness is established by code
+    review (it drains through the exact same nonblocking `drive()`/
+    `made_progress` primitive `read()` already trusts in production, and
+    the existing native-TLS pooled-reuse integration test continues to pass
+    with it in place) and by the F-06 campaign's plain-HTTP pool-staleness
+    coverage above, which exercises the same `checkout()` code path for the
+    non-TLS branch. It does **not** yet have a dedicated regression test
+    that drives a real two-sided TLS handshake and injects a hostile
+    ghost application-data record before checkout, because no existing
+    test in this codebase performs an in-process client+server TLS
+    handshake (the only precedent, `test-integration-native-tls`, spawns
+    two full separate `tardi` processes, which cannot be made to act
+    hostile without a purpose-built malicious TLS origin). Building that
+    harness is tracked as follow-up work rather than blocking this fix,
+    per the review's own stated fallback: prefer a working, reasoned fix
+    with an honestly-scoped test gap over deferring the fix itself.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
@@ -513,7 +578,7 @@ forced-streaming `/hostile-streaming` twin -- plus a symlink and an
 `tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
 results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials
 are synthetic and local-only; no production secrets or traffic were used.
-154/154 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
+159/159 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
 script for current evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference
