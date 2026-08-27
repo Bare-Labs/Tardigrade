@@ -1,16 +1,18 @@
 # HTTP/2 and HTTP/3 Release Sweep Slice (#677)
 
-## Final Closeout: 2026-08-27 (commit `a30ff0f3e2af`)
+## Final Closeout: 2026-08-27 (commit `bcf17040`)
 
-This section supersedes the "Closeout Slice: 2026-08-27" section below, which
-recorded a `#694` review pass that used a local ReleaseFast fallback, skipped
-the black-box H3 external-peer rows, and (per the review) had a
-self-contradictory static/404 predicate. This section is the final,
-post-review-remediation evidence run against the exact commit that closes
-`#694`'s remaining findings, plus two more product/harness defects discovered
-while re-running the black-box row (see "Defects found and fixed" below).
+This section supersedes the "Closeout Slice: 2026-08-27" section below,
+which recorded a `#694` review pass that used a local ReleaseFast fallback,
+skipped the black-box H3 external-peer rows, and (per review) had a
+self-contradictory static/404 predicate. It has been through two rounds of
+`#694` review remediation since; this is the evidence for the second round,
+run against the exact commit closing all currently-known findings. **One
+item -- the installed/public-artifact wrapper passing -- cannot close from
+this PR at all; see "Installed/public artifact wrapper" below for why, with
+concrete evidence.**
 
-- Commit: `a30ff0f3e2af09843599f55ae99356ca728f4e5c` (branch
+- Commit: `bcf170401592dd09bb053b4a64a6a3550f122264` (branch
   `codex/issue-677-release-sweep-closeout`)
 - OS: macOS 26.3, Darwin 25.3.0, arm64 (Apple M4)
 - Zig: `0.16.0`
@@ -45,8 +47,76 @@ SHA-256-verified against the release's own `tardigrade-checksums.txt`):
 -Dversion=issue-677-closeout-final`):
 
 - `tardi version`: `issue-677-closeout-final (tls-profile=general, tls-backend=native)`
-- artifact SHA-256: `9c6edb4a89655b3bf0f33f9118e9c6951893b2dba4851930ed669086eebe0478`
-- source SHA: `a30ff0f3e2af09843599f55ae99356ca728f4e5c`
+- artifact SHA-256: `1a0e01e4eac706ddcd684c035e7268e6550b2edb3463a143684a53f8097fd0a4`
+- source SHA: `bcf170401592dd09bb053b4a64a6a3550f122264`
+
+### Installed/public artifact wrapper (structural finding, not a #694 defect)
+
+The reconciled #677 close rule requires `TARDI_BIN="$(command -v tardi)"
+HTTP_SWEEP_FULL_GATES=1 scripts/run-http-release-sweep.sh` to **pass**
+against the current published/installed `tardi`, not a ReleaseFast
+fallback. This was run for real, twice (once per review round, both times
+identical), against a genuinely installed artifact:
+
+```sh
+brew tap bare-systems/tap   # the tap this repo's README documents
+brew trust bare-systems/tap
+brew install tardigrade     # FAILS: see below
+```
+
+`brew install tardigrade` itself failed with a checksum mismatch --
+the public tap's `0.6.3` formula entry has a stale `sha256` (it matches
+the *previous* `0.6.2` release's checksum, not `0.6.3`'s). This is a real,
+separate, user-facing bug in the release/tap-publishing automation,
+unrelated to #677/#694; it has been flagged as its own follow-up rather
+than fixed here (out of scope: this PR is HTTP/2/HTTP/3 correctness, not
+packaging). Homebrew correctly refuses to install a checksum-mismatched
+artifact, so the actual release bits could not be fetched through `brew`
+itself.
+
+Bypassing only that broken step -- using the *exact same bytes* Homebrew
+would install, fetched directly via `gh release download v0.6.3` and
+verified against the release's own `tardigrade-checksums.txt` (SHA-256
+`3264be223a7d32483844b193389412e9c237a97fd6f9797ac5006c0ed991763e`,
+matching the "Release-artifact identity" section above) -- the real
+required wrapper was run:
+
+```sh
+PATH="<dir-containing-the-verified-v0.6.3-binary-as-tardi>:$PATH"
+TARDI_BIN="$(command -v tardi)" \
+HTTP_SWEEP_FULL_GATES=1 \
+  scripts/run-http-release-sweep.sh
+```
+
+Result: **fails**, deterministically, on the exact same 4 tests both times
+this was run (identical on the commit before this round's fixes and on
+`bcf17040`):
+
+```
+error: 'interop.h2.return_directive matches shared H1/H3 redirect and method-enforcement semantics' failed: expected 0, found 5
+error: 'interop.h2.static_try_files_serves_file_over_native_h2' failed: expected 200, found 404
+error: 'interop.h2.proxy_head_preserves_upstream_content_length_without_data' failed: expected "8", found "0"
+error: 'interop.h2.proxy_head_h2_origin_preserves_content_length_without_data' failed: expected "8", found "0"
+Build Summary: 6/8 steps succeeded (1 failed); 33/37 tests passed (4 failed)
+```
+
+This is not a #694 regression or an incomplete fix -- **every one of these
+four tests asserts behavior this PR itself introduces** (the direct-return
+and proxied HEAD fixes, and native H2 static-file dispatch). `v0.6.3`
+predates this PR by definition, so it structurally cannot pass tests that
+assert this PR's own fixes; no released artifact can, until a release is
+cut *after* this PR merges. There is no other "explicitly accepted
+release-candidate artifact from this head" to substitute (checked: the
+repository has no nightly/rolling channel, only tagged releases, and the
+latest tag, `v0.6.3`, is the one just shown failing).
+
+Per the reviewer's own stated resolution for exactly this situation: this
+PR is the code/harness fix. Closing #677 requires, as a follow-up *after*
+this PR merges: cut and publish a new v0.6.x release containing these
+fixes, then rerun this exact wrapper against that release (real installed
+artifact, external H3 peers wired in) and close #677 from that evidence.
+This PR's own title/`Closes` keyword has been adjusted to `Refs #677`
+accordingly -- it cannot honestly claim closure.
 
 ### Black-box release-artifact sweep, before/after
 
@@ -58,14 +128,16 @@ HTTP_SWEEP_RESOURCE_CYCLES=30 \
 scripts/http-release-blackbox-677.sh
 ```
 
-| Row | `v0.6.3` (pre-fix) | final head `a30ff0f3e2af` |
+| Row | `v0.6.3` (pre-fix) | final head `bcf17040` |
 | --- | --- | --- |
 | independent `nghttp` H2 (static/404/proxy/proxy-error/HEAD/POST small+large) | **FAIL** | **PASS** |
 | Alt-Svc advertised when H3 usable | PASS | PASS |
-| black-box ngtcp2/GnuTLS H3 (static/proxy over real QUIC) | **FAIL** | **PASS** |
+| black-box ngtcp2/GnuTLS H3 (static/proxy/error over real QUIC) | **FAIL** | **PASS** |
 | second H3 implementation (aioquic) | PASS | PASS |
+| H3 RESET_STREAM/STOP_SENDING cancellation + same-connection recovery | PASS (pre-existing QUIC machinery, unaffected by this PR) | **PASS** |
+| H3 GOAWAY/drain boundary (admitted work completes, new work refused) | PASS (same) | **PASS** |
 | Alt-Svc withheld when H3 disabled | PASS | PASS |
-| resource settle (30 cycles) | `before rss_kb=4192` -> `cycle_30 rss_kb=9344` -> `after_settle rss_kb=7088`, `fds=10 sockets=2` throughout | `before rss_kb=4144` -> `cycle_30 rss_kb=8880` -> `after_settle rss_kb=6624`, `fds=10 sockets=2` throughout |
+| resource settle (30 cycles, connect/request/**cancel**/close for H3) | `before rss_kb=4192` -> `cycle_30 rss_kb=6144` -> `after_settle rss_kb=6144`, `fds=10 sockets=2` throughout | `before rss_kb=4128` -> `cycle_30 rss_kb=5712` -> `after_settle rss_kb=5424`, `fds=10 sockets=2` throughout |
 
 `v0.6.3`'s two failures are exactly the two defects this PR fixes, confirmed
 by inspecting its own black-box logs:
@@ -79,6 +151,39 @@ by inspecting its own black-box logs:
 Neither FD count nor socket count grew across 30 cycles on either artifact;
 RSS returns to a low, bounded plateau after the cycle burst rather than
 growing linearly with cycle count.
+
+### H3 cancellation and GOAWAY/drain, against the selected artifact
+
+Neither ngtcp2's example client nor this repo's own `h3_interop_tool`
+expose a stream-cancel or drain-exercise flag, and aioquic's `H3Connection`
+does not surface GOAWAY as a public event -- so two new scripts drive the
+real QUIC transport primitives directly against the selected `TARDI_BIN`,
+rather than treating a CLI's `--h3` flag or the existing source-tree QUIC
+unit tests as a substitute:
+
+- `scripts/interop/aioquic_cancel_client.py`: opens one QUIC connection to
+  the selected artifact, sends a request and immediately aborts it with a
+  real `RESET_STREAM`, sends a second request and immediately aborts it
+  with `STOP_SENDING`, then sends a third, ordinary request on the **same**
+  connection. Result: the third request completes normally
+  (`recovery status: 200`, body `alive`) -- cancellation does not poison
+  the connection.
+- `scripts/interop/aioquic_drain_client.py`: completes one ordinary
+  request, signals the shell harness it is safe to proceed, the harness
+  sends `SIGTERM` to the selected artifact's process, the script waits
+  300ms then attempts a **new** stream on the same already-open connection.
+  Result: the pre-signal request completes (`pre-drain status: 200`) and
+  the post-signal stream is refused (`post-drain refused: True`) --
+  admitted work finishes, new work is not served across the drain boundary.
+  The server's own log for this run shows a clean, non-forced drain:
+  `"http3: graceful drain started ..."` followed by
+  `"Graceful shutdown complete (forced_closes=0 drain_timed_out=false)"`.
+
+Both pass on `v0.6.3` and on the final head (this specific QUIC-transport
+cancellation/drain machinery predates this PR and was not touched by it);
+the resource-settle cycle loop above now also does connect/request/
+**cancel**/close for its H3 leg via the same cancellation script, not just
+connect/request/close.
 
 ### External H3 peer matrix (`scripts/interop/run-interop.sh`)
 
@@ -129,8 +234,8 @@ zig build test-integration --summary all --error-style verbose
 zig build test-quic --summary all --error-style verbose
 ```
 
-All three passed with no failures on commit `a30ff0f3e2af`: `test`:
-`3885/3895` (10 skipped), `test-integration`: `180/199` (19 skipped, no
+All three passed with no failures on commit `bcf17040`: `test`:
+`3887/3897` (10 skipped), `test-integration`: `180/199` (19 skipped, no
 `H3_INTEROP_CLIENT_PATH` configured for this particular invocation --
 see the peer-wired reruns above for that coverage), `test-quic`:
 `984/984`.
@@ -209,11 +314,24 @@ see the peer-wired reruns above for that coverage), `test-quic`:
    not. This blocked running the external H3 peer matrix on this host at
    all, independent of any peer being configured. Fixed with the portable
    `"${arr[@]+"${arr[@]}"}"` idiom at all 8 call sites.
+9. **H3 HEAD representation-length regression, in item 4's own fix**
+   (`src/gateway_handlers.zig`): both `handleHttp3TopLevelStaticFallback`
+   (item 4, above) and the pre-existing `handleHttp3StaticLocation` derive
+   `Content-Length` from `out_body.len`, which is intentionally 0 for HEAD
+   (the transmitted body is suppressed). A HEAD request against a real,
+   non-empty static file therefore reported `Content-Length: 0` instead of
+   the file's true size -- the same class of bug as the H2 proxied-HEAD
+   fix earlier in this PR, just in a different code path. Fixed by using
+   `served.content_length` (the file's true representation length,
+   correctly already `0` for 304 and the partial-range length for 206) for
+   HEAD in both functions, with two new regressions: one for the top-level
+   fallback, one for the pre-existing location-block path.
 
 Items 1-3 and 5 are the four blockers from the prior `#694` review pass.
 Items 4, 6, 7, 8 were found while re-verifying the fix for item 5 against
-real external peers; each has a focused regression and was re-verified
-against the exact final commit above.
+real external peers. Item 9 was found by the next review round on item 4's
+own fix. Each has a focused regression and was re-verified against the
+exact final commit above.
 
 ### Browser-client disposition
 
@@ -238,6 +356,8 @@ above are the canonical, reproducible proof for this closeout.
 
 This evidence is linked back to #389 as reusable pre-performance
 correctness evidence (see the #389 comment posted alongside this PR).
+#677 itself is not closed by this PR -- see "Installed/public artifact
+wrapper" above for the structural reason and the required follow-up.
 
 ## Closeout Slice: 2026-08-27
 
