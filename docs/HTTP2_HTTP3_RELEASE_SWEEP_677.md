@@ -5,6 +5,64 @@ It records what was run on an ordinary macOS development host before the
 dedicated release-artifact, browser, malformed-input, and external-peer matrix
 can be completed.
 
+## Closeout Slice: 2026-08-27
+
+- Source SHA before this PR commit: `9e871817e82b9aec28060b0e7a26a5f2f388f470`
+- Branch: `codex/issue-677-release-sweep-closeout`
+- OS: macOS 26.3, Darwin 25.3.0, arm64
+- Zig: `0.16.0`
+- curl: `8.7.1`
+- nghttp: `nghttp2/1.69.0`
+- OpenSSL: `3.6.3`
+- Installed `tardi` on PATH: unavailable in this environment; the repeatable
+  harness now accepts `TARDI_BIN` and was exercised against the local
+  ReleaseFast fallback artifact.
+- Browser version discovery: Chrome `152.0.7977.64`, Firefox `150.0.3`, Safari
+  `26.3`; no automated in-browser HTTP/3 protocol proof was run from this
+  terminal-only environment.
+
+ReleaseFast fallback artifact:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dversion=issue-677-blackbox \
+  --summary all --error-style verbose
+TARDI_BIN="$PWD/zig-out/bin/tardi" HTTP_SWEEP_RESOURCE_CYCLES=4 \
+  scripts/run-http-release-sweep.sh
+```
+
+Results:
+
+- build: passed, `4/4 steps succeeded`; composed sweep wrapper also completed
+- binary: `.zig-cache/http-release-sweep-677/selected-tardi`
+- `tardi version`: `issue-677-blackbox (tls-profile=general, tls-backend=native)`
+- binary SHA-256:
+  `d92471d3607b6ec2038cec50a7b090211d219c3c99c746d07689b97d77af2d30`
+- independent `nghttp` H2 proof: passed over ALPN `h2`, including SETTINGS,
+  200 static return, 404 miss, 500 proxied upstream error, HEAD without DATA,
+  and small/large POST proxy bodies
+- Alt-Svc enabled proof: passed, emitted `h3=":53967"` for the selected UDP port
+- Alt-Svc disabled proof: passed, HTTP/1.1 200 response with no `h3` Alt-Svc
+- resource settle sample: `before rss_kb=4064 fds=10 sockets=2`,
+  `cycle_2 rss_kb=4912 fds=10 sockets=2`,
+  `cycle_4 rss_kb=4912 fds=10 sockets=2`,
+  `after_settle rss_kb=4864 fds=10 sockets=2`
+- black-box H3 with ngtcp2/GnuTLS: skipped because
+  `NGTCP2_EXAMPLES_DIR/gtlsclient` was unavailable
+- second H3 implementation: skipped because neither `AIOQUIC_PYTHON` nor
+  `QUICHE_EXAMPLES_DIR/http3-client` was configured
+
+Additional H2 malformed-input closeout:
+
+```sh
+zig build test-integration -Dintegration-test-filter='interop.h2.' \
+  --summary all --error-style verbose
+```
+
+Result: passed, `8/8 steps succeeded; 33/33 tests passed`. This includes the
+previously incomplete truncated-frame-header EOF and truncated-frame-payload EOF
+boundary rows. Both prove the malformed connection closes cleanly and a fresh
+request can still complete on the listener afterward.
+
 ## Environment
 
 - Date: 2026-08-25

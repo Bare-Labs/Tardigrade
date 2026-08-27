@@ -3121,14 +3121,23 @@ fn respondHttp2Stream(
 
     const header_block = try http.hpack.encodeLiteralHeaderBlock(allocator, response_headers.items);
     defer allocator.free(header_block);
+    const response_header_flags: u8 = if (std.mem.eql(u8, method, "HEAD"))
+        http.http2_frame.Flags.END_HEADERS | http.http2_frame.Flags.END_STREAM
+    else
+        http.http2_frame.Flags.END_HEADERS;
 
     try http.http2_frame.writeFrame(
         conn.writer(),
         .headers,
-        http.http2_frame.Flags.END_HEADERS,
+        response_header_flags,
         stream_id,
         header_block,
     );
+
+    if (std.mem.eql(u8, method, "HEAD")) {
+        state.metricsRecord(status_code);
+        return;
+    }
 
     var resp = PendingHttp2Response{
         .body_alloc = body_alloc,

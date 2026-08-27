@@ -427,13 +427,31 @@ pub fn writeReturnResponse(
     writer: anytype,
     state: *GatewayState,
     ctx: *http.request_context.RequestContext,
-    request_is_get_or_head: bool,
+    request_method: http.Method,
     status: u16,
     body: []const u8,
     correlation_id: []const u8,
     keep_alive: bool,
 ) !ReturnResponseWriteResult {
-    return writeReturnResponsePlan(allocator, writer, state, ctx, planReturnResponse(request_is_get_or_head, status, body), correlation_id, keep_alive);
+    const plan = planReturnResponse(request_method == .GET or request_method == .HEAD, status, body);
+    if (request_method != .HEAD) return writeReturnResponsePlan(allocator, writer, state, ctx, plan, correlation_id, keep_alive);
+    switch (plan) {
+        .method_not_allowed, .redirect => return writeReturnResponsePlan(allocator, writer, state, ctx, plan, correlation_id, keep_alive),
+        .body => |b| {
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(@enumFromInt(b.status))
+                .setBody("")
+                .setContentType("text/plain; charset=utf-8")
+                .setConnection(keep_alive)
+                .setContentLength(b.body.len);
+            setRequestIdHeaders(&response, correlation_id);
+            ctx.response_bytes = 0;
+            applyResponseHeaders(state, &response);
+            try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+            return .{ .status = b.status };
+        },
+    }
 }
 
 fn recordReturnResponseMetrics(state: *GatewayState, result: ReturnResponseWriteResult) void {
@@ -877,7 +895,7 @@ fn executeLocationAction(
                 writer,
                 state,
                 ctx,
-                request.method == .GET or request.method == .HEAD,
+                request.method,
                 ret.status,
                 ret.body,
                 correlation_id,

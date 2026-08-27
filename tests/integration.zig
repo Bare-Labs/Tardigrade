@@ -3286,6 +3286,21 @@ fn pureZigH2GetResponse(allocator: std.mem.Allocator, port: u16, headers: []cons
             0x1 => {
                 if (frame.stream_id == 1) {
                     response_headers = try hpack.decode(allocator, frame.payload);
+                    if ((frame.flags & 0x1) != 0) {
+                        const decoded = response_headers orelse return error.H2ResponseNotFound;
+                        response_headers = null;
+                        var status: u16 = 0;
+                        for (decoded.headers) |h| {
+                            if (std.mem.eql(u8, h.name, ":status")) {
+                                status = std.fmt.parseInt(u16, h.value, 10) catch 0;
+                            }
+                        }
+                        return .{
+                            .status = status,
+                            .headers = decoded.headers,
+                            .body = try response_body.toOwnedSlice(),
+                        };
+                    }
                 }
             },
             0x0 => {
@@ -3462,6 +3477,23 @@ fn expectH2RstStream(client: *PureZigTlsClient, allocator: std.mem.Allocator, ex
         return;
     }
     return error.H2RstStreamNotFound;
+}
+
+fn expectH2TransportBoundaryClosesCleanly(client: *PureZigTlsClient, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        _ = client.record.drive() catch |err| switch (err) {
+            error.EndOfStream, error.TruncatedStream => return,
+            error.WouldBlock => {},
+            else => return err,
+        };
+        client.waitForReadiness(100) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return,
+            error.WouldBlock => {},
+            else => return err,
+        };
+    }
+    return error.ReadTimeout;
 }
 
 fn expectOpenSslH2ResponseBody(allocator: std.mem.Allocator, stdout: []const u8, expected_body: []const u8) !void {
@@ -5357,6 +5389,100 @@ test "interop.h2.invalid_settings_length_sends_goaway" {
     try expectH2Goaway(client, allocator, 0x6); // FRAME_SIZE_ERROR
 }
 
+test "interop.h2.truncated_frame_header_eof_closes_without_poisoning_listener" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    const partial_header = [_]u8{ 0x00, 0x00, 0x04, 0x08, 0x00 };
+    try client.writeAllPlain(partial_header[0..]);
+    _ = std.c.shutdown(client.stream.handle, std.posix.SHUT.WR);
+    try expectH2TransportBoundaryClosesCleanly(client, 5_000);
+
+    var control = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/healthz", "tardigrade.test");
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status_code);
+    try assertContains(control.body, "alive");
+}
+
+test "interop.h2.truncated_frame_payload_eof_closes_without_poisoning_listener" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    var frame = std.array_list.Managed(u8).init(allocator);
+    defer frame.deinit();
+    var declared_header: [9]u8 = undefined;
+    declared_header[0] = 0;
+    declared_header[1] = 0;
+    declared_header[2] = 4;
+    declared_header[3] = 0x8; // WINDOW_UPDATE
+    declared_header[4] = 0;
+    std.mem.writeInt(u32, declared_header[5..9], 0, .big);
+    try frame.appendSlice(declared_header[0..]);
+    try frame.appendSlice(&.{ 0x00, 0x00 }); // fewer bytes than declared, then EOF
+    try client.writeAllPlain(frame.items);
+    _ = std.c.shutdown(client.stream.handle, std.posix.SHUT.WR);
+    try expectH2TransportBoundaryClosesCleanly(client, 5_000);
+
+    var control = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/healthz", "tardigrade.test");
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status_code);
+    try assertContains(control.body, "alive");
+}
+
 test "interop.h2.window_update_zero_increment_connection_goaway_and_stream_rst" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -6951,6 +7077,22 @@ test "interop.h2.return_directive matches shared H1/H3 redirect and method-enfor
         defer resp.deinit(allocator);
         try std.testing.expectEqual(@as(u16, 302), resp.status);
         try std.testing.expectEqualStrings("/new-place", resp.header("location") orelse "");
+        try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+    }
+
+    // HEAD a body-bearing return: HTTP/2 must finish the response on HEADERS
+    // and preserve Content-Length without sending any DATA frames.
+    {
+        const headers = [_]hpack.HeaderField{
+            .{ .name = ":method", .value = "HEAD" },
+            .{ .name = ":path", .value = "/healthz" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        };
+        var resp = try pureZigH2GetResponse(allocator, tardigrade.port, headers[0..]);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expectEqualStrings("5", resp.header("content-length") orelse "");
         try std.testing.expectEqual(@as(usize, 0), resp.body.len);
     }
 
