@@ -1799,6 +1799,15 @@ pub const GatewayState = struct {
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_idle", snap.host, "{d}", .{s.idle});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_active", snap.host, "{d}", .{s.active});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_total", snap.host, "{d}", .{s.stale_retries_total});
+            try appendUpstreamLabelMetric(out, "checkout_stale_tls_incomplete_ciphertext", snap.host, "{d}", .{s.checkout_quarantined_tls_incomplete});
+            try appendUpstreamLabelMetric(out, "checkout_stale_tls_application_plaintext", snap.host, "{d}", .{s.checkout_stale_tls_application_plaintext});
+            try appendUpstreamLabelMetric(out, "checkout_stale_tls_peer_closed", snap.host, "{d}", .{s.checkout_stale_tls_peer_closed});
+            try appendUpstreamLabelMetric(out, "checkout_stale_tls_drive_error", snap.host, "{d}", .{s.checkout_stale_tls_drive_error});
+            try appendUpstreamLabelMetric(out, "checkout_stale_tls_drain_budget", snap.host, "{d}", .{s.checkout_stale_tls_drain_budget});
+            try appendUpstreamLabelMetric(out, "checkout_stale_plaintext_unexpected", snap.host, "{d}", .{s.checkout_stale_plaintext_unexpected});
+            try appendUpstreamLabelMetric(out, "release_rejected_lifetime", snap.host, "{d}", .{s.release_rejected_lifetime});
+            try appendUpstreamLabelMetric(out, "release_rejected_capacity", snap.host, "{d}", .{s.release_rejected_capacity});
+            try appendUpstreamLabelMetric(out, "release_not_reusable", snap.host, "{d}", .{s.release_not_reusable});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_at_capacity_total", snap.host, "{d}", .{s.at_capacity_total});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_reuse_ratio", snap.host, "{d:.4}", .{ratio});
         }

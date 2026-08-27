@@ -81,8 +81,16 @@ pub const HostStats = struct {
     reused_local_total: u64 = 0,
     reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
-    /// Checkouts rejected fail-fast at `max_active_per_host` (#239).
     at_capacity_total: u64 = 0,
+    checkout_stale_plaintext_unexpected: u64 = 0,
+    checkout_stale_tls_application_plaintext: u64 = 0,
+    checkout_stale_tls_peer_closed: u64 = 0,
+    checkout_stale_tls_drive_error: u64 = 0,
+    checkout_stale_tls_drain_budget: u64 = 0,
+    checkout_quarantined_tls_incomplete: u64 = 0,
+    release_rejected_lifetime: u64 = 0,
+    release_rejected_capacity: u64 = 0,
+    release_not_reusable: u64 = 0,
     active: u64 = 0,
     idle: u64 = 0,
 };
@@ -95,6 +103,15 @@ pub const Stats = struct {
     reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
     at_capacity_total: u64 = 0,
+    checkout_stale_plaintext_unexpected: u64 = 0,
+    checkout_stale_tls_application_plaintext: u64 = 0,
+    checkout_stale_tls_peer_closed: u64 = 0,
+    checkout_stale_tls_drive_error: u64 = 0,
+    checkout_stale_tls_drain_budget: u64 = 0,
+    checkout_quarantined_tls_incomplete: u64 = 0,
+    release_rejected_lifetime: u64 = 0,
+    release_rejected_capacity: u64 = 0,
+    release_not_reusable: u64 = 0,
     idle: u64 = 0,
     active: u64 = 0,
 };
@@ -187,6 +204,7 @@ pub const RequestLatencySnapshot = struct {
 
 const HostEntry = struct {
     idle: std.ArrayList(PooledConn) = .empty,
+    quarantined: std.ArrayList(PooledConn) = .empty,
     stats: HostStats = .{},
 };
 
@@ -385,16 +403,30 @@ pub const UpstreamPool = struct {
     /// genuine platform-specific failure resurfaces, prefer reverting this
     /// one line to `tls.readReady()` over re-diagnosing under pressure; see
     /// `docs/SECURITY_TEST_PLAN.md` defect 27 for the full history.
-    fn hasUnexpectedReadableBytes(conn: PooledConn) bool {
-        if (conn.tls) |tls| return tls.drainQueuedRecordsAndCheckReady();
+    pub const PlaintextCheckoutReadiness = enum {
+        clean,
+        unexpected_bytes,
+    };
+
+    pub const PoolCheckoutReadiness = union(enum) {
+        clean,
+        tls: upstream_tls.UpstreamTlsConn.CheckoutReadiness,
+        plaintext: PlaintextCheckoutReadiness,
+    };
+
+    fn checkReadiness(conn: PooledConn) PoolCheckoutReadiness {
+        if (conn.tls) |tls| return .{ .tls = tls.drainQueuedRecordsAndCheckReady() };
         var pfds = [_]std.posix.pollfd{.{
             .fd = conn.stream.handle,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
             .revents = 0,
         }};
-        const n = std.posix.poll(&pfds, 0) catch return true;
-        if (n == 0) return false;
-        return (pfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
+        const n = std.posix.poll(&pfds, 0) catch return .{ .plaintext = .unexpected_bytes };
+        if (n == 0) return .clean;
+        if ((pfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
+            return .{ .plaintext = .unexpected_bytes };
+        }
+        return .clean;
     }
 
     /// Close a connection: tear down the owned TLS connection (if any), then
@@ -476,10 +508,57 @@ pub const UpstreamPool = struct {
                 self.closeConn(conn);
                 continue;
             }
-            if (hasUnexpectedReadableBytes(conn)) {
-                entry.stats.stale_retries_total += 1;
-                self.closeConn(conn);
-                continue;
+            const readiness = checkReadiness(conn);
+            switch (readiness) {
+                .clean => {}, // reuse
+                .plaintext => |pt| {
+                    switch (pt) {
+                        .clean => {}, // reuse
+                        .unexpected_bytes => {
+                            entry.stats.checkout_stale_plaintext_unexpected += 1;
+                            entry.stats.stale_retries_total += 1;
+                            self.closeConn(conn);
+                            continue;
+                        },
+                    }
+                },
+                .tls => |t| {
+                    switch (t) {
+                        .clean => {}, // reuse
+                        .application_plaintext => {
+                            entry.stats.checkout_stale_tls_application_plaintext += 1;
+                            entry.stats.stale_retries_total += 1;
+                            self.closeConn(conn);
+                            continue;
+                        },
+                        .peer_closed => {
+                            entry.stats.checkout_stale_tls_peer_closed += 1;
+                            entry.stats.stale_retries_total += 1;
+                            self.closeConn(conn);
+                            continue;
+                        },
+                        .drive_error => {
+                            entry.stats.checkout_stale_tls_drive_error += 1;
+                            entry.stats.stale_retries_total += 1;
+                            self.closeConn(conn);
+                            continue;
+                        },
+                        .drain_budget_exhausted => {
+                            entry.stats.checkout_stale_tls_drain_budget += 1;
+                            entry.stats.stale_retries_total += 1;
+                            self.closeConn(conn);
+                            continue;
+                        },
+                        .incomplete_ciphertext => {
+                            entry.stats.checkout_quarantined_tls_incomplete += 1;
+                            entry.stats.stale_retries_total += 1;
+                            entry.quarantined.append(self.allocator, conn) catch {
+                                self.closeConn(conn);
+                            };
+                            continue;
+                        },
+                    }
+                },
             }
             entry.stats.reused_total += 1;
             if (conn.released_by == currentWorkerId()) {
@@ -542,9 +621,18 @@ pub const UpstreamPool = struct {
         };
         if (entry.stats.active > 0) entry.stats.active -= 1;
 
-        if (!self.config.enabled or !reusable or self.isExpired(conn, now_ms) or
-            entry.idle.items.len >= self.config.max_idle_per_host)
-        {
+        if (!self.config.enabled or !reusable) {
+            entry.stats.release_not_reusable += 1;
+            self.closeConn(conn);
+            return;
+        }
+        if (self.isExpired(conn, now_ms)) {
+            entry.stats.release_rejected_lifetime += 1;
+            self.closeConn(conn);
+            return;
+        }
+        if (entry.idle.items.len >= self.config.max_idle_per_host) {
+            entry.stats.release_rejected_capacity += 1;
             self.closeConn(conn);
             return;
         }
@@ -586,16 +674,50 @@ pub const UpstreamPool = struct {
         defer self.unlock(lock_wait_ns);
         var it = self.hosts.iterator();
         while (it.next()) |entry| {
-            const list = &entry.value_ptr.idle;
-            var i: usize = 0;
-            while (i < list.items.len) {
-                if (self.isExpired(list.items[i], now_ms)) {
-                    self.closeConn(list.orderedRemove(i));
-                } else {
-                    i += 1;
+            {
+                const list = &entry.value_ptr.idle;
+                var i: usize = 0;
+                while (i < list.items.len) {
+                    if (self.isExpired(list.items[i], now_ms)) {
+                        self.closeConn(list.orderedRemove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                entry.value_ptr.stats.idle = list.items.len;
+            }
+            {
+                const list = &entry.value_ptr.quarantined;
+                var i: usize = 0;
+                while (i < list.items.len) {
+                    const conn = list.items[i];
+                    if (self.isExpired(conn, now_ms)) {
+                        self.closeConn(list.orderedRemove(i));
+                        continue;
+                    }
+                    const readiness = checkReadiness(conn);
+                    switch (readiness) {
+                        .clean => {
+                            _ = list.orderedRemove(i);
+                            entry.value_ptr.idle.append(self.allocator, conn) catch {
+                                self.closeConn(conn);
+                            };
+                            entry.value_ptr.stats.idle = entry.value_ptr.idle.items.len;
+                        },
+                        .tls => |t| switch (t) {
+                            .incomplete_ciphertext => {
+                                i += 1;
+                            },
+                            else => {
+                                self.closeConn(list.orderedRemove(i));
+                            }
+                        },
+                        .plaintext => {
+                            self.closeConn(list.orderedRemove(i));
+                        },
+                    }
                 }
             }
-            entry.value_ptr.stats.idle = list.items.len;
         }
     }
 
@@ -613,6 +735,15 @@ pub const UpstreamPool = struct {
             agg.reused_cross_worker_total += s.reused_cross_worker_total;
             agg.stale_retries_total += s.stale_retries_total;
             agg.at_capacity_total += s.at_capacity_total;
+            agg.checkout_stale_plaintext_unexpected += s.checkout_stale_plaintext_unexpected;
+            agg.checkout_stale_tls_application_plaintext += s.checkout_stale_tls_application_plaintext;
+            agg.checkout_stale_tls_peer_closed += s.checkout_stale_tls_peer_closed;
+            agg.checkout_stale_tls_drive_error += s.checkout_stale_tls_drive_error;
+            agg.checkout_stale_tls_drain_budget += s.checkout_stale_tls_drain_budget;
+            agg.checkout_quarantined_tls_incomplete += s.checkout_quarantined_tls_incomplete;
+            agg.release_rejected_lifetime += s.release_rejected_lifetime;
+            agg.release_rejected_capacity += s.release_rejected_capacity;
+            agg.release_not_reusable += s.release_not_reusable;
             agg.active += s.active;
             agg.idle += entry.value_ptr.idle.items.len;
         }
