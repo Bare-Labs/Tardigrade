@@ -12,13 +12,6 @@ rm -f "$logs"/*.log "$logs"/*.txt "$logs"/*.raw "$logs"/*.headers "$logs"/*.err
 
 say() { printf '%s\n' "$*"; }
 
-enabled() {
-  case "${1:-}" in
-    1|true|TRUE|yes|YES|on|ON) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 free_tcp_port() {
   python3 - <<'PY'
 import socket
@@ -117,6 +110,7 @@ import pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(r'''
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
+LENGTHS_PATH = sys.argv[2]
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, fmt, *args): pass
@@ -137,6 +131,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, "")
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("content-length", "0")))
+        with open(LENGTHS_PATH, "a", encoding="utf-8") as f:
+            f.write(str(len(body)) + "\n")
         self._send(200, "proxy-post:" + str(len(body)))
 port = int(sys.argv[1])
 srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -146,7 +142,9 @@ srv.serve_forever()
 PY
 
 upstream_port="$(free_tcp_port)"
-python3 "$workdir/upstream.py" "$upstream_port" >"$logs/upstream.log" 2>&1 &
+post_lengths="$workdir/post-lengths.txt"
+: >"$post_lengths"
+python3 "$workdir/upstream.py" "$upstream_port" "$post_lengths" >"$logs/upstream.log" 2>&1 &
 upstream_pid=$!
 
 tcp_port="$(free_tcp_port)"
@@ -176,6 +174,7 @@ location = /proxy-error {
 
 EOF
 
+# shellcheck disable=SC2317,SC2329 # invoked by trap on script exit
 cleanup() {
   [ -n "${tardi_pid:-}" ] && kill "$tardi_pid" 2>/dev/null
   [ -n "${upstream_pid:-}" ] && kill "$upstream_pid" 2>/dev/null
@@ -196,13 +195,13 @@ TARDIGRADE_HTTP3_ENABLED=true \
 TARDIGRADE_QUIC_PORT="$udp_port" \
 TARDIGRADE_HTTP3_ALT_SVC=auto \
 TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS=60 \
-TARDIGRADE_ERROR_LOG_PATH="$logs/tardi.log" \
-"$tardi_bin" run -c "$config" >"$logs/tardi.stdout" 2>>"$logs/tardi.log" &
+TARDIGRADE_ERROR_LOG_PATH="$logs/tardi-app.log" \
+"$tardi_bin" run -c "$config" >"$logs/tardi.stdout" 2>"$logs/tardi.stderr" &
 tardi_pid=$!
 
 if ! wait_tcp "$tcp_port"; then
   say "FAIL blackbox: tardi did not open TCP port $tcp_port"
-  cat "$logs/tardi.log" 2>/dev/null
+  cat "$logs/tardi-app.log" "$logs/tardi.stderr" 2>/dev/null
   exit 1
 fi
 
@@ -220,6 +219,8 @@ status=0
 
 if command -v nghttp >/dev/null 2>&1; then
   nghttp --version >"$logs/nghttp-version.txt" 2>&1 || true
+  nghttp -v -y "https://127.0.0.1:$tcp_port/index.html" \
+    >"$logs/nghttp-static.log" 2>&1 || status=1
   nghttp -v -y -n -m 2 \
     "https://127.0.0.1:$tcp_port/simple" \
     "https://127.0.0.1:$tcp_port/missing" \
@@ -246,7 +247,13 @@ PY
      grep -q ':status: 500' "$logs/nghttp-proxy-error.log" &&
      grep -q ':status: 200' "$logs/nghttp-head.log" &&
      ! grep -q 'recv DATA frame' "$logs/nghttp-head.log" &&
-     ! grep -q 'INVALID; error=Protocol error' "$logs/nghttp-head.log"; then
+     ! grep -q 'INVALID; error=Protocol error' "$logs/nghttp-head.log" &&
+     grep -q ':status: 200' "$logs/nghttp-static.log" &&
+     grep -q 'blackbox-static-ok' "$logs/nghttp-static.log" &&
+     grep -q ':status: 200' "$logs/nghttp-post-small.log" &&
+     grep -q ':status: 200' "$logs/nghttp-post-large.log" &&
+     grep -qx '10' "$post_lengths" &&
+     grep -qx '65536' "$post_lengths"; then
     say "PASS independent nghttp H2 proof"
     printf 'nghttp_h2=PASS\n' >>"$summary"
   else
@@ -285,8 +292,11 @@ if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]
   "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" \
     "https://localhost:$udp_port/" "https://localhost:$udp_port/proxy" \
     --exit-on-all-streams-close >"$logs/gtlsclient-h3-multi.log" 2>&1 || status=1
-  if grep -q '[:status: 200]' "$logs/gtlsclient-altsvc.log" &&
-     grep -q '[:status: 200]' "$logs/gtlsclient-h3-multi.log"; then
+  if grep -Fq ':status: 200' "$logs/gtlsclient-altsvc.log" &&
+     grep -q 'alive' "$logs/gtlsclient-altsvc.log" &&
+     grep -Fq ':status: 200' "$logs/gtlsclient-h3-multi.log" &&
+     grep -q 'blackbox-static-ok' "$logs/gtlsclient-h3-multi.log" &&
+     grep -q 'proxy-ok' "$logs/gtlsclient-h3-multi.log"; then
     say "PASS black-box ngtcp2/GnuTLS H3 proof"
     printf 'blackbox_h3_ngtcp2=PASS\n' >>"$summary"
   else
@@ -359,8 +369,8 @@ TARDIGRADE_TLS_SNI_CERTS="localhost:$repo/tests/fixtures/tls/native_ed25519.crt:
 TARDIGRADE_HTTP2_ENABLED=true \
 TARDIGRADE_HTTP3_ENABLED=false \
 TARDIGRADE_HTTP3_ALT_SVC=auto \
-TARDIGRADE_ERROR_LOG_PATH="$logs/tardi-disabled.log" \
-"$tardi_bin" run -c "$config" >"$logs/tardi-disabled.stdout" 2>>"$logs/tardi-disabled.log" &
+TARDIGRADE_ERROR_LOG_PATH="$logs/tardi-disabled-app.log" \
+"$tardi_bin" run -c "$config" >"$logs/tardi-disabled.stdout" 2>"$logs/tardi-disabled.stderr" &
 tardi_pid=$!
 if wait_tcp "$disabled_tcp_port"; then
   if command -v openssl >/dev/null 2>&1; then

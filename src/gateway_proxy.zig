@@ -100,6 +100,7 @@ pub const BufferedUpstreamResponse = struct {
     reason: []const u8,
     headers: []UpstreamHeader,
     body: []u8,
+    representation_content_length: ?[]const u8 = null,
 
     pub fn deinit(self: *BufferedUpstreamResponse, allocator: std.mem.Allocator) void {
         self.metadata_arena.deinit();
@@ -374,6 +375,7 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
     const resp_body = if (responseStatusIsBodiless(status_code)) "" else raw[header_end + 4 ..];
 
     var resp_headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
+    var representation_content_length: ?[]const u8 = null;
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[status_line.header_lines_start..], "\r\n");
     while (hdr_lines.next()) |line| {
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
@@ -390,6 +392,9 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         // upstream responses never went through that path at all.
         if (!http.headers.isValidHeaderName(hname) or !http.headers.isValidHeaderValue(hval)) {
             return error.UpstreamProtocolError;
+        }
+        if (std.ascii.eqlIgnoreCase(hname, "content-length") and representation_content_length == null) {
+            representation_content_length = try metadata_allocator.dupe(u8, hval);
         }
         if (gph.shouldSkipUpstreamResponseHeader(hname, null)) continue;
         // Scan the SAME header-lines view this loop itself iterates
@@ -424,6 +429,7 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         .reason = reason_owned,
         .headers = headers_owned,
         .body = body_owned,
+        .representation_content_length = representation_content_length,
     };
 }
 

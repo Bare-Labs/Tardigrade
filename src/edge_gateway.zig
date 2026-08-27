@@ -3068,7 +3068,7 @@ fn respondHttp2Stream(
                 status_code = response.status_code;
                 body_alloc = try allocator.dupe(u8, response.body);
                 body = body_alloc.?;
-                try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response);
+                try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response, std.mem.eql(u8, method, "HEAD"));
             },
             .local_rejection => |rejection| {
                 status_code = rejection.status_code;
@@ -3101,6 +3101,33 @@ fn respondHttp2Stream(
                     },
                 }
             },
+            .static_response => |static_response| {
+                var static = static_response;
+                defer static.deinit(allocator);
+                status_code = static.status_code;
+                body_alloc = static.takeBody();
+                body = body_alloc.?;
+                try response_headers.append(.{ .name = "content-type", .value = static.content_type });
+                if (static.etag) |value| {
+                    const owned = try allocator.dupe(u8, value);
+                    errdefer allocator.free(owned);
+                    try owned_header_values.append(owned);
+                    try response_headers.append(.{ .name = "etag", .value = owned });
+                }
+                if (static.last_modified) |value| {
+                    const owned = try allocator.dupe(u8, value);
+                    errdefer allocator.free(owned);
+                    try owned_header_values.append(owned);
+                    try response_headers.append(.{ .name = "last-modified", .value = owned });
+                }
+                if (static.content_range) |value| {
+                    const owned = try allocator.dupe(u8, value);
+                    errdefer allocator.free(owned);
+                    try owned_header_values.append(owned);
+                    try response_headers.append(.{ .name = "content-range", .value = owned });
+                }
+                if (static.accept_ranges) try response_headers.append(.{ .name = "accept-ranges", .value = "bytes" });
+            },
         }
     }
 
@@ -3109,7 +3136,9 @@ fn respondHttp2Stream(
     const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
     defer allocator.free(len_str);
     try response_headers.insert(0, .{ .name = ":status", .value = status_str });
-    try response_headers.append(.{ .name = "content-length", .value = len_str });
+    if (!hasH2Header(&response_headers, "content-length")) {
+        try response_headers.append(.{ .name = "content-length", .value = len_str });
+    }
     if (!hasH2Header(&response_headers, "content-type")) {
         try response_headers.append(.{ .name = "content-type", .value = JSON_CONTENT_TYPE });
     }
@@ -3161,6 +3190,7 @@ const Http2ProxyRouteResult = union(enum) {
     response: gp.BufferedUpstreamResponse,
     local_rejection: Http2LocalRejection,
     return_response: ghandlers.ReturnResponsePlan,
+    static_response: Http2StaticResponse,
 };
 
 const Http2LocalRejection = struct {
@@ -3168,6 +3198,30 @@ const Http2LocalRejection = struct {
     code: []const u8,
     message: []const u8,
     retry_after: ?[]const u8 = null,
+};
+
+const Http2StaticResponse = struct {
+    body: ?[]u8,
+    status_code: u16,
+    content_type: []const u8,
+    etag: ?[]u8 = null,
+    last_modified: ?[]u8 = null,
+    content_range: ?[]u8 = null,
+    accept_ranges: bool = false,
+
+    fn deinit(self: *Http2StaticResponse, allocator: std.mem.Allocator) void {
+        if (self.body) |body| allocator.free(body);
+        if (self.etag) |v| allocator.free(v);
+        if (self.last_modified) |v| allocator.free(v);
+        if (self.content_range) |v| allocator.free(v);
+        self.* = undefined;
+    }
+
+    fn takeBody(self: *Http2StaticResponse) []u8 {
+        const body = self.body.?;
+        self.body = null;
+        return body;
+    }
 };
 
 fn executeHttp2ProxyRoute(
@@ -3216,7 +3270,12 @@ fn executeHttp2ProxyRoute(
         return .{ .local_rejection = rejection };
     }
 
-    const matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse return null;
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse {
+        if (try buildHttp2StaticResponse(allocator, route_cfg, request)) |static_response| {
+            return .{ .static_response = static_response };
+        }
+        return null;
+    };
     if (matched.block.auth == .required) return .{ .local_rejection = .{
         .status_code = @intFromEnum(http.Status.unauthorized),
         .code = "unauthorized",
@@ -3519,6 +3578,37 @@ fn http2ProxyAttemptTimeoutMs(cfg: *const edge_config.EdgeConfig) u32 {
     return @intCast(@min(@as(u64, cfg.upstream_timeout_ms), cfg.upstream_timeout_budget_ms));
 }
 
+fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, request: *const http.Request) !?Http2StaticResponse {
+    if (!(request.method == .GET or request.method == .HEAD)) return null;
+    if (cfg.doc_root.len == 0) return null;
+    const effective_try_files = if (cfg.try_files.len > 0) cfg.try_files else "$uri";
+    var served = (try http.static_file.serve(allocator, .{
+        .root = cfg.doc_root,
+        .request_path = request.uri.path,
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = effective_try_files,
+        .autoindex = false,
+        .headers = &request.headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+        .prefer_file_backed = false,
+    })) orelse return null;
+    defer served.deinit(allocator);
+
+    var result = Http2StaticResponse{
+        .body = try allocator.dupe(u8, served.body orelse ""),
+        .status_code = @intFromEnum(served.status_code),
+        .content_type = served.content_type,
+        .accept_ranges = served.accept_ranges,
+    };
+    errdefer result.deinit(allocator);
+    result.etag = if (served.etag_value) |v| try allocator.dupe(u8, v) else null;
+    result.last_modified = if (served.last_modified_value) |v| try allocator.dupe(u8, v) else null;
+    result.content_range = if (served.content_range_value) |v| try allocator.dupe(u8, v) else null;
+    return result;
+}
+
 fn hasH2Header(headers: *const std.array_list.Managed(http.hpack.HeaderField), name: []const u8) bool {
     for (headers.items) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
@@ -3532,11 +3622,17 @@ fn appendHttp2UpstreamResponseHeaders(
     lowered_names: *std.array_list.Managed([]u8),
     owned_values: *std.array_list.Managed([]u8),
     response: *const gp.BufferedUpstreamResponse,
+    preserve_content_length: bool,
 ) !void {
+    if (preserve_content_length) {
+        if (response.representation_content_length) |value| {
+            try headers.append(.{ .name = "content-length", .value = value });
+        }
+    }
     for (response.headers) |header| {
         if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
         if (gph.anyConnectionHeaderReferencesHeader(response.headers, header.name)) continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+        if (!preserve_content_length and std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         const name = try lowercaseName(allocator, lowered_names, header.name);
         const value = try allocator.dupe(u8, header.value);
         errdefer allocator.free(value);
