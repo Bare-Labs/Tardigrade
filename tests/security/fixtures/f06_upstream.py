@@ -191,6 +191,14 @@ HOSTILE_SCENARIOS = {
     "chunk_trailer_invalid_name": (
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nBad Name: x\r\n\r\n"
     ),
+    # A colon is present and the name has no control characters or
+    # whitespace, but it contains a non-colon RFC 7230 separator ("("). An
+    # isValidHeaderName() that only excluded control chars/space/colon
+    # (round 8's version, despite claiming full tchar validation) would
+    # have accepted this (#673 review round 9).
+    "chunk_trailer_separator_char_in_name": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nBad(Name: x\r\n\r\n"
+    ),
     # #673 review round 7 point 4: a hostile origin drip-feeding interim
     # responses forever must not tie up the streaming path indefinitely or
     # grow its memory unbounded. 80 interim responses is comfortably past

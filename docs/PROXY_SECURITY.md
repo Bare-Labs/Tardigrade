@@ -177,11 +177,15 @@ All header names stored by Tardigrade's `Headers` collection are lowercased on
 ingress. Lookups are always case-insensitive. Header values are trimmed of
 leading and trailing whitespace (HTAB and SP).
 
-Header names must consist only of RFC 7230 token characters: visible ASCII
-excluding control characters, DEL (0x7F), and the separator characters
-`` ()<>@,;:\"/[]?={} `` and SP/HTAB. The colon separator is also rejected
-within a name. Any inbound header that violates this rule is rejected with
-`400 Bad Request`.
+Header names must consist only of RFC 7230 §3.2.6 `tchar` characters:
+`` !#$%&'*+-.^_`|~ ``, digits, and letters — visible ASCII excluding
+control characters, DEL (0x7F), SP/HTAB, and every separator character
+(`` ()<>@,;:\"/[]?={} ``). Any inbound header that violates this rule is
+rejected with `400 Bad Request`. (`isValidHeaderName()` in
+`src/http/headers.zig` previously only excluded control characters, space,
+DEL, and colon — a header name like `Bad(Name` or `Bad,Name` still passed
+despite this document already describing the stricter rule; #673 review
+round 9 made the implementation match it.)
 
 Header values must not contain CR (0x0D), LF (0x0A), NUL (0x00), or any other
 control character (0x00–0x1F, 0x7F). HTAB (0x09) and SP (0x20) are allowed
@@ -465,22 +469,21 @@ application data — that ciphertext shows up as immediately readable on the
 raw fd regardless, which would flag essentially every freshly-pooled TLS
 connection as stale and defeat TLS connection pooling outright.
 
-TLS connections check `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`.
-An earlier version of this check used `readReady()` (already-decrypted
-buffered plaintext, or a completed clean TLS shutdown), but that only
-reflects what a *prior* `read()` call already decrypted — a hostile TLS
-origin's ghost application-data record can already be queued as raw
-ciphertext on the fd, not yet fed through the record layer, and
-`readReady()` would report "nothing pending" for that exactly as it would
-for a harmless session ticket (#673 review round 8).
-`drainQueuedRecordsAndCheckReady()` closes that gap: it nonblockingly
-drives the record layer through everything currently queued on the raw fd
-(the fd is already nonblocking for this client, so `drive()` never waits
-on the network — the same primitive `read()` itself uses before ever
-calling `waitForFd()`) and reports "do not reuse" only if genuine
-application plaintext or a clean shutdown actually emerges from that,
-correctly letting protocol-only traffic like a `NewSessionTicket` through
-without discarding a still-healthy connection.
+TLS connections check `UpstreamTlsConn.readReady()`: already-decrypted
+buffered plaintext, or a completed clean TLS shutdown. This only reflects
+what a *prior* `read()` call already decrypted — a hostile TLS origin's
+ghost application-data record can already be queued as raw ciphertext on
+the fd, not yet fed through the record layer, and `readReady()` reports
+"nothing pending" for that exactly as it would for a harmless session
+ticket (#673 review round 8). A fix closing that gap
+(`UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which nonblockingly
+drives the record layer through everything queued before checking) was
+built and passed on this platform, but broke TLS connection pooling on
+Linux ARM CI specifically for reasons that could not be safely
+root-caused without access to that environment, and was reverted (#673
+review round 9) — see `docs/SECURITY_TEST_PLAN.md` defect 27 for the
+current, honestly-open state of this gap. `drainQueuedRecordsAndCheckReady()`
+remains defined in `src/http/upstream_tls.zig` but is not currently called.
 
 Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `parseBufferedUpstreamResponse()`, `detectResponseFraming()`,
@@ -488,9 +491,10 @@ Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `readUpstreamHead()`/`streamProxyOverTransport()`/`relayUpstreamBody()`
 (the streaming path's equivalents) in `src/gateway_proxy.zig`;
 `UpstreamPool.checkout()`/`hasUnexpectedReadableBytes()` in
-`src/http/upstream_pool.zig`;
-`UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`/`readReady()`/
-`pending()` in `src/http/upstream_tls.zig`.
+`src/http/upstream_pool.zig`; `UpstreamTlsConn.readReady()`/`pending()`
+(currently used) and `drainQueuedRecordsAndCheckReady()` (defined but not
+currently called; see the reverted-fix note above) in
+`src/http/upstream_tls.zig`.
 
 ## 12. Directory Traversal — Static File Serving
 

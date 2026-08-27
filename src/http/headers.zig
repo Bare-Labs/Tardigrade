@@ -171,14 +171,31 @@ pub const Headers = struct {
     }
 };
 
+/// Whether `c` is an RFC 7230 §3.2.6 `tchar`:
+/// `"!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / "^" / "_" /
+/// "`" / "|" / "~" / DIGIT / ALPHA`. This excludes every ASCII separator
+/// (`()<>@,;:\"/[]?={}`), space, HTAB, control characters, and DEL -- not
+/// just control characters and colon.
+fn isTchar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9' => true,
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
 /// Returns true if every byte of the header name is a valid RFC 7230 token
-/// character.  Control characters (0x00–0x1F) and DEL (0x7F) are forbidden;
-/// so are ASCII separators that would be ambiguous in a raw header stream.
+/// character (`1*tchar`, §3.2.6) -- not merely "not a control character and
+/// not a colon". A prior version of this check only excluded control
+/// characters, space, DEL, and colon, so a genuine ASCII separator like `(`,
+/// `,`, `;`, `=`, `?`, `[`, `]`, `{`, `}`, `@`, `/`, or `\` still passed --
+/// letting a malformed field name like `Bad(Name` or `Bad,Name` through
+/// wherever this validator gates chunked-trailer or header-name acceptance
+/// (#673 review round 9).
 pub fn isValidHeaderName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
-        // Reject control chars, DEL, space, and the colon separator.
-        if (c <= 0x20 or c == 0x7F or c == ':') return false;
+        if (!isTchar(c)) return false;
     }
     return true;
 }
@@ -432,6 +449,16 @@ test "isValidHeaderName rejects control chars and accepts valid tokens" {
     try std.testing.expect(!isValidHeaderName("Bad\x7FName"));
     // Empty
     try std.testing.expect(!isValidHeaderName(""));
+    // Every RFC 7230 separator besides colon (already covered above) is
+    // NOT a valid tchar either -- a prior version of this check only
+    // excluded control characters, space, DEL, and colon, so these all
+    // used to pass (#673 review round 9).
+    inline for (.{ "Bad(Name", "Bad)Name", "Bad<Name", "Bad>Name", "Bad@Name", "Bad,Name", "Bad;Name", "Bad\"Name", "Bad/Name", "Bad[Name", "Bad]Name", "Bad?Name", "Bad=Name", "Bad{Name", "Bad}Name", "Bad\\Name" }) |name| {
+        try std.testing.expect(!isValidHeaderName(name));
+    }
+    // Valid tchar punctuation IS still accepted.
+    try std.testing.expect(isValidHeaderName("X-Custom!Header"));
+    try std.testing.expect(isValidHeaderName("X_Custom'Header~Ok"));
 }
 
 test "isValidHeaderValue rejects CR LF and NUL but allows HTAB and printable chars" {
@@ -475,6 +502,13 @@ test "isValidTrailerLine requires an actual header-field, not just a colon anywh
     // The name is fine, but the value is malformed.
     try std.testing.expect(!isValidTrailerLine("X-Good: bad\x00value")); // NUL in value
     try std.testing.expect(!isValidTrailerLine("X-Good: bad\rvalue")); // bare CR in value
+
+    // A colon is present and the name has no control characters or
+    // whitespace, but it contains a non-colon RFC 7230 separator -- an
+    // isValidHeaderName() that only excluded control chars/space/colon
+    // (round 8's version) would have accepted these (#673 review round 9).
+    try std.testing.expect(!isValidTrailerLine("Bad(Name: x"));
+    try std.testing.expect(!isValidTrailerLine("Bad,Name: x"));
 }
 
 test "parseHeaders rejects CRLF injection in header value" {

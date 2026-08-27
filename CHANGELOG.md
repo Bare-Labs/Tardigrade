@@ -5,7 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Twenty-seven auth/framing defects found by a live F-06 black-box campaign (#673)** —
+- **Twenty-eight auth/framing defects found by a live F-06 black-box campaign (#673)** —
   `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
   real local edge fronting a disposable upstream (plus a deliberately
   hostile one, on both the buffered and a forced-streaming proxy route) and
@@ -134,20 +134,28 @@ All notable user-facing changes to Tardigrade are documented here.
     connections (a raw-fd poll on TLS connections flagged routine
     post-handshake protocol chatter, e.g. session tickets, as staleness and
     broke TLS connection pooling outright -- caught before merge by the
-    native-TLS integration suite), and for TLS connections, nonblockingly
-    driving the record layer through everything already queued and checking
-    whether genuine application plaintext or a clean shutdown emerges (an
-    intermediate version checked only already-decrypted plaintext, which
-    missed a hostile origin's ghost record arriving as raw, not-yet-driven
-    ciphertext).
+    native-TLS integration suite), and `UpstreamTlsConn.readReady()` for
+    TLS connections. A follow-up that nonblockingly drove the record layer
+    through queued ciphertext to also catch a hostile origin's
+    not-yet-decrypted ghost record was built and passed locally, but broke
+    TLS connection pooling on Linux ARM CI for reasons not safely
+    root-caused without access to that environment, and was reverted; this
+    gap remains open for TLS upstreams specifically (documented in
+    `docs/SECURITY_TEST_PLAN.md`).
   - The two newly-added chunked-body trailer checks validated only "does
     this line contain a colon", not real `field-name: value` syntax -- and
     two more production trailer-consuming implementations (the streaming
     request-upload reader and the streaming response-relay's trailer
     consumer) had no validation at all. Fixed with one shared validator
     used by all four.
+  - That shared trailer validator's field-name check
+    (`isValidHeaderName()`) claimed to implement RFC 7230's `token`/`tchar`
+    grammar but only rejected control characters, space, DEL, and colon --
+    every other ASCII separator (`()<>@,;"/[]?={}`) still passed, on every
+    header-name validation site in the codebase, not just trailers. Fixed
+    by making it an actual `tchar` validator.
 
-  All twenty-seven fixed with regression coverage in `gateway_proxy_headers.zig`,
+  All twenty-eight fixed with regression coverage in `gateway_proxy_headers.zig`,
   `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
   `src/gateway_connection.zig`, `src/http/upstream_pool.zig`,
   `src/http/upstream_tls.zig`, `src/http/chunked_upload.zig`, and

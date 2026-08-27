@@ -146,7 +146,7 @@ client got a 4xx -- and every smuggling-shaped framing probe additionally
 appends a unique pipelined marker request to prove it is never dispatched,
 not just that the malformed probe itself was rejected.
 
-Coverage (159 live cases):
+Coverage (164 live cases):
 - missing/malformed credentials (no header, bare `Bearer`, wrong scheme,
   oversized token, malformed/invalid-signature JWT, comma-joined
   `Authorization`, NUL/CR injection attempts), including a strict deny for
@@ -231,11 +231,13 @@ Coverage (159 live cases):
   request over the same pooled upstream connection, on both the buffered
   and streaming paths;
 - a chunked-body trailer line with a colon but a malformed name (e.g. a
-  space in it) is rejected on both the request direction (with valid auth,
-  so the parser rejection is what is actually proven) and the response
-  direction (both the buffered and forced-streaming hostile routes).
+  space in it, or a valid-looking name containing a non-colon RFC 7230
+  separator such as `(`) is rejected on both the request direction (with
+  valid auth, so the parser rejection is what is actually proven) and the
+  response direction (both the buffered and forced-streaming hostile
+  routes).
 
-The campaign found and fixed twenty-seven real defects, all now covered by
+The campaign found and fixed twenty-eight real defects, all now covered by
 deterministic regression tests:
 
 1. `shouldSkipUpstreamResponseHeader()` did not honor the upstream
@@ -543,32 +545,51 @@ deterministic regression tests:
     reports "nothing pending" for it exactly as it would for a harmless
     session ticket -- the poisoned connection gets reused, and the next
     `read()`/`writeAll()` drive decrypts the ghost as if it were the
-    unrelated next request's response. Fixed with
-    `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`: it nonblockingly
+    unrelated next request's response.
+
+    **Attempted fix, reverted after a cross-platform CI failure**: added
+    `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which nonblockingly
     drives the record layer through everything currently queued on the raw
     fd (the fd is already nonblocking for this client, so `drive()` never
     waits on the network -- the same primitive `read()` itself uses before
     ever calling `waitForFd()`) and reports "do not reuse" only if genuine
-    application plaintext or a clean shutdown actually emerges from that,
-    correctly letting protocol-only traffic like a `NewSessionTicket`
-    through without discarding a still-healthy connection.
+    application plaintext or a clean shutdown actually emerges from that.
+    This passed locally (macOS) and in that platform's own CI run, but
+    broke `"native upstream https: two proxied requests reuse the pooled
+    TLS connection"` on Linux ARM CI specifically (`reused_total` stayed at
+    0) -- a cross-platform behavior difference in the drive loop that could
+    not be safely root-caused without access to that environment. Reverted
+    to `readReady()` rather than ship an active-draining approach with an
+    unexplained platform-dependent failure mode; `drainQueuedRecordsAndCheckReady()`
+    remains in `src/http/upstream_tls.zig` as dead code pending a safe fix,
+    not wired into `UpstreamPool.checkout()`.
 
-    **Known coverage gap**: this fix's correctness is established by code
-    review (it drains through the exact same nonblocking `drive()`/
-    `made_progress` primitive `read()` already trusts in production, and
-    the existing native-TLS pooled-reuse integration test continues to pass
-    with it in place) and by the F-06 campaign's plain-HTTP pool-staleness
-    coverage above, which exercises the same `checkout()` code path for the
-    non-TLS branch. It does **not** yet have a dedicated regression test
-    that drives a real two-sided TLS handshake and injects a hostile
-    ghost application-data record before checkout, because no existing
-    test in this codebase performs an in-process client+server TLS
-    handshake (the only precedent, `test-integration-native-tls`, spawns
-    two full separate `tardi` processes, which cannot be made to act
-    hostile without a purpose-built malicious TLS origin). Building that
-    harness is tracked as follow-up work rather than blocking this fix,
-    per the review's own stated fallback: prefer a working, reasoned fix
-    with an honestly-scoped test gap over deferring the fix itself.
+    **Remaining gap**: `readReady()` does not catch a hostile TLS origin's
+    ghost application-data record that has arrived as raw, not-yet-driven
+    ciphertext -- this is a real, currently-open gap, not merely an
+    untested one. It is a strict improvement over having no TLS staleness
+    check at all (the pre-round-7 state, when `checkout()` never examined a
+    TLS connection's readiness before reuse), but does not fully close
+    defect 25 for TLS upstreams specifically. Safely closing it requires
+    either root-causing the platform-specific drive-loop failure (which
+    would need Linux ARM access this session did not have) or building new
+    in-process two-sided TLS handshake test infrastructure to validate a
+    fix with confidence before shipping it -- tracked as follow-up work.
+28. `isValidHeaderName()` -- the function `isValidTrailerLine()` (defect 26)
+    delegates field-name validation to -- claimed to implement RFC 7230
+    §3.2.6's `token`/`tchar` grammar but actually only rejected control
+    characters, space, DEL, and colon. Every *other* ASCII separator
+    (`()<>@,;"/[]?={}` minus colon) still passed, so a trailer like
+    `Bad(Name: x` or `Bad,Name: x` satisfied `isValidTrailerLine()` despite
+    not being a valid header field -- meaning defect 26's stated invariant
+    ("real `field-name: value` syntax across all four paths") was not
+    actually true. Since every header-name validation in the codebase
+    (ordinary request/response headers, not just trailers) goes through
+    this same function, the gap was universal, not trailer-specific. Fixed
+    by making `isValidHeaderName()` an actual `tchar` validator (RFC 7230
+    §3.2.6: `"!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+    "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA`), which also hardens every
+    other header-name validation site consistently, not only trailers.
 
 Tooling: `scripts/run-f06-auth-framing-campaign.sh` builds `tardi`, starts
 the fixtures in `tests/security/fixtures/` (`f06_upstream.py`,
@@ -578,7 +599,7 @@ forced-streaming `/hostile-streaming` twin -- plus a symlink and an
 `tests/security/f06_live_campaign.py`, writing evidence (metadata, raw
 results, process logs) to `.zig-cache/f06-campaign-673/`. All credentials
 are synthetic and local-only; no production secrets or traffic were used.
-159/159 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
+164/164 probes pass after the fixes (Zig 0.16.0, macOS arm64; rerun the
 script for current evidence -- results are not committed).
 
 ## Proxy Security Behavior Reference

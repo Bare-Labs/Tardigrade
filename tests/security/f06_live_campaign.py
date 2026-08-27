@@ -593,6 +593,10 @@ def run_hostile_framing(up: Upstream, port: int) -> None:
     # this (colon present, but the name contains a space).
     framing_marker_case(up, "chunk_trailer_colon_but_invalid_name", cat, port, lambda tail:
                          b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Name: x\r\n\r\n" + tail)
+    # #673 review round 9: a valid-looking name (no control chars or
+    # whitespace) can still contain a non-colon RFC 7230 separator.
+    framing_marker_case(up, "chunk_trailer_separator_char_in_name", cat, port, lambda tail:
+                         b"POST /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + VALID_TOKEN.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad(Name: x\r\n\r\n" + tail)
 
     # #673 review round 7 point 3: every case above tests one MALFORMED or
     # ambiguous framing combination and asserts it is rejected (zero
@@ -846,6 +850,9 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         # #673 review round 8: trailer lines must be valid header-field
         # syntax, not merely "contain a colon somewhere".
         "chunk_trailer_invalid_name",
+        # #673 review round 9: a valid-looking name (no control chars or
+        # whitespace) can still contain a non-colon RFC 7230 separator.
+        "chunk_trailer_separator_char_in_name",
     ]
     for scenario in core_scenarios:
         up.reset()
@@ -1030,6 +1037,7 @@ def run_malicious_upstream(up: Upstream, port: int) -> None:
         "status_code_too_low",
         "status_code_too_high",
         "chunk_trailer_invalid_name",
+        "chunk_trailer_separator_char_in_name",
     ]:
         up.reset()
         raw = send_raw(port, hostile(scenario, "/hostile-streaming"))
