@@ -301,6 +301,7 @@ if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]
   # directly -- bare `/` has no automatic index.html fallback and 404s.
   "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" \
     "https://tardigrade.test:$udp_port/index.html" "https://tardigrade.test:$udp_port/proxy" \
+    "https://tardigrade.test:$udp_port/proxy-error" \
     --exit-on-all-streams-close >"$logs/gtlsclient-h3-multi.log" 2>&1 || status=1
   # gtlsclient logs the received body as a hexdump wrapped at 16 bytes per
   # line, so a literal response-body needle longer than one wrapped segment
@@ -315,8 +316,10 @@ if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]
   if grep -Fq ':status: 200' "$logs/gtlsclient-altsvc.log" &&
      log_contains "$logs/gtlsclient-altsvc.log" 'alive' &&
      grep -Fq ':status: 200' "$logs/gtlsclient-h3-multi.log" &&
+     grep -Fq ':status: 500' "$logs/gtlsclient-h3-multi.log" &&
      log_contains "$logs/gtlsclient-h3-multi.log" 'blackbox-static-ok' &&
-     log_contains "$logs/gtlsclient-h3-multi.log" 'proxy-ok'; then
+     log_contains "$logs/gtlsclient-h3-multi.log" 'proxy-ok' &&
+     log_contains "$logs/gtlsclient-h3-multi.log" 'proxy-upstream-error'; then
     say "PASS black-box ngtcp2/GnuTLS H3 proof"
     printf 'blackbox_h3_ngtcp2=PASS\n' >>"$summary"
   else
