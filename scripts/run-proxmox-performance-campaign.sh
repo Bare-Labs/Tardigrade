@@ -987,6 +987,8 @@ EOF
       --tool k6 \
       --scenarios keepalive-starvation \
       --save "$backend_dir/primary-keepalive-starvation.json"
+    jq -e '.["keepalive-starvation"] != null' "$backend_dir/primary-keepalive-starvation.json" >/dev/null || \
+      die "$backend keepalive-starvation did not produce a result"
     wrk --latency -s benchmarks/wrk-summary.lua -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" -H "Connection: close" "http://127.0.0.1:19092/tiny.txt" >"$backend_dir/primary-connection-churn.wrk.txt" 2>&1
     churn_summary="$(grep 'WRK_SUMMARY ' "$backend_dir/primary-connection-churn.wrk.txt" | tail -1 | sed 's/^.*WRK_SUMMARY //')"
     [[ -n "$churn_summary" ]] || die "$backend connection churn did not emit WRK_SUMMARY"
