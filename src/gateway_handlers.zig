@@ -2512,6 +2512,11 @@ fn handleHttp3StaticLocation(
         );
     }
     const out_body: []const u8 = compress_result.body orelse raw_body;
+    // HEAD must report the GET-equivalent representation length even though
+    // no body bytes are actually sent: `served.content_length` is the true
+    // served size, while `out_body.len` was forced to 0 above by emptying
+    // `raw_body` for HEAD before it ever reached compression.
+    const content_length: usize = if (is_head_req) served.content_length else out_body.len;
     _ = response
         .setStatus(served.status_code)
         .setBodyOwned(try allocator.dupe(u8, out_body))
@@ -2527,7 +2532,7 @@ fn handleHttp3StaticLocation(
     }
     _ = response
         .setHeader("server", http.SERVER_NAME)
-        .setContentLength(out_body.len);
+        .setContentLength(content_length);
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(@intFromEnum(served.status_code));
     return true;
@@ -2583,6 +2588,10 @@ fn handleHttp3TopLevelStaticFallback(
         );
     }
     const out_body: []const u8 = compress_result.body orelse raw_body;
+    // Same HEAD representation-length fix as handleHttp3StaticLocation above:
+    // `out_body.len` is 0 for HEAD (body intentionally suppressed), but the
+    // client still needs the true served length, not the transmitted one.
+    const content_length: usize = if (is_head_req) served.content_length else out_body.len;
     _ = response
         .setStatus(served.status_code)
         .setBodyOwned(try allocator.dupe(u8, out_body))
@@ -2598,7 +2607,7 @@ fn handleHttp3TopLevelStaticFallback(
     }
     _ = response
         .setHeader("server", http.SERVER_NAME)
-        .setContentLength(out_body.len);
+        .setContentLength(content_length);
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(@intFromEnum(served.status_code));
     return true;
@@ -2647,6 +2656,106 @@ test "handleHttp3Connection serves the top-level static root when no location ma
 
     try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
     try std.testing.expectEqualStrings("blackbox-static-ok", response.body orelse "");
+}
+
+test "handleHttp3Connection preserves representation length for HEAD against the top-level static fallback" {
+    // Regression for a bug introduced by the fallback above: HEAD correctly
+    // suppresses the transmitted body, but the fix must not also zero the
+    // reported Content-Length -- it must equal the GET-equivalent
+    // representation length (the served file's real size), not 0.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "blackbox-static-ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.doc_root = root_path;
+    cfg.try_files = "$uri";
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "HEAD"),
+        .path = try allocator.dupe(u8, "/index.html"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Connection(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqual(@as(usize, 0), if (response.body) |b| b.len else 0);
+    try std.testing.expectEqualStrings("18", response.headers.get("content-length") orelse "");
+}
+
+test "handleHttp3Connection preserves representation length for HEAD against a location-block static root" {
+    // Same fix, for the pre-existing location-block static path
+    // (handleHttp3StaticLocation) rather than the new top-level fallback:
+    // both derived Content-Length from the (HEAD-emptied) transmitted body.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "blackbox-static-ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/index.html",
+        .priority = 0,
+        .action = .{ .static_root = .{
+            .root = root_path,
+            .alias = false,
+            .autoindex = false,
+            .index = "",
+            .try_files = "$uri",
+        } },
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "HEAD"),
+        .path = try allocator.dupe(u8, "/index.html"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Connection(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqual(@as(usize, 0), if (response.body) |b| b.len else 0);
+    try std.testing.expectEqualStrings("18", response.headers.get("content-length") orelse "");
 }
 
 test "handleHttp3Connection still 404s an unmatched path when no top-level root is configured" {

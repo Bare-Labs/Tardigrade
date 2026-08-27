@@ -359,12 +359,42 @@ else
   printf 'second_h3_impl=SKIP no-aioquic-or-quiche\n' >>"$summary"
 fi
 
+if [ -n "${AIOQUIC_PYTHON:-}" ] && [ -x "${AIOQUIC_PYTHON:-}" ]; then
+  # RESET_STREAM/STOP_SENDING cancellation, against the selected artifact:
+  # a CLI accepting "--h3" is not proof of this, and neither ngtcp2's
+  # example client nor h3_interop_tool expose a stream-cancel flag, so this
+  # drives the real QUIC transport primitives directly via aioquic's
+  # low-level API. Proves cancellation doesn't poison the connection: a
+  # third, ordinary request on the same connection must still succeed.
+  "$AIOQUIC_PYTHON" "$here/interop/aioquic_cancel_client.py" 127.0.0.1 "$udp_port" tardigrade.test /healthz \
+    >"$logs/aioquic-cancel-client.log" 2>&1 || status=1
+  if grep -q 'recovery status: 200' "$logs/aioquic-cancel-client.log" &&
+     grep -q 'alive' "$logs/aioquic-cancel-client.log"; then
+    say "PASS black-box H3 RESET_STREAM/STOP_SENDING cancellation + same-connection recovery"
+    printf 'blackbox_h3_cancel=PASS\n' >>"$summary"
+  else
+    say "FAIL black-box H3 RESET_STREAM/STOP_SENDING cancellation + same-connection recovery"
+    printf 'blackbox_h3_cancel=FAIL\n' >>"$summary"
+    status=1
+  fi
+else
+  say "SKIP black-box H3 cancellation proof: AIOQUIC_PYTHON unavailable"
+  printf 'blackbox_h3_cancel=SKIP no-aioquic\n' >>"$summary"
+fi
+
 cycles="${HTTP_SWEEP_RESOURCE_CYCLES:-20}"
 for i in $(seq 1 "$cycles"); do
   if command -v nghttp >/dev/null 2>&1; then
     nghttp -y -n "https://127.0.0.1:$tcp_port/healthz" >/dev/null 2>>"$logs/resource-nghttp.err" || status=1
   fi
-  if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
+  # connect/request/cancel/close, not just connect/request/close: each cycle
+  # exercises the real RESET_STREAM/STOP_SENDING + same-connection-recovery
+  # path (like the dedicated cancellation row above) rather than only ever
+  # closing streams cleanly.
+  if [ -n "${AIOQUIC_PYTHON:-}" ] && [ -x "${AIOQUIC_PYTHON:-}" ]; then
+    "$AIOQUIC_PYTHON" "$here/interop/aioquic_cancel_client.py" 127.0.0.1 "$udp_port" tardigrade.test /healthz \
+      >/dev/null 2>>"$logs/resource-aioquic-cancel.err" || status=1
+  elif [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
     "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" "https://tardigrade.test:$udp_port/healthz" \
       --exit-on-first-stream-close >/dev/null 2>>"$logs/resource-gtlsclient.err" || status=1
   fi
@@ -377,8 +407,44 @@ record_sample after_settle "$tardi_pid" >>"$summary"
 
 curl -sk --noproxy '*' --resolve "tardigrade.test:$tcp_port:127.0.0.1" -D "$logs/altsvc-disabled.headers" -o /dev/null \
   "https://tardigrade.test:$tcp_port/healthz" >"$logs/altsvc-disabled-prestop.curl.log" 2>&1 || true
-kill "$tardi_pid" 2>/dev/null
-wait "$tardi_pid" 2>/dev/null
+
+if [ -n "${AIOQUIC_PYTHON:-}" ] && [ -x "${AIOQUIC_PYTHON:-}" ]; then
+  # GOAWAY/drain boundary, against the selected artifact: complete one
+  # ordinary request, signal readiness, SIGTERM the server (the same signal
+  # the enabled-instance shutdown below already uses), then attempt a new
+  # stream on the SAME already-open connection. aioquic does not surface the
+  # GOAWAY frame itself as a public event, so this proves the boundary's
+  # effect instead: admitted work completing plus new work being refused.
+  drain_ready="$workdir/drain-ready"
+  rm -f "$drain_ready"
+  "$AIOQUIC_PYTHON" "$here/interop/aioquic_drain_client.py" 127.0.0.1 "$udp_port" tardigrade.test /healthz "$drain_ready" \
+    >"$logs/aioquic-drain-client.log" 2>&1 &
+  drain_client_pid=$!
+  for _ in $(seq 1 50); do
+    [ -f "$drain_ready" ] && break
+    sleep 0.1
+  done
+  kill "$tardi_pid" 2>/dev/null
+  wait "$drain_client_pid" 2>/dev/null
+  drain_client_status=$?
+  wait "$tardi_pid" 2>/dev/null
+  tardi_pid=""
+  if [ "$drain_client_status" -eq 0 ] &&
+     grep -q 'pre-drain status: 200' "$logs/aioquic-drain-client.log" &&
+     grep -q 'post-drain refused: True' "$logs/aioquic-drain-client.log"; then
+    say "PASS black-box H3 GOAWAY/drain boundary (admitted work completes, new work refused)"
+    printf 'blackbox_h3_drain=PASS\n' >>"$summary"
+  else
+    say "FAIL black-box H3 GOAWAY/drain boundary (admitted work completes, new work refused)"
+    printf 'blackbox_h3_drain=FAIL\n' >>"$summary"
+    status=1
+  fi
+else
+  say "SKIP black-box H3 GOAWAY/drain boundary proof: AIOQUIC_PYTHON unavailable"
+  printf 'blackbox_h3_drain=SKIP no-aioquic\n' >>"$summary"
+  kill "$tardi_pid" 2>/dev/null
+  wait "$tardi_pid" 2>/dev/null
+fi
 tardi_pid=""
 
 disabled_tcp_port="$(free_tcp_port)"
