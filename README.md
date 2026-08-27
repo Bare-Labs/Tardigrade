@@ -77,23 +77,20 @@ tardi run -c ./my-site.conf
 
 This is useful when you want to keep multiple config files for different environments.
 
-### 4. Run in the background
-
-```bash
-tardi run --daemon
-```
-
-This starts Tardigrade as a daemonized process.
-
-### 5. TLS termination example
+### 4. TLS termination example
 
 ```bash
 tardi init tls > tardigrade.conf
+```
+
+Set the certificate/key paths and your upstream in `tardigrade.conf`, then:
+
+```bash
 tardi check
 tardi run
 ```
 
-Use this when you want Tardigrade to handle TLS at the edge.
+See the [TLS termination example](examples/tls-termination/README.md) for a complete setup.
 
 ## Useful commands
 
@@ -139,5 +136,7 @@ For full configuration details and advanced deployment options, see:
   <a href="SECURITY.md">Security</a> |
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
+
+Performance methodology, reproducible harnesses, and the latest committed benchmark report are in [benchmarks/README.md](benchmarks/README.md).
 
 This project is licensed under the Apache License 2.0.
