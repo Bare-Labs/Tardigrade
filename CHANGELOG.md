@@ -2,6 +2,57 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.6.4] - 2026-08-27
+
+### Fixed
+- **TLS upstream pooling no longer discards healthy fragmented-record
+  connections (#695)** — the post-release TLS staleness check added during the
+  F-06 hardening campaign could treat a partial TLS record already buffered in
+  the record layer as proof that application data was pending on an idle
+  upstream connection. That made otherwise reusable TLS upstream connections
+  look stale and closed them aggressively. The pool now distinguishes genuine
+  application plaintext or peer shutdown from incomplete ciphertext, quarantines
+  unresolved fragmented records instead of misclassifying them, and records
+  clearer diagnostics for the quarantine path. Regression coverage exercises
+  the reuse/staleness classifier so TLS pooling keeps working without reopening
+  the ghost-response poisoning gap fixed in `0.6.3`.
+
+- **HTTP/3 static fallback and HEAD response parity are now aligned with the
+  stable H1/H2 behavior (#677, #694)** — the release sweep found H3-only gaps
+  where paths that should fall through to the top-level static root returned
+  `404`, and HEAD responses for static content could report a transmitted-body
+  length of `0` or the uncompressed representation length instead of matching
+  the equivalent GET response headers. H3 now applies the same top-level static
+  fallback and GET-equivalent compression metadata used by the other stable
+  paths while still suppressing the HEAD body.
+
+- **Proxied HEAD responses preserve trustworthy upstream `Content-Length`
+  metadata across H2/H3 paths (#677, #694)** — H2/H3 release-sweep work closed
+  gaps where proxied HEAD responses could lose the upstream representation
+  length, borrow it from short-lived parser storage, or preserve it before
+  applying the upstream `Connection` nomination filter. The proxy now owns the
+  value for later header encoding, fills it for h2c-origin buffered responses,
+  and strips hop-by-hop-nominated lengths before they can cross the trust
+  boundary.
+
+### Testing
+- **HTTP/2 and HTTP/3 release sweep coverage now exercises the published
+  artifact contract (#677, #694)** — `scripts/run-http-release-sweep.sh` and
+  the lower-level black-box harness now cover H2 proxied HEAD behavior, H3
+  static fallback, H3 upstream error propagation, H3 cancellation/recovery,
+  and H3 GOAWAY drain-boundary behavior against a selected `TARDI_BIN`. The
+  committed evidence compares the published `v0.6.3` artifact with the fixed
+  source build and documents the expected pre-release failures that this
+  `0.6.4` cut is intended to publish.
+
+- **Full TLS conformance is now a repeatable v0.6.x hardening gate (#674,
+  #693)** — a scheduled and manually runnable `tls-conformance-full.yml`
+  workflow runs the full OpenSSL/GnuTLS TLS interop profile and the pinned
+  external H3/QUIC peer matrix, failing unless the required rows finish with
+  zero unexplained failures or skips. The retained hardening evidence records
+  116/116 full-profile rows passing and real external H3/QUIC peer coverage,
+  including HelloRetryRequest scenarios in both directions.
+
 ## [0.6.3] - 2026-08-26
 
 ### Fixed
