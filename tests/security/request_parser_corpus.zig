@@ -100,6 +100,7 @@ fn assertMutationsDoNotCrash(allocator: std.mem.Allocator, path: []const u8) !vo
                 error.InvalidContentLength,
                 error.ConflictingHeaders,
                 error.InvalidChunkedBody,
+                error.DuplicateAuthorizationHeader,
                 => continue,
                 error.OutOfMemory => return err,
             };

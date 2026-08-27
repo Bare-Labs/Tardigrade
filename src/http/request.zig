@@ -4,6 +4,7 @@ const Method = @import("method.zig").Method;
 const Version = @import("version.zig").Version;
 const Headers = @import("headers.zig").Headers;
 const parseHeaders = @import("headers.zig").parseHeaders;
+const isValidTrailerLine = @import("headers.zig").isValidTrailerLine;
 
 /// Maximum request line size
 pub const MAX_REQUEST_LINE_SIZE = 8 * 1024; // 8KB
@@ -37,6 +38,12 @@ pub const ParseError = error{
     ConflictingHeaders,
     /// Transfer-Encoding: chunked body is malformed.
     InvalidChunkedBody,
+    /// More than one `Authorization` header field was present. HTTP does
+    /// not define combination semantics for `Authorization`, so accepting
+    /// either occurrence creates the same class of ambiguity risk as
+    /// duplicate `Content-Length` (WSTG-ATHZ-01/02, #673 F-06) -- reject
+    /// outright rather than silently preferring one field.
+    DuplicateAuthorizationHeader,
     OutOfMemory,
 };
 
@@ -115,25 +122,27 @@ pub const Request = struct {
         // present, reject as a potential request-smuggling attack.
         if (has_te and has_cl) return error.ConflictingHeaders;
 
+        if (headers.countByName("authorization") > 1) return error.DuplicateAuthorizationHeader;
+
         var body: ?[]const u8 = null;
         var total_bytes = body_start;
 
         if (has_te) {
-            // Only chunked is supported; other transfer codings are not valid
-            // for HTTP/1.1 requests from clients.
+            // Only chunked is supported, and the value must equal "chunked"
+            // exactly -- a coding *list* (e.g. "chunked, gzip", "gzip,
+            // chunked") is rejected rather than pattern-matched for a
+            // "chunked" token, since Tardigrade cannot apply an unrecognized
+            // coding and "chunked" is only valid as the final coding anyway
+            // (RFC 7230 §3.3.1) (#673 review).
             const te_value = headers.get("transfer-encoding").?;
-            var is_chunked = false;
-            var it = std.mem.splitSequence(u8, te_value, ",");
-            while (it.next()) |token| {
-                const trimmed = std.mem.trim(u8, token, " \t");
-                if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) is_chunked = true;
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, te_value, " \t"), "chunked")) {
+                return error.ConflictingHeaders; // unsupported/misordered TE
             }
-            if (!is_chunked) return error.ConflictingHeaders; // unsupported TE
             // Decode chunked body from data[body_start..].
             const decoded = try decodeChunkedBody(allocator, data[body_start..], max_body_size);
-            errdefer allocator.free(decoded);
-            body = decoded;
-            total_bytes = data.len; // consumed the rest of the buffer
+            errdefer allocator.free(decoded.body);
+            body = decoded.body;
+            total_bytes = body_start + decoded.consumed;
         } else if (has_cl) {
             const cl_str = headers.get("content-length").?;
             const content_length = std.fmt.parseInt(usize, cl_str, 10) catch {
@@ -210,20 +219,20 @@ pub const Request = struct {
         const cl_count = headers.countByName("content-length");
         if (cl_count > 1 or te_count > 1) return error.ConflictingHeaders;
         if (te_count > 0 and cl_count > 0) return error.ConflictingHeaders;
+        if (headers.countByName("authorization") > 1) return error.DuplicateAuthorizationHeader;
         if (cl_count == 1) {
             _ = std.fmt.parseInt(usize, headers.get("content-length").?, 10) catch {
                 return error.InvalidContentLength;
             };
         }
         if (te_count == 1) {
+            // Same exact-match policy as `parse()`: a coding list is
+            // rejected rather than pattern-matched for a "chunked" token
+            // (#673 review).
             const te_value = headers.get("transfer-encoding").?;
-            var is_chunked = false;
-            var it = std.mem.splitSequence(u8, te_value, ",");
-            while (it.next()) |token| {
-                const trimmed = std.mem.trim(u8, token, " \t");
-                if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) is_chunked = true;
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, te_value, " \t"), "chunked")) {
+                return error.ConflictingHeaders;
             }
-            if (!is_chunked) return error.ConflictingHeaders;
         }
 
         return .{
@@ -337,14 +346,27 @@ fn parseUri(uri: []const u8) ?Uri {
     };
 }
 
+/// Decoded chunked-body payload plus how many leading bytes of `data` the
+/// decode actually consumed (through and including the terminating chunk's
+/// trailer section). The caller (`Request.parse()`) must use `consumed`
+/// rather than assuming the whole buffer belongs to this one request's body:
+/// otherwise a pipelined request already sitting past the real terminator
+/// would either be silently discarded or misread as part of this body
+/// (#673 review).
+const ChunkedDecodeResult = struct { body: []u8, consumed: usize };
+
 /// Decode an HTTP/1.1 chunked-encoded body per RFC 7230 §4.1.
 /// Returns an owned slice with the decoded content.  Caller must free.
-fn decodeChunkedBody(allocator: Allocator, data: []const u8, max_body_size: usize) ParseError![]u8 {
+fn decodeChunkedBody(allocator: Allocator, data: []const u8, max_body_size: usize) ParseError!ChunkedDecodeResult {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var pos: usize = 0;
-    while (pos < data.len) {
-        // Find end of chunk-size line.
+    while (true) {
+        // Find end of chunk-size line. Reaching the end of `data` without
+        // ever finding a terminating zero-size chunk is a truncated body,
+        // not a complete one -- unlike a bare `while (pos < data.len)` loop,
+        // which would silently accept EOF right after a nonzero chunk as
+        // "done" (#673 review).
         const line_end = std.mem.find(u8, data[pos..], "\r\n") orelse return error.InvalidChunkedBody;
         const chunk_size_line = data[pos .. pos + line_end];
         // Strip optional chunk extensions (;ext=value …).
@@ -352,16 +374,39 @@ fn decodeChunkedBody(allocator: Allocator, data: []const u8, max_body_size: usiz
         const hex = std.mem.trim(u8, if (semi) |s| chunk_size_line[0..s] else chunk_size_line, " \t");
         const chunk_size = std.fmt.parseInt(usize, hex, 16) catch return error.InvalidChunkedBody;
         pos += line_end + 2; // skip size line + CRLF
-        if (chunk_size == 0) break; // last-chunk
+        if (chunk_size == 0) {
+            // Last-chunk: require the (possibly empty) trailer section to
+            // actually end in a blank line (RFC 7230 §4.1) rather than
+            // stopping at "0\r\n" and trusting whatever follows -- otherwise
+            // bytes that are really a pipelined next request could be
+            // silently swallowed or misread as trailers.
+            var tpos = pos;
+            while (true) {
+                const tlen = std.mem.find(u8, data[tpos..], "\r\n") orelse return error.InvalidChunkedBody;
+                if (tlen == 0) return .{ .body = out.toOwnedSlice(allocator) catch return error.OutOfMemory, .consumed = tpos + 2 };
+                // RFC 9112 §7.1.2: the trailer part is `*( field-line CRLF
+                // )` -- a non-blank line must actually be valid
+                // `field-name ":" OWS field-value OWS` syntax, not merely
+                // "contains a colon somewhere" (#673 review round 8: a
+                // colon-only check still let a malformed name/value like
+                // "Bad Name: x" or "X-Good: bad\x00value" through).
+                const trailer_line = data[tpos .. tpos + tlen];
+                if (!isValidTrailerLine(trailer_line)) return error.InvalidChunkedBody;
+                tpos += tlen + 2;
+            }
+        }
         if (out.items.len + chunk_size > max_body_size) return error.BodyTooLarge;
-        if (pos + chunk_size > data.len) return error.InvalidChunkedBody;
-        out.appendSlice(allocator, data[pos .. pos + chunk_size]) catch return error.OutOfMemory;
-        pos += chunk_size;
-        // Each chunk must end with CRLF.
-        if (pos + 2 > data.len or data[pos] != '\r' or data[pos + 1] != '\n') return error.InvalidChunkedBody;
-        pos += 2;
+        // Checked arithmetic: an oversized hex chunk-size must fail the
+        // request rather than overflow (#673 review).
+        const data_end = std.math.add(usize, pos, chunk_size) catch return error.InvalidChunkedBody;
+        const chunk_end = std.math.add(usize, data_end, 2) catch return error.InvalidChunkedBody;
+        if (chunk_end > data.len) return error.InvalidChunkedBody;
+        // Each chunk must end with a literal CRLF, not just two arbitrary
+        // bytes the decoder skips past.
+        if (!std.mem.eql(u8, data[data_end..chunk_end], "\r\n")) return error.InvalidChunkedBody;
+        out.appendSlice(allocator, data[pos..data_end]) catch return error.OutOfMemory;
+        pos = chunk_end;
     }
-    return out.toOwnedSlice(allocator) catch error.OutOfMemory;
 }
 
 // Tests
@@ -566,6 +611,27 @@ test "reject duplicate Content-Length headers" {
     try std.testing.expectError(error.ConflictingHeaders, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
 }
 
+test "reject duplicate Authorization headers even when one occurrence is well-formed (#673)" {
+    // Duplicate Authorization is ambiguous the same way duplicate
+    // Content-Length is: HTTP defines no combination semantics for it, so
+    // this must be rejected outright rather than silently preferring
+    // whichever occurrence a given code path happens to read first --
+    // regardless of which occurrence (first or second) would otherwise have
+    // been a valid credential.
+    const allocator = std.testing.allocator;
+
+    {
+        const raw = "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer garbage\r\nAuthorization: Bearer valid-token\r\n\r\n";
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parseHead(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+    }
+    {
+        const raw = "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer valid-token\r\nAuthorization: Bearer garbage\r\n\r\n";
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+        try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parseHead(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+    }
+}
+
 test "parse chunked body correctly" {
     const allocator = std.testing.allocator;
     // Two chunks: "Hello, " (7 bytes) + "World!" (6 bytes) = "Hello, World!"
@@ -603,6 +669,120 @@ test "chunked body exceeding max body size returns BodyTooLarge" {
     const allocator = std.testing.allocator;
     const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     try std.testing.expectError(error.BodyTooLarge, Request.parse(allocator, raw, 3));
+}
+
+test "reject a Transfer-Encoding coding list instead of pattern-matching a chunked token (#673 review)" {
+    // Both orderings of "chunked, gzip" used to be ACCEPTED as plain chunked
+    // framing because the old check only asked "does any comma-separated
+    // token equal chunked", ignoring the rest of the list. Tardigrade has no
+    // way to apply the "gzip" coding, and "chunked" is only valid as the
+    // final coding anyway (RFC 7230 §3.3.1), so the whole request must be
+    // rejected rather than decoded as if chunked were the only coding.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.ConflictingHeaders, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+    try std.testing.expectError(error.ConflictingHeaders, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+    try std.testing.expectError(error.ConflictingHeaders, Request.parseHead(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+}
+
+test "chunked body with no terminating zero chunk is rejected, not silently accepted at EOF (#673 review)" {
+    // The old decoder's outer loop condition was `while (pos < data.len)`,
+    // so reaching the end of the buffer right after a nonzero chunk's data
+    // (with no "0\r\n" terminator ever seen) fell out of the loop and
+    // returned successfully -- treating a truncated chunked body as if it
+    // were complete.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+}
+
+test "chunked body's trailer section must actually end in a blank line (#673 review)" {
+    // The old decoder stopped scanning the instant it saw "0\r\n" and never
+    // required the trailer section to reach its own terminating blank line,
+    // so trailing bytes right after "0\r\n" -- including what could be a
+    // pipelined next request -- were never validated as part of this body's
+    // framing.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+}
+
+test "chunked request reports the exact consumed offset, not the whole buffer, as its body boundary (#673 review)" {
+    // The old decoder always set `total_bytes = data.len`, so a pipelined
+    // second request already sitting right after a chunked body's real
+    // terminator was silently swallowed into "this request's consumed
+    // bytes" instead of being left for the next parse.
+    const allocator = std.testing.allocator;
+    const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n" ++
+        "GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const result = try Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE);
+    var req = result.request;
+    defer req.deinit();
+    try std.testing.expectEqualStrings("hello", req.body.?);
+    const consumed_prefix_len = raw.len - "GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n".len;
+    try std.testing.expectEqual(consumed_prefix_len, result.bytes_consumed);
+}
+
+test "chunked body's trailer lines must actually be header-field syntax (#673 review)" {
+    // A trailer line with no colon is not `header-field` per RFC 7230
+    // §4.1.2 -- the old decoder accepted any non-blank line as "a trailer"
+    // without checking, so unstructured bytes here (which could really be
+    // part of a pipelined next request) were silently swallowed as if they
+    // were legitimate trailer syntax.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Trailer No Colon\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+    // A well-formed trailer (has a colon) is still accepted.
+    const result = try Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Checksum: abc123\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    );
+    var req = result.request;
+    defer req.deinit();
+    try std.testing.expectEqual(@as(usize, 0), req.body.?.len);
+}
+
+test "chunked body's trailer lines must be a valid header field, not just contain a colon (#673 review round 8)" {
+    // A colon-only check (the round-7 version of this validation) would
+    // have accepted all of these: a colon is present, but the name or
+    // value is malformed.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Name: x\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Bad\x00Name: x\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Good: bad\x00value\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    ));
 }
 
 test "fuzz: Request.parse never panics on arbitrary HTTP input" {

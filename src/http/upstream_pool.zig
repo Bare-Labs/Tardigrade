@@ -328,6 +328,75 @@ pub const UpstreamPool = struct {
         return false;
     }
 
+    /// Whether an idle pooled connection already has something readable
+    /// waiting on its raw fd -- unsolicited bytes the origin sent after
+    /// releasing it back to the pool, or the origin having closed the
+    /// connection outright.
+    ///
+    /// The existing framing fixes above only prove a connection was in sync
+    /// *at the instant it was released*: a response that lands exactly on
+    /// its declared Content-Length/chunked boundary is legitimately marked
+    /// reusable, but a hostile or misbehaving origin can send a "ghost"
+    /// response asynchronously *after* release, with no relationship to any
+    /// request Tardigrade ever sent. Nothing at release time can observe
+    /// that; it can only be caught by checking again right before the
+    /// connection is handed to the next, unrelated caller (#673 review).
+    /// Without this, that caller sends its request and then reads the
+    /// stale ghost bytes as if they were its own response.
+    ///
+    /// A zero-timeout `poll()` is a conservative test for a **plain**
+    /// connection: `POLLIN` means bytes are already queued, `POLLHUP`/
+    /// `POLLERR` mean the peer is gone either way, and every byte on a
+    /// plain connection's raw fd is necessarily application-layer, so any
+    /// of these unambiguously means "do not reuse". A poll failure fails
+    /// closed (treated as stale) rather than risking a false "clean" on an
+    /// unexpected error.
+    ///
+    /// A **TLS** connection cannot use the same raw-fd poll: real TLS 1.3
+    /// servers routinely send a `NewSessionTicket` (or other post-handshake,
+    /// record-layer-only message) asynchronously right after the handshake,
+    /// with no relationship to application data at all. That ciphertext
+    /// shows up as `POLLIN` on the raw fd immediately, which would flag
+    /// essentially every freshly-pooled TLS connection as "stale" and
+    /// defeat TLS connection pooling outright (caught by an integration
+    /// test asserting a second proxied HTTPS request reuses the pooled
+    /// connection).
+    ///
+    /// TLS connections currently use
+    /// `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which
+    /// nonblockingly drives the record layer through everything already
+    /// queued before deciding, and fails closed if it still owns any
+    /// not-yet-resolved ciphertext once the drive stalls (a partial record
+    /// is not proof of "nothing pending" -- see that function's doc comment
+    /// in `src/http/upstream_tls.zig` for the full rationale, including a
+    /// round-10 fix for a prefix-consumed-without-plaintext false-clean
+    /// gap). A simpler alternative, `readReady()` (already-decrypted
+    /// plaintext or a completed clean shutdown only, never driving new
+    /// ciphertext), is kept available on `UpstreamTlsConn` as a fallback:
+    /// this drive-based approach previously caused a Linux-ARM-only CI
+    /// failure on the pooled-TLS-reuse integration test that could not be
+    /// reproduced or explained, prompting a revert to `readReady()` that a
+    /// documentation/code mismatch briefly failed to actually apply in code
+    /// (#673 review round 10). It was re-enabled, with the false-clean gap
+    /// above fixed, once the reviewer's own re-review of the exact reverted
+    /// head observed the previously-failing Linux ARM job passing on this
+    /// same drive-based code -- evidence the original failure was more
+    /// likely transient than a deterministic platform difference. If a
+    /// genuine platform-specific failure resurfaces, prefer reverting this
+    /// one line to `tls.readReady()` over re-diagnosing under pressure; see
+    /// `docs/SECURITY_TEST_PLAN.md` defect 27 for the full history.
+    fn hasUnexpectedReadableBytes(conn: PooledConn) bool {
+        if (conn.tls) |tls| return tls.drainQueuedRecordsAndCheckReady();
+        var pfds = [_]std.posix.pollfd{.{
+            .fd = conn.stream.handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        const n = std.posix.poll(&pfds, 0) catch return true;
+        if (n == 0) return false;
+        return (pfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
+    }
+
     /// Close a connection: tear down the owned TLS connection (if any), then
     /// close the transport.
     fn closeConn(self: *UpstreamPool, conn: PooledConn) void {
@@ -404,6 +473,11 @@ pub const UpstreamPool = struct {
         }
         while (entry.idle.pop()) |conn| {
             if (self.isExpired(conn, now_ms)) {
+                self.closeConn(conn);
+                continue;
+            }
+            if (hasUnexpectedReadableBytes(conn)) {
+                entry.stats.stale_retries_total += 1;
                 self.closeConn(conn);
                 continue;
             }
@@ -693,6 +767,56 @@ test "new connection then release pools it; acquire reuses and tracks active" {
     try testing.expectEqual(@as(u64, 0), agg.idle);
     pool.release("h:80", got, false, 1500); // close it
     try testing.expectEqual(@as(u64, 0), pool.aggregateStats().active);
+}
+
+test "checkout discards an idle connection with an unsolicited ghost byte instead of reusing it (#673 review)" {
+    // A hostile or misbehaving origin can send a "ghost" response
+    // asynchronously, any time after Tardigrade released a connection back
+    // to the pool -- with no relationship to any request Tardigrade ever
+    // sent on it. The framing-level fixes elsewhere only prove a connection
+    // was in sync at release time; only a check at the next checkout can
+    // catch bytes that arrive after that.
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const fds = try testPair();
+    defer _ = std.c.close(fds[1]);
+
+    try pool.reserveSlot("h:80");
+    pool.noteNewConnection("h:80");
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 1000, .last_used_ms = 1000 }, true, 1000);
+    try testing.expectEqual(@as(u64, 1), pool.aggregateStats().idle);
+
+    // The origin ("fds[1]") sends an unsolicited ghost byte on the idle
+    // connection before anyone checks it out again.
+    const ghost = "G";
+    _ = std.c.write(fds[1], ghost.ptr, ghost.len);
+
+    // checkout() must not hand back the poisoned connection: it should
+    // discard it and fall through to "no idle connection available"
+    // (reserving a slot for a fresh one), exactly like popping an expired
+    // connection does.
+    const got = try pool.checkout("h:80", 1500);
+    try testing.expect(got == null);
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 0), agg.idle);
+    try testing.expectEqual(@as(u64, 0), agg.reused_total);
+    try testing.expectEqual(@as(u64, 1), agg.stale_retries_total);
+}
+
+test "checkout discards an idle connection the origin already closed instead of reusing it" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const fds = try testPair();
+
+    try pool.reserveSlot("h:80");
+    pool.noteNewConnection("h:80");
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 1000, .last_used_ms = 1000 }, true, 1000);
+    // The origin closes its end while the connection sits idle.
+    _ = std.c.close(fds[1]);
+
+    const got = try pool.checkout("h:80", 1500);
+    try testing.expect(got == null);
+    try testing.expectEqual(@as(u64, 0), pool.aggregateStats().idle);
 }
 
 test "reuse on the releasing thread counts as local" {

@@ -4,6 +4,168 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Twenty-eight auth/framing defects found by a live F-06 black-box campaign (#673)** —
+  `scripts/run-f06-auth-framing-campaign.sh` fires raw HTTP/1.1 probes at a
+  real local edge fronting a disposable upstream (plus a deliberately
+  hostile one, on both the buffered and a forced-streaming proxy route) and
+  found:
+  - Upstream response `Connection` header could smuggle a header past
+    hop-by-hop stripping: a malicious/misbehaving upstream sending
+    `Connection: X-Foo` alongside `X-Foo: ...` could ride `X-Foo` through to
+    the client. The request direction already honored client-nominated
+    hop-by-hop headers (RFC 7230 §6.1); the response direction did not.
+  - That same nomination check only consulted the first `Connection` field
+    when the header was duplicated, in both directions -- and a first fix
+    attempt that joined every occurrence into a fixed 4 KiB buffer was
+    itself bypassable by padding earlier fields past the buffer boundary.
+  - Duplicate `Authorization` fields were accepted whenever the field a
+    given code path happened to read first was valid, silently ignoring a
+    second, malformed field.
+  - The client identity used to key rate-limit buckets and access logs
+    could be freely rewritten via `X-Forwarded-For`/`X-Real-IP` from *any*
+    client, even behind a correctly configured `trusted_upstream_identities`
+    trust boundary, because that resolution never consulted it.
+  - Upstream response headers were forwarded to the client with no
+    control-character validation at all, unlike client request headers,
+    letting a hostile/compromised upstream inject a bare CR or NUL into a
+    header value the client received.
+  - The buffered proxy path forwarded an illegal body for upstream
+    `204`/`304`/`1xx` responses whenever the upstream included one, even
+    though those statuses are bodiless by definition regardless of
+    `Content-Length` -- a real response-splitting vector, since a
+    downstream client would treat the illegal bytes as the start of the
+    next response on the connection.
+  - Both the buffered and streamed proxy paths could still return a
+    bodiless upstream connection to the idle pool for reuse whenever
+    nothing had trailed the header block *at the instant it was parsed* --
+    a malicious/misbehaving upstream could send just the headers, wait
+    until the connection was pooled, and only then send an illegal body or
+    a full ghost response, poisoning whatever unrelated request checked
+    the connection out next. The streamed path's own copy of this fix
+    turned out not to run at all in production for exactly the response
+    family it targeted (only inside a conditional that is false for
+    bodiless responses), requiring a second, separate fix.
+  - The first interim `1xx` response in a chain (e.g. `103 Early Hints`)
+    was wrongly treated as the complete exchange on the buffered proxy
+    path, silently discarding whatever actually followed -- including the
+    real final response. The streamed proxy path had the same bug in a
+    separate code path, fixed separately.
+  - A duplicate upstream `Content-Length` resolved to whichever field
+    happened to appear last instead of being rejected, so reversing field
+    order could flip which (possibly smaller, leaving "extra" bytes past
+    the parsed boundary) value won.
+  - Upstream status-line parsing was not strict: a bare LF right after the
+    status line could hide a `Connection`-nominated header from the
+    nomination filter (buffered path) or get swallowed into the reason
+    phrase and re-emitted to the client with the embedded LF intact
+    (streaming path), and an unparseable status code silently defaulted to
+    `200`/`0` instead of being rejected.
+  - Even after the fix above, all three status-line-parsing call sites each
+    kept their own independent boundary-finding logic that merely happened
+    to agree; consolidated into one shared `parseStrictStatusLine()`.
+  - Upstream `Transfer-Encoding` matching accepted any comma-separated list
+    containing a `chunked` token (e.g. `chunked, gzip`) as plain chunked
+    framing, silently discarding the unrecognized coding, and never
+    rejected a duplicated `Transfer-Encoding` field the way duplicate
+    `Content-Length` already was.
+  - An upstream response carrying both `Transfer-Encoding: chunked` and
+    `Content-Length` was deliberately allowed through with
+    `Transfer-Encoding` given precedence -- the classic smuggling
+    ambiguity RFC 7230 §3.3.3 says to reject outright, not resolve.
+  - An upstream `101 Switching Protocols` response fell through to being
+    re-serialized to the client as an ordinary bodiless final response by
+    a generic reverse-proxy path with no actual protocol-tunnel support,
+    leaving the client believing the connection had switched protocols
+    while Tardigrade still parsed it as HTTP/1.1.
+  - The buffered path's chunked-body decoder reported only the decoded
+    payload, not how many input bytes it consumed, so the exchange loop
+    marked the upstream connection reusable unconditionally the instant
+    decoding succeeded -- even with extra/ghost bytes already sitting past
+    the terminating chunk's trailer section in the same read (the
+    chunked-body counterpart of the bodiless pool-poisoning fix above). It
+    also skipped the two bytes after each chunk's data without checking
+    they were a literal CRLF, and computed chunk boundaries with unchecked
+    arithmetic a maliciously oversized hex chunk-size could overflow into
+    a safety-checked panic.
+  - The shared status-line parser required exactly three decimal digits
+    but never checked they fell inside RFC 9110 §15's valid `100..599`
+    status code range, so a value like `099` or `600` parsed successfully
+    -- and on the buffered path, an unrejected `099` was later reformatted
+    straight back out to the client as the invalid response line
+    `HTTP/1.1 99 ...`.
+  - The campaign's own request-framing smuggling oracle sent every
+    malformed/ambiguous probe with no `Authorization` header, so "zero
+    upstream hits" was equally explained by the `/protected` auth gate
+    rejecting the request regardless of what the framing parser would have
+    done -- masking whether the parser itself was actually correct on 15
+    live cases.
+  - Once probes carried valid auth, the REQUEST direction turned out to
+    have the same `Transfer-Encoding` list-matching defect already fixed on
+    the response direction: a coding list like `chunked, gzip` was accepted
+    as plain chunked framing.
+  - The request-side chunked-body decoder accepted EOF right after a
+    nonzero chunk with no terminating zero-chunk ever seen (treating a
+    truncated body as complete), never required the trailer section to
+    reach its own blank-line terminator, and always reported the whole
+    buffer as consumed regardless of where the chunked body's encoding
+    actually ended -- silently swallowing a pipelined next request's bytes.
+  - Neither chunked-body decoder (request or response direction) validated
+    that a non-blank trailer line was actually `name: value` syntax; a line
+    with no colon at all was accepted as "a trailer".
+  - The buffered path's request-completeness check had no
+    `Transfer-Encoding` awareness at all: a chunked request with no
+    `Content-Length` was declared "complete" the instant its headers
+    finished, before a single body byte arrived, handing the parser an
+    empty body and treating the connection as ready for the next request
+    while the real chunked body was still in flight on the wire.
+  - The streaming path's interim-`1xx`-discarding loop had no cap on how
+    many interim responses a hostile origin could drip-feed, no
+    cancellation check inside the loop, and a shared arena across every
+    iteration that never freed a discarded interim head's allocations
+    until the whole request ended.
+  - `UpstreamPool.checkout()` handed back an idle pooled connection without
+    checking whether its peer had sent anything (or closed) since release
+    -- so a "ghost" response delayed until after release, on a
+    `Content-Length`/chunked response that legitimately landed on its
+    declared boundary (not just the already-covered bodiless case), could
+    still poison a later, unrelated request over the same connection. Fixed
+    with a transport-aware staleness check: a raw-fd poll for plain
+    connections (a raw-fd poll on TLS connections flagged routine
+    post-handshake protocol chatter, e.g. session tickets, as staleness and
+    broke TLS connection pooling outright -- caught before merge by the
+    native-TLS integration suite), and for TLS connections, nonblockingly
+    driving the record layer through everything already queued and
+    checking whether genuine application plaintext or a clean shutdown
+    emerges -- also failing closed if the record layer still owns
+    unresolved ciphertext when the drive stalls, since a partial record is
+    not proof nothing is pending. This went through two more rounds of
+    scrutiny before landing: a first version broke TLS pooling on Linux ARM
+    CI for reasons not fully explained, prompting an attempted revert that
+    a documentation/code mismatch briefly failed to actually apply; a
+    second review caught both the mismatch and a genuine false-clean gap in
+    the drive logic itself. See `docs/SECURITY_TEST_PLAN.md` defect 27 for
+    the full history.
+  - The two newly-added chunked-body trailer checks validated only "does
+    this line contain a colon", not real `field-name: value` syntax -- and
+    two more production trailer-consuming implementations (the streaming
+    request-upload reader and the streaming response-relay's trailer
+    consumer) had no validation at all. Fixed with one shared validator
+    used by all four.
+  - That shared trailer validator's field-name check
+    (`isValidHeaderName()`) claimed to implement RFC 7230's `token`/`tchar`
+    grammar but only rejected control characters, space, DEL, and colon --
+    every other ASCII separator (`()<>@,;"/[]?={}`) still passed, on every
+    header-name validation site in the codebase, not just trailers. Fixed
+    by making it an actual `tchar` validator.
+
+  All twenty-eight fixed with regression coverage in `gateway_proxy_headers.zig`,
+  `src/http/request.zig`, `src/http/request_context.zig`, `src/http/headers.zig`,
+  `src/gateway_connection.zig`, `src/http/upstream_pool.zig`,
+  `src/http/upstream_tls.zig`, `src/http/chunked_upload.zig`, and
+  `gateway_proxy.zig`; see `docs/SECURITY_TEST_PLAN.md` (F-06) for the full
+  campaign writeup.
+
 ### Testing
 - **Linux release archive compatibility verification (#671)** — adds a new blocking `verify-linux-archive` job to the release CI pipeline that ensures `linux-x86_64` `.tar.gz` release artifacts can successfully start, serve traffic, and gracefully shut down on the project's required older userlands (Ubuntu 22.04 LTS and Rocky Linux 9). Release builds remain pinned to the `x86_64-linux-gnu.2.28` target, and a pull-request `linux-release-smoke.yml` workflow catches linkage or runtime regressions before merge.
 

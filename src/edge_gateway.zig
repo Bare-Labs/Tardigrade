@@ -3525,7 +3525,8 @@ fn appendHttp2UpstreamResponseHeaders(
     response: *const gp.BufferedUpstreamResponse,
 ) !void {
     for (response.headers) |header| {
-        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
+        if (gph.anyConnectionHeaderReferencesHeader(response.headers, header.name)) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         const name = try lowercaseName(allocator, lowered_names, header.name);
         const value = try allocator.dupe(u8, header.value);
@@ -4080,7 +4081,23 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         session.proxy_client_ip_buf[0..session.proxy_client_ip_len]
     else
         connection_ip;
-    const client_ip = http.request_context.extractClientIp(&request, effective_connection_ip);
+    // Gate X-Forwarded-For/X-Real-IP honoring on the same trust boundary
+    // docs/PROXY_SECURITY.md §7 documents for the outbound X-Forwarded-For
+    // sent to the upstream (#673): an untrusted connecting peer must not be
+    // able to rewrite the client_ip used for rate-limit bucketing and
+    // access logging just by sending those headers. Strip them from the
+    // request outright when untrusted -- before proxy-layer code (which
+    // reads request.headers.get("x-forwarded-for") directly to build the
+    // outbound X-Forwarded-For chain sent to Tardigrade's own upstream) can
+    // see them either; PROXY_SECURITY.md §7 documents that an untrusted
+    // host's X-Forwarded-For "is stripped and replaced by just the
+    // connection IP", which this call site previously never enforced.
+    const trusted_forwarding_source = gph.isTrustedUpstream(cfg, connection_ip);
+    if (!trusted_forwarding_source) {
+        request.headers.remove("x-forwarded-for");
+        request.headers.remove("x-real-ip");
+    }
+    const client_ip = http.request_context.extractClientIp(&request, trusted_forwarding_source, effective_connection_ip);
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     ctx.early_data.transport_early = request_transport_early;
     ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();

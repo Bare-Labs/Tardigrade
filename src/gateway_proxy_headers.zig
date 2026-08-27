@@ -60,7 +60,15 @@ pub fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]c
 /// Strips the RFC 7230 hop-by-hop set and technology-disclosure headers
 /// (WSTG-INFO-02, ASVS-14.3.3).  Tardigrade emits its own `Server` header
 /// and re-calculates `Content-Length` from the materialized body.
-pub fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
+///
+/// `connection_header` is the upstream response's own `Connection` value (if
+/// any). RFC 7230 §6.1 lets *either* end of a hop nominate extra headers as
+/// hop-by-hop via `Connection`; a malicious or misbehaving upstream must not
+/// be able to ride a nominated header past this filter to the client the way
+/// `shouldSkipUpstreamRequestHeader` already blocks it on the request side.
+pub fn shouldSkipUpstreamResponseHeader(name: []const u8, connection_header: ?[]const u8) bool {
+    if (connectionHeaderReferencesHeader(connection_header, name)) return true;
+
     return std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "content-encoding") or
         std.ascii.eqlIgnoreCase(name, http.early_data.HEADER_NAME) or
@@ -95,15 +103,54 @@ pub fn connectionHeaderReferencesHeader(connection_header: ?[]const u8, name: []
     return false;
 }
 
+/// Returns true if `name` is nominated as hop-by-hop by *any* occurrence of
+/// a `Connection` header among an already-parsed list of `{name, value}`
+/// headers (RFC 7230 §6.1) -- duplicate `Connection` fields must each be
+/// evaluated in full, not just the first (`Headers.get()` semantics) and
+/// not via a fixed-size join buffer. A prior version of this fix joined
+/// every occurrence into a `[4096]u8` buffer and silently truncated on
+/// overflow, which is itself bypassable: pad the first Connection field(s)
+/// with enough benign tokens to push a real nomination past byte 4096 and
+/// it would silently drop out of the joined value (#673 review). Scanning
+/// each occurrence's own (unbounded) value directly has no such limit.
+pub fn anyConnectionHeaderReferencesHeader(headers: anytype, name: []const u8) bool {
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        if (connectionHeaderReferencesHeader(header.value, name)) return true;
+    }
+    return false;
+}
+
+/// Same as `anyConnectionHeaderReferencesHeader`, but scans a raw
+/// `\r\n`-separated header block (status/request line included -- lines
+/// without a colon are skipped) instead of an already-parsed list. Used
+/// during a single streaming parse pass, before per-header filtering
+/// decisions.
+pub fn anyRawConnectionHeaderReferencesHeader(header_block: []const u8, name: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, header_block, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const hname = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(hname, "connection")) continue;
+        const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (connectionHeaderReferencesHeader(hval, name)) return true;
+    }
+    return false;
+}
+
 /// Copy safe client request headers into `extra_headers`, omitting all
 /// hop-by-hop and Tardigrade-reserved headers.
 pub fn appendProxyRequestHeaders(
     extra_headers: *std.array_list.Managed(std.http.Header),
     request_headers: *const http.Headers,
 ) !void {
-    const connection_header = request_headers.get("connection");
-    for (request_headers.iterator()) |header| {
-        if (shouldSkipUpstreamRequestHeader(header.name, connection_header)) continue;
+    // `Headers.get()` returns only the first match, but a client may repeat
+    // `Connection` as multiple fields; check every occurrence directly
+    // rather than pre-joining into a bounded buffer (#673).
+    const headers_list = request_headers.iterator();
+    for (headers_list) |header| {
+        if (shouldSkipUpstreamRequestHeader(header.name, null)) continue;
+        if (anyConnectionHeaderReferencesHeader(headers_list, header.name)) continue;
         try extra_headers.append(.{ .name = header.name, .value = header.value });
     }
 }
@@ -380,14 +427,14 @@ test "shouldSkipUpstreamRequestHeader drops Connection-listed custom hop-by-hop 
 }
 
 test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding", null));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type", null));
 }
 
 test "shouldSkipUpstreamResponseHeader strips Early-Data response headers" {
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Early-Data"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("early-data"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Early-Data", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("early-data", null));
 }
 
 test "appendCanonicalEarlyDataHeader emits exactly one RFC 8470 marker when enabled" {
@@ -424,19 +471,40 @@ test "appendProxyRequestHeaders normalizes duplicate inbound Early-Data through 
     try std.testing.expectEqualStrings("1", extra_headers.items[1].value);
 }
 
+test "appendProxyRequestHeaders unions duplicate Connection fields, not just the first (#673)" {
+    // `Headers.get()` returns only the first match; a client repeating
+    // `Connection` as two separate fields must still have every nominated
+    // header stripped, not just whichever field happened to come first.
+    var request_headers = http.Headers.init(std.testing.allocator);
+    defer request_headers.deinit();
+    try request_headers.append("Connection", "X-Ignore");
+    try request_headers.append("Connection", "X-Hostile-Secret");
+    try request_headers.append("X-Ignore", "client-value");
+    try request_headers.append("X-Hostile-Secret", "client-value");
+    try request_headers.append("X-Safe", "kept");
+
+    var extra_headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer extra_headers.deinit();
+
+    try appendProxyRequestHeaders(&extra_headers, &request_headers);
+
+    try std.testing.expectEqual(@as(usize, 1), extra_headers.items.len);
+    try std.testing.expectEqualStrings("x-safe", extra_headers.items[0].name);
+}
+
 test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
     // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
     // to external clients — Tardigrade emits its own Server header instead.
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("server", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by", null));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY", null));
     // Must not suppress unrelated headers.
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type", null));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header", null));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie", null));
 }
 
 test "shouldSkipUpstreamResponseHeader strips all hop-by-hop and disclosure headers" {
@@ -451,7 +519,7 @@ test "shouldSkipUpstreamResponseHeader strips all hop-by-hop and disclosure head
         "X-Powered-By",     "x-powered-by",
     };
     for (strip_cases) |name| {
-        try std.testing.expect(shouldSkipUpstreamResponseHeader(name));
+        try std.testing.expect(shouldSkipUpstreamResponseHeader(name, null));
     }
 }
 
@@ -466,8 +534,106 @@ test "shouldSkipUpstreamResponseHeader passes safe application response headers"
         "Last-Modified",
     };
     for (pass_cases) |name| {
-        try std.testing.expect(!shouldSkipUpstreamResponseHeader(name));
+        try std.testing.expect(!shouldSkipUpstreamResponseHeader(name, null));
     }
+}
+
+test "shouldSkipUpstreamResponseHeader strips headers nominated by the upstream's own Connection value (#673)" {
+    // RFC 7230 §6.1 lets either end of a hop nominate extra hop-by-hop
+    // headers via `Connection`. A hostile or misbehaving upstream sending
+    // `Connection: X-Hostile-Secret` alongside `X-Hostile-Secret: ...` must
+    // not be able to ride that header past the proxy to the client -- this
+    // mirrors the request-direction protection already covered by
+    // `shouldSkipUpstreamRequestHeader drops Connection-listed custom
+    // hop-by-hop headers`.
+    const conn = "X-Hostile-Secret, X-Also-Hostile";
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Hostile-Secret", conn));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-also-hostile", conn));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Safe-Header", conn));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie", conn));
+}
+
+test "anyConnectionHeaderReferencesHeader and anyRawConnectionHeaderReferencesHeader locate Connection case-insensitively" {
+    const Header = struct { name: []const u8, value: []const u8 };
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "CONNECTION", .value = "X-Foo" },
+    };
+    try std.testing.expect(anyConnectionHeaderReferencesHeader(&headers, "X-Foo"));
+    try std.testing.expect(!anyConnectionHeaderReferencesHeader(&headers, "X-Missing"));
+
+    const raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: X-Foo\r\n";
+    try std.testing.expect(anyRawConnectionHeaderReferencesHeader(raw, "X-Foo"));
+    try std.testing.expect(!anyRawConnectionHeaderReferencesHeader(raw, "X-Missing"));
+}
+
+test "anyConnectionHeaderReferencesHeader and anyRawConnectionHeaderReferencesHeader union duplicate Connection fields regardless of order/casing (#673)" {
+    // A response (or request) is allowed to repeat Connection as multiple
+    // header fields; RFC 7230 §3.2.2 treats that as equivalent to one
+    // comma-joined field. Consulting only the first occurrence would let a
+    // nomination hiding in a second/later field bypass filtering.
+    const Header = struct { name: []const u8, value: []const u8 };
+    const headers = [_]Header{
+        .{ .name = "Connection", .value = "X-Ignore" },
+        .{ .name = "CONNECTION", .value = "X-Hostile-Secret" },
+    };
+    try std.testing.expect(anyConnectionHeaderReferencesHeader(&headers, "X-Ignore"));
+    try std.testing.expect(anyConnectionHeaderReferencesHeader(&headers, "X-Hostile-Secret"));
+    try std.testing.expect(!anyConnectionHeaderReferencesHeader(&headers, "X-Safe"));
+
+    // Reversed order, reversed casing: still evaluated correctly.
+    const headers_reversed = [_]Header{
+        .{ .name = "connection", .value = "X-Hostile-Secret" },
+        .{ .name = "Connection", .value = "X-Ignore" },
+    };
+    try std.testing.expect(anyConnectionHeaderReferencesHeader(&headers_reversed, "X-Hostile-Secret"));
+    try std.testing.expect(anyConnectionHeaderReferencesHeader(&headers_reversed, "X-Ignore"));
+
+    const raw = "HTTP/1.1 200 OK\r\nConnection: X-Ignore\r\nConnection: X-Hostile-Secret\r\n";
+    try std.testing.expect(anyRawConnectionHeaderReferencesHeader(raw, "X-Hostile-Secret"));
+}
+
+test "anyConnectionHeaderReferencesHeader has no fixed-size limit -- a late nomination beyond 4096 bytes is still honored (#673 review)" {
+    // A prior version of this fix pre-joined every Connection occurrence
+    // into a fixed [4096]u8 buffer and silently truncated on overflow.
+    // That is itself bypassable: pad earlier Connection field(s) with
+    // enough benign tokens to push a real nomination past byte 4096, and
+    // the truncated joined value would silently drop it. Scanning each
+    // occurrence's own unbounded value directly (as these functions do)
+    // has no such limit.
+    const allocator = std.testing.allocator;
+
+    // A single ~4500-byte token, comfortably past the old 4096-byte
+    // buffer, followed by the real nomination in the SAME Connection field.
+    const padding = "X-Benign-" ** 500;
+    const conn_value = try std.fmt.allocPrint(allocator, "{s}, X-Hostile-Secret", .{padding});
+    defer allocator.free(conn_value);
+    try std.testing.expect(conn_value.len > 4096);
+
+    const Header = struct { name: []const u8, value: []const u8 };
+    const headers = [_]Header{.{ .name = "Connection", .value = conn_value }};
+    try std.testing.expect(anyConnectionHeaderReferencesHeader(&headers, "X-Hostile-Secret"));
+
+    const raw = try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nConnection: {s}\r\n", .{conn_value});
+    defer allocator.free(raw);
+    try std.testing.expect(anyRawConnectionHeaderReferencesHeader(raw, "X-Hostile-Secret"));
+
+    // Also cover the nomination being pushed past byte 4096 by *multiple*
+    // separate Connection fields rather than one long value.
+    const headers_multi = [_]Header{
+        .{ .name = "Connection", .value = padding },
+        .{ .name = "Connection", .value = padding },
+        .{ .name = "Connection", .value = "X-Hostile-Secret" },
+    };
+    try std.testing.expect(anyConnectionHeaderReferencesHeader(&headers_multi, "X-Hostile-Secret"));
+
+    const raw_multi = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nConnection: {s}\r\nConnection: {s}\r\nConnection: X-Hostile-Secret\r\n",
+        .{ padding, padding },
+    );
+    defer allocator.free(raw_multi);
+    try std.testing.expect(anyRawConnectionHeaderReferencesHeader(raw_multi, "X-Hostile-Secret"));
 }
 
 test "connectionHeaderReferencesHeader handles whitespace around tokens" {

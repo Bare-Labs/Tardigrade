@@ -208,7 +208,25 @@ pub const RequestContext = struct {
 /// Extract the client IP from request headers or connection info.
 /// Checks X-Forwarded-For and X-Real-IP before falling back to
 /// the provided default (connection remote address).
-pub fn extractClientIp(request: *const Request, default: []const u8) []const u8 {
+///
+/// `trusted_forwarding_source` gates whether those client-supplied headers
+/// are honored at all. This value is resolved by the caller (edge_gateway.zig)
+/// against `trusted_upstream_identities` / `trust_require_upstream_identity`
+/// -- the SAME trust boundary `docs/PROXY_SECURITY.md` §7 documents for the
+/// outbound `X-Forwarded-For` Tardigrade sends to its own upstream. Before
+/// #673, this function ignored that boundary entirely: it honored
+/// `X-Forwarded-For`/`X-Real-IP` from *any* client unconditionally, which
+/// let an untrusted client freely rewrite the `client_ip` used to key rate
+/// limiting (`ip:{client_ip}` buckets) and the `client_ip` recorded in
+/// access logs -- a trivial rate-limit bypass and log-forgery vector, live
+/// even when an operator had correctly locked down `trusted_upstream_identities`
+/// per the Safe Deployment Checklist, because this call site never consulted
+/// it. When `trusted_forwarding_source` is false, `default` (the real
+/// connection IP) is always returned, exactly as if no forwarding headers
+/// were present.
+pub fn extractClientIp(request: *const Request, trusted_forwarding_source: bool, default: []const u8) []const u8 {
+    if (!trusted_forwarding_source) return default;
+
     // Prefer X-Forwarded-For first IP
     if (request.headers.get("x-forwarded-for")) |xff| {
         if (std.mem.findScalar(u8, xff, ',')) |comma| {
@@ -324,7 +342,7 @@ test "extractClientIp prefers X-Forwarded-For" {
     var req = result.request;
     defer req.deinit();
 
-    const ip = extractClientIp(&req, "fallback");
+    const ip = extractClientIp(&req, true, "fallback");
     try std.testing.expectEqualStrings("1.2.3.4", ip);
 }
 
@@ -336,7 +354,7 @@ test "extractClientIp falls back to X-Real-IP" {
     var req = result.request;
     defer req.deinit();
 
-    const ip = extractClientIp(&req, "fallback");
+    const ip = extractClientIp(&req, true, "fallback");
     try std.testing.expectEqualStrings("9.8.7.6", ip);
 }
 
@@ -348,6 +366,23 @@ test "extractClientIp uses default when no proxy headers" {
     var req = result.request;
     defer req.deinit();
 
-    const ip = extractClientIp(&req, "192.168.1.1");
+    const ip = extractClientIp(&req, true, "192.168.1.1");
     try std.testing.expectEqualStrings("192.168.1.1", ip);
+}
+
+test "extractClientIp ignores X-Forwarded-For/X-Real-IP from an untrusted forwarding source (#673)" {
+    // Before #673 this function had no trust gate at all: any client could
+    // rewrite the client_ip used to key rate-limit buckets and access logs
+    // just by sending X-Forwarded-For, even behind a correctly configured
+    // `trusted_upstream_identities`. The untrusted path must always return
+    // the real connection IP, identically to "no proxy headers present".
+    const allocator = std.testing.allocator;
+
+    const raw = "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 6.6.6.6, 6.6.6.6\r\nX-Real-IP: 6.6.6.6\r\n\r\n";
+    const result = try Request.parse(allocator, raw, 1024 * 1024);
+    var req = result.request;
+    defer req.deinit();
+
+    const ip = extractClientIp(&req, false, "127.0.0.1");
+    try std.testing.expectEqualStrings("127.0.0.1", ip);
 }
