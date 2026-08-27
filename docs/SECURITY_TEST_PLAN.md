@@ -598,33 +598,33 @@ deterministic regression tests:
     `inboundCiphertextOwned()` sums internally -- and failing closed
     (treating the connection as unsafe to reuse) if that sum is nonzero.
 
-    Once both issues were fixed, the corrected code/doc-consistent
-    drive-based check was re-enabled as the active `checkout()` behavior.
-    The reviewer's own re-review of the exact (mismatched) reverted head
-    observed the previously-failing Linux ARM CI job passing on that same
-    drive-based code -- evidence the original Linux ARM failure was more
-    likely transient (a CI-environment race, similar to this same
-    workflow's already-observed flaky "best-effort, not CI-gated" H2 test)
-    than a deterministic platform difference in the drive logic itself,
-    though this could not be proven with certainty absent direct access to
-    that environment.
+    Issue #692 showed that the corrected drive-based check could still
+    false-stale a healthy native-TLS pooled connection on hosted ARM
+    runners when a protected record was only partially available at
+    checkout. The pool now reports a typed TLS checkout outcome instead of
+    a boolean stale decision. Definite application plaintext, peer close,
+    drive errors, and drain-budget exhaustion still fail closed and close
+    the connection. Incomplete ciphertext is moved to a bounded quarantine
+    list so the current checkout opens a fresh connection without waiting,
+    while a later maintenance pass can finish the nonblocking record drain
+    and either return the connection to idle or close it once the record is
+    classifiable. Retained capacity counts both idle and quarantined
+    connections, and maintenance detaches a small quarantine batch before
+    calling the TLS record drain so record work does not monopolize the
+    shared pool mutex.
 
-    **Known coverage gap**: this fix's correctness rests on code review
-    (draining through the exact primitive `read()` already trusts in
-    production, plus the now-closed partial-ciphertext gap) and on
-    cross-platform CI -- including the Linux ARM job that previously
-    failed -- rather than on a dedicated deterministic unit test that
-    drives a real two-sided TLS handshake and injects a hostile ghost
-    record before checkout. Building that requires in-process client+server
-    TLS handshake test infrastructure this codebase does not currently
-    have (the only precedent, `test-integration-native-tls`, spawns two
-    full separate `tardi` processes, which cannot be made to act hostile
-    without a purpose-built malicious TLS origin) -- tracked as follow-up
-    work rather than blocking this fix. If a genuine, reproducible
-    platform-specific failure resurfaces, the safest immediate mitigation
-    is reverting `hasUnexpectedReadableBytes()`'s TLS branch to
-    `tls.readReady()` (one line, `src/http/upstream_pool.zig`) while
-    re-diagnosing, rather than attempting a fix under time pressure again.
+    **Known coverage gap**: this path now has deterministic pool-level
+    coverage for typed plaintext stale detection, retained-capacity
+    accounting across idle plus quarantine, and bounded quarantine
+    maintenance, plus the native-TLS integration test still requires a
+    healthy persistent origin to produce reuse. It still lacks a
+    purpose-built malicious TLS origin that can split a protected
+    application record exactly across the checkout boundary and then prove
+    the completed ghost never becomes the next response. Building that
+    requires in-process client+server TLS handshake test infrastructure or
+    a controllable hostile native-TLS origin; until that exists, the
+    quarantine behavior is validated by pool lifecycle tests, typed
+    telemetry, and cross-platform native-TLS CI.
 28. `isValidHeaderName()` -- the function `isValidTrailerLine()` (defect 26)
     delegates field-name validation to -- claimed to implement RFC 7230
     §3.2.6's `token`/`tchar` grammar but actually only rejected control

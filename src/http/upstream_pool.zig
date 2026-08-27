@@ -208,6 +208,8 @@ const HostEntry = struct {
     stats: HostStats = .{},
 };
 
+const max_quarantine_drain_batch = 8;
+
 pub const UpstreamPool = struct {
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
@@ -385,25 +387,13 @@ pub const UpstreamPool = struct {
     /// TLS connections currently use
     /// `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which
     /// nonblockingly drives the record layer through everything already
-    /// queued before deciding, and fails closed if it still owns any
-    /// not-yet-resolved ciphertext once the drive stalls (a partial record
-    /// is not proof of "nothing pending" -- see that function's doc comment
-    /// in `src/http/upstream_tls.zig` for the full rationale, including a
-    /// round-10 fix for a prefix-consumed-without-plaintext false-clean
-    /// gap). A simpler alternative, `readReady()` (already-decrypted
-    /// plaintext or a completed clean shutdown only, never driving new
-    /// ciphertext), is kept available on `UpstreamTlsConn` as a fallback:
-    /// this drive-based approach previously caused a Linux-ARM-only CI
-    /// failure on the pooled-TLS-reuse integration test that could not be
-    /// reproduced or explained, prompting a revert to `readReady()` that a
-    /// documentation/code mismatch briefly failed to actually apply in code
-    /// (#673 review round 10). It was re-enabled, with the false-clean gap
-    /// above fixed, once the reviewer's own re-review of the exact reverted
-    /// head observed the previously-failing Linux ARM job passing on this
-    /// same drive-based code -- evidence the original failure was more
-    /// likely transient than a deterministic platform difference. If a
-    /// genuine platform-specific failure resurfaces, prefer reverting this
-    /// one line to `tls.readReady()` over re-diagnosing under pressure; see
+    /// queued before deciding. Definite application data, peer close, drive
+    /// errors, or drain-budget exhaustion close the candidate. If the TLS
+    /// layer still owns incomplete ciphertext, checkout quarantines the
+    /// candidate and opens a fresh connection rather than blocking while the
+    /// pool mutex is held. Maintenance later drains a bounded quarantine
+    /// batch outside the mutex and either returns clean candidates to idle
+    /// or closes classified stale connections. See
     /// `docs/SECURITY_TEST_PLAN.md` defect 27 for the full history.
     pub const PlaintextCheckoutReadiness = enum {
         clean,
@@ -483,6 +473,46 @@ pub const UpstreamPool = struct {
         return gop.value_ptr;
     }
 
+    fn retainedCount(entry: *const HostEntry) usize {
+        return entry.idle.items.len + entry.quarantined.items.len;
+    }
+
+    fn recordRejectedReadiness(entry: *HostEntry, readiness: PoolCheckoutReadiness) void {
+        switch (readiness) {
+            .clean => {},
+            .plaintext => |pt| switch (pt) {
+                .clean => {},
+                .unexpected_bytes => {
+                    entry.stats.checkout_stale_plaintext_unexpected += 1;
+                    entry.stats.stale_retries_total += 1;
+                },
+            },
+            .tls => |t| switch (t) {
+                .clean => {},
+                .application_plaintext => {
+                    entry.stats.checkout_stale_tls_application_plaintext += 1;
+                    entry.stats.stale_retries_total += 1;
+                },
+                .peer_closed => {
+                    entry.stats.checkout_stale_tls_peer_closed += 1;
+                    entry.stats.stale_retries_total += 1;
+                },
+                .drive_error => {
+                    entry.stats.checkout_stale_tls_drive_error += 1;
+                    entry.stats.stale_retries_total += 1;
+                },
+                .drain_budget_exhausted => {
+                    entry.stats.checkout_stale_tls_drain_budget += 1;
+                    entry.stats.stale_retries_total += 1;
+                },
+                .incomplete_ciphertext => {
+                    entry.stats.checkout_quarantined_tls_incomplete += 1;
+                    entry.stats.stale_retries_total += 1;
+                },
+            },
+        }
+    }
+
     /// Reuse-or-reserve checkout with fail-fast active-cap enforcement (#239).
     /// Returns a still-fresh pooled connection (now counted `active`), or null
     /// after **reserving** an active slot for the caller to open a fresh
@@ -517,8 +547,7 @@ pub const UpstreamPool = struct {
                     switch (pt) {
                         .clean => {}, // reuse
                         .unexpected_bytes => {
-                            entry.stats.checkout_stale_plaintext_unexpected += 1;
-                            entry.stats.stale_retries_total += 1;
+                            recordRejectedReadiness(entry, readiness);
                             self.closeConn(conn);
                             continue;
                         },
@@ -528,32 +557,27 @@ pub const UpstreamPool = struct {
                     switch (t) {
                         .clean => {}, // reuse
                         .application_plaintext => {
-                            entry.stats.checkout_stale_tls_application_plaintext += 1;
-                            entry.stats.stale_retries_total += 1;
+                            recordRejectedReadiness(entry, readiness);
                             self.closeConn(conn);
                             continue;
                         },
                         .peer_closed => {
-                            entry.stats.checkout_stale_tls_peer_closed += 1;
-                            entry.stats.stale_retries_total += 1;
+                            recordRejectedReadiness(entry, readiness);
                             self.closeConn(conn);
                             continue;
                         },
                         .drive_error => {
-                            entry.stats.checkout_stale_tls_drive_error += 1;
-                            entry.stats.stale_retries_total += 1;
+                            recordRejectedReadiness(entry, readiness);
                             self.closeConn(conn);
                             continue;
                         },
                         .drain_budget_exhausted => {
-                            entry.stats.checkout_stale_tls_drain_budget += 1;
-                            entry.stats.stale_retries_total += 1;
+                            recordRejectedReadiness(entry, readiness);
                             self.closeConn(conn);
                             continue;
                         },
                         .incomplete_ciphertext => {
-                            entry.stats.checkout_quarantined_tls_incomplete += 1;
-                            entry.stats.stale_retries_total += 1;
+                            recordRejectedReadiness(entry, readiness);
                             entry.quarantined.append(self.allocator, conn) catch {
                                 self.closeConn(conn);
                             };
@@ -633,7 +657,7 @@ pub const UpstreamPool = struct {
             self.closeConn(conn);
             return;
         }
-        if (entry.idle.items.len >= self.config.max_idle_per_host) {
+        if (retainedCount(entry) >= self.config.max_idle_per_host) {
             entry.stats.release_rejected_capacity += 1;
             self.closeConn(conn);
             return;
@@ -672,58 +696,115 @@ pub const UpstreamPool = struct {
     /// Close and drop every idle connection that has aged out, refreshing each
     /// origin's idle gauge. Intended to run from the gateway maintenance tick.
     pub fn reapIdle(self: *UpstreamPool, now_ms: u64) void {
-        const lock_wait_ns = self.lock();
-        defer self.unlock(lock_wait_ns);
-        var it = self.hosts.iterator();
-        while (it.next()) |entry| {
-            {
-                const list = &entry.value_ptr.idle;
-                var i: usize = 0;
-                while (i < list.items.len) {
-                    if (self.isExpired(list.items[i], now_ms)) {
-                        self.closeConn(list.orderedRemove(i));
-                    } else {
+        const QuarantineCandidate = struct {
+            key: []const u8,
+            conn: PooledConn,
+            readiness: PoolCheckoutReadiness = .clean,
+        };
+        var batch: [max_quarantine_drain_batch]QuarantineCandidate = undefined;
+        var batch_len: usize = 0;
+
+        var lock_wait_ns = self.lock();
+        {
+            var it = self.hosts.iterator();
+            while (it.next()) |entry| {
+                {
+                    const list = &entry.value_ptr.idle;
+                    var i: usize = 0;
+                    while (i < list.items.len) {
+                        if (self.isExpired(list.items[i], now_ms)) {
+                            self.closeConn(list.orderedRemove(i));
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    entry.value_ptr.stats.idle = list.items.len;
+                }
+                {
+                    const list = &entry.value_ptr.quarantined;
+                    var i: usize = 0;
+                    while (i < list.items.len) {
+                        const conn = list.items[i];
+                        if (self.isExpired(conn, now_ms)) {
+                            self.closeConn(list.orderedRemove(i));
+                            continue;
+                        }
+                        if (batch_len < batch.len) {
+                            batch[batch_len] = .{
+                                .key = entry.key_ptr.*,
+                                .conn = list.orderedRemove(i),
+                            };
+                            batch_len += 1;
+                            continue;
+                        }
                         i += 1;
                     }
                 }
-                entry.value_ptr.stats.idle = list.items.len;
             }
-            {
-                const list = &entry.value_ptr.quarantined;
-                var i: usize = 0;
-                while (i < list.items.len) {
-                    const conn = list.items[i];
-                    if (self.isExpired(conn, now_ms)) {
-                        self.closeConn(list.orderedRemove(i));
+        }
+        self.unlock(lock_wait_ns);
+
+        for (batch[0..batch_len]) |*candidate| {
+            candidate.readiness = checkReadiness(candidate.conn);
+        }
+
+        lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
+        for (batch[0..batch_len]) |candidate| {
+            const entry = self.hosts.getPtr(candidate.key) orelse {
+                self.closeConn(candidate.conn);
+                continue;
+            };
+            if (self.isExpired(candidate.conn, now_ms)) {
+                self.closeConn(candidate.conn);
+                continue;
+            }
+            switch (candidate.readiness) {
+                .clean => {
+                    if (retainedCount(entry) >= self.config.max_idle_per_host) {
+                        entry.stats.release_rejected_capacity += 1;
+                        self.closeConn(candidate.conn);
                         continue;
                     }
-                    const readiness = checkReadiness(conn);
-                    switch (readiness) {
-                        .clean => {
-                            _ = list.orderedRemove(i);
-                            if (entry.value_ptr.idle.items.len >= self.config.max_idle_per_host) {
-                                entry.value_ptr.stats.release_rejected_capacity += 1;
-                                self.closeConn(conn);
-                                continue;
-                            }
-                            entry.value_ptr.idle.append(self.allocator, conn) catch {
-                                self.closeConn(conn);
-                            };
-                            entry.value_ptr.stats.idle = entry.value_ptr.idle.items.len;
-                        },
-                        .tls => |t| switch (t) {
-                            .incomplete_ciphertext => {
-                                i += 1;
-                            },
-                            else => {
-                                self.closeConn(list.orderedRemove(i));
-                            },
-                        },
-                        .plaintext => {
-                            self.closeConn(list.orderedRemove(i));
-                        },
-                    }
-                }
+                    entry.idle.append(self.allocator, candidate.conn) catch {
+                        self.closeConn(candidate.conn);
+                        continue;
+                    };
+                    entry.stats.idle = entry.idle.items.len;
+                },
+                .tls => |t| switch (t) {
+                    .clean => {
+                        if (retainedCount(entry) >= self.config.max_idle_per_host) {
+                            entry.stats.release_rejected_capacity += 1;
+                            self.closeConn(candidate.conn);
+                            continue;
+                        }
+                        entry.idle.append(self.allocator, candidate.conn) catch {
+                            self.closeConn(candidate.conn);
+                            continue;
+                        };
+                        entry.stats.idle = entry.idle.items.len;
+                    },
+                    .incomplete_ciphertext => {
+                        if (retainedCount(entry) >= self.config.max_idle_per_host) {
+                            entry.stats.release_rejected_capacity += 1;
+                            self.closeConn(candidate.conn);
+                            continue;
+                        }
+                        entry.quarantined.append(self.allocator, candidate.conn) catch {
+                            self.closeConn(candidate.conn);
+                            continue;
+                        };
+                    },
+                    else => {
+                        recordRejectedReadiness(entry, candidate.readiness);
+                        self.closeConn(candidate.conn);
+                    },
+                },
+                .plaintext => {
+                    recordRejectedReadiness(entry, candidate.readiness);
+                    self.closeConn(candidate.conn);
+                },
             }
         }
     }
@@ -1024,6 +1105,61 @@ test "release honors max_idle_per_host" {
     const agg = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 1), agg.idle);
     try testing.expectEqual(@as(u64, 1), agg.release_rejected_capacity);
+}
+
+test "release capacity counts quarantined connections as retained" {
+    var pool = UpstreamPool.init(testing.allocator, .{ .max_idle_per_host = 1 });
+    defer pool.deinit();
+    const quarantined = try testPair();
+    const fresh = try testPair();
+    defer _ = std.c.close(quarantined[1]);
+    defer _ = std.c.close(fresh[1]);
+
+    const entry = pool.hostEntry("h:80") orelse return error.TestUnexpectedResult;
+    try entry.quarantined.append(testing.allocator, .{
+        .stream = compat.netStreamFromFd(quarantined[0]),
+        .created_ms = 0,
+        .last_used_ms = 0,
+    });
+
+    pool.release("h:80", .{
+        .stream = compat.netStreamFromFd(fresh[0]),
+        .created_ms = 0,
+        .last_used_ms = 0,
+    }, true, 0);
+
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 0), agg.idle);
+    try testing.expectEqual(@as(usize, 1), pool.hosts.getPtr("h:80").?.quarantined.items.len);
+    try testing.expectEqual(@as(u64, 1), agg.release_rejected_capacity);
+}
+
+test "reapIdle moves only a bounded quarantined batch back to retained capacity" {
+    var pool = UpstreamPool.init(testing.allocator, .{ .max_idle_per_host = max_quarantine_drain_batch + 2 });
+    defer pool.deinit();
+    var peer_fds: [max_quarantine_drain_batch + 2]std.posix.fd_t = undefined;
+    var peer_count: usize = 0;
+    defer {
+        for (peer_fds[0..peer_count]) |fd| _ = std.c.close(fd);
+    }
+
+    const entry = pool.hostEntry("h:80") orelse return error.TestUnexpectedResult;
+    for (0..max_quarantine_drain_batch + 2) |_| {
+        const fds = try testPair();
+        peer_fds[peer_count] = fds[1];
+        peer_count += 1;
+        try entry.quarantined.append(testing.allocator, .{
+            .stream = compat.netStreamFromFd(fds[0]),
+            .created_ms = 0,
+            .last_used_ms = 0,
+        });
+    }
+
+    pool.reapIdle(0);
+
+    const retained = pool.hosts.getPtr("h:80").?;
+    try testing.expectEqual(@as(usize, max_quarantine_drain_batch), retained.idle.items.len);
+    try testing.expectEqual(@as(usize, 2), retained.quarantined.items.len);
 }
 
 test "reapIdle evicts aged connections and refreshes the gauge" {
