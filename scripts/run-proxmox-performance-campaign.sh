@@ -306,6 +306,7 @@ guest_ssh_host=""
 guest_scp_host=""
 guest_ssh_key="$REMOTE_STAGE/vm_ssh_key"
 host_meta="$REMOTE_STAGE/proxmox-host-metadata.txt"
+cloud_init_snippet_path=""
 
 require_host_tool() {
   command -v "$1" >/dev/null 2>&1 || die "$1 not found; run this on a Proxmox host"
@@ -432,6 +433,9 @@ cleanup() {
   elif [[ "$guest_created" == true ]]; then
     say "==> kept guest $guest_label for inspection"
   fi
+  if [[ "$PROXMOX_KEEP_GUEST" != true && -n "$cloud_init_snippet_path" ]]; then
+    rm -f "$cloud_init_snippet_path" >/dev/null 2>&1 || true
+  fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -515,7 +519,7 @@ create_kvm() {
 
   snippet_ref=""
   if [[ -n "$snippets_storage" ]]; then
-    snippet_ref="${snippets_storage}:snippets/tardigrade-perf-${guest_id}-user-data.yaml"
+    snippet_ref="${snippets_storage}:snippets/tardigrade-perf-${guest_id}-vendor-data.yaml"
     snippet_path="$(pvesm path "$snippet_ref" 2>/dev/null || true)"
     [[ -n "$snippet_path" ]] || die "could not resolve snippets path for $snippet_ref"
     mkdir -p "$(dirname "$snippet_path")"
@@ -529,6 +533,7 @@ runcmd:
   - [ systemctl, enable, --now, qemu-guest-agent.service ]
   - [ systemctl, enable, --now, ssh.service ]
 EOF
+    cloud_init_snippet_path="$snippet_path"
   else
     say "warning: no active snippets storage found; falling back to DHCP neighbor discovery without qemu-guest-agent bootstrap" >&2
   fi
@@ -555,7 +560,7 @@ EOF
     --ipconfig0 "$ipconfig"
   )
   if [[ -n "$snippet_ref" ]]; then
-    qm_set_args+=(--cicustom "user=${snippet_ref}")
+    qm_set_args+=(--cicustom "vendor=${snippet_ref}")
   fi
   qm set "$guest_id" "${qm_set_args[@]}" >/dev/null
   qm resize "$guest_id" scsi0 "${PROXMOX_GUEST_DISK_GB}G" >/dev/null || true
@@ -967,8 +972,21 @@ EOF
       --keepalive-path /tiny.txt \
       --proxy-path /proxy/health \
       --proxy-payload-16m-path /proxy/payload-16m.bin \
-      --scenarios static-http1,proxy-http1,proxy-payload-16m,keepalive-starvation \
+      --scenarios static-http1,proxy-http1,proxy-payload-16m \
       --save "$backend_dir/primary-results.json"
+    ./benchmarks/run.sh \
+      --host 127.0.0.1 \
+      --port 19092 \
+      --driver "proxmox-backend-comparison" \
+      --config-label "$backend" \
+      --pid "$primary_pid" \
+      --duration "$DURATION" \
+      --connections "$CONNECTIONS" \
+      --threads "$THREADS" \
+      --keepalive-path /tiny.txt \
+      --tool k6 \
+      --scenarios keepalive-starvation \
+      --save "$backend_dir/primary-keepalive-starvation.json"
     wrk --latency -s benchmarks/wrk-summary.lua -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" -H "Connection: close" "http://127.0.0.1:19092/tiny.txt" >"$backend_dir/primary-connection-churn.wrk.txt" 2>&1
     churn_summary="$(grep 'WRK_SUMMARY ' "$backend_dir/primary-connection-churn.wrk.txt" | tail -1 | sed 's/^.*WRK_SUMMARY //')"
     [[ -n "$churn_summary" ]] || die "$backend connection churn did not emit WRK_SUMMARY"
