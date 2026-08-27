@@ -26,6 +26,7 @@ PROXMOX_GUEST_DISK_GB="${PROXMOX_GUEST_DISK_GB:-16}"
 PROXMOX_GUEST_IP="${PROXMOX_GUEST_IP:-dhcp}"
 PROXMOX_VM_IMAGE="${PROXMOX_VM_IMAGE:-https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2}"
 PROXMOX_VM_GATEWAY="${PROXMOX_VM_GATEWAY:-}"
+PROXMOX_SNIPPETS_STORAGE="${PROXMOX_SNIPPETS_STORAGE:-}"
 PROXMOX_KEEP_GUEST=false
 PROXMOX_NONCANONICAL=false
 
@@ -33,6 +34,9 @@ TARDIGRADE_REF="${TARDIGRADE_REF:-v0.6.4}"
 ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
 K6_VERSION="${K6_VERSION:-latest}"
 H2LOAD_PATH="${H2LOAD_PATH:-}"
+H2LOAD_NGHTTP2_REF="${H2LOAD_NGHTTP2_REF:-v1.69.0}"
+H2LOAD_NGHTTP3_REF="${H2LOAD_NGHTTP3_REF:-v1.18.0}"
+H2LOAD_NGTCP2_REF="${H2LOAD_NGTCP2_REF:-v1.25.0}"
 SERVERS="${SERVERS:-tardigrade,nginx,haproxy,caddy}"
 DURATION="${DURATION:-15}"
 CONNECTIONS="${CONNECTIONS:-32}"
@@ -70,7 +74,11 @@ Options:
   --tardigrade-ref REF      Git ref to archive and benchmark (default: v0.6.4)
   --vm-image PATH|URL       Debian cloud image for KVM mode
   --vm-gateway IP           Static gateway for --ip CIDR in KVM mode
+  --snippets-storage NAME    Storage for generated cloud-init snippets
   --h2load-path PATH        QUIC-capable h2load path inside the guest
+  --h2load-nghttp2-ref REF   nghttp2 ref for QUIC h2load build
+  --h2load-nghttp3-ref REF   nghttp3 ref for QUIC h2load build
+  --h2load-ngtcp2-ref REF    ngtcp2 ref for QUIC h2load build
   --template STORAGE:PATH   Existing CT template ref, or template filename
   --template-storage NAME   Storage for CT template download/discovery
   --rootfs-storage NAME     Storage for VM disk or CT rootfs
@@ -111,7 +119,11 @@ while [[ $# -gt 0 ]]; do
     --tardigrade-ref) TARDIGRADE_REF="$2"; shift 2 ;;
     --vm-image) PROXMOX_VM_IMAGE="$2"; shift 2 ;;
     --vm-gateway) PROXMOX_VM_GATEWAY="$2"; shift 2 ;;
+    --snippets-storage) PROXMOX_SNIPPETS_STORAGE="$2"; shift 2 ;;
     --h2load-path) H2LOAD_PATH="$2"; shift 2 ;;
+    --h2load-nghttp2-ref) H2LOAD_NGHTTP2_REF="$2"; shift 2 ;;
+    --h2load-nghttp3-ref) H2LOAD_NGHTTP3_REF="$2"; shift 2 ;;
+    --h2load-ngtcp2-ref) H2LOAD_NGTCP2_REF="$2"; shift 2 ;;
     --template) PROXMOX_TEMPLATE="$2"; shift 2 ;;
     --template-storage) PROXMOX_TEMPLATE_STORAGE="$2"; shift 2 ;;
     --rootfs-storage) PROXMOX_ROOTFS_STORAGE="$2"; shift 2 ;;
@@ -234,6 +246,7 @@ write_param PROXMOX_BRIDGE "$PROXMOX_BRIDGE"
 write_param PROXMOX_GUEST_IP "$PROXMOX_GUEST_IP"
 write_param PROXMOX_VM_GATEWAY "$PROXMOX_VM_GATEWAY"
 write_param PROXMOX_VM_IMAGE "$PROXMOX_VM_IMAGE"
+write_param PROXMOX_SNIPPETS_STORAGE "$PROXMOX_SNIPPETS_STORAGE"
 write_param PROXMOX_GUEST_CORES "$PROXMOX_GUEST_CORES"
 write_param PROXMOX_GUEST_MEMORY_MB "$PROXMOX_GUEST_MEMORY_MB"
 write_param PROXMOX_GUEST_DISK_GB "$PROXMOX_GUEST_DISK_GB"
@@ -244,6 +257,9 @@ write_param TARDIGRADE_SHA "$TARDIGRADE_SHA"
 write_param ZIG_VERSION "$ZIG_VERSION"
 write_param K6_VERSION "$K6_VERSION"
 write_param H2LOAD_PATH "$H2LOAD_PATH"
+write_param H2LOAD_NGHTTP2_REF "$H2LOAD_NGHTTP2_REF"
+write_param H2LOAD_NGHTTP3_REF "$H2LOAD_NGHTTP3_REF"
+write_param H2LOAD_NGTCP2_REF "$H2LOAD_NGTCP2_REF"
 write_param SERVERS "$SERVERS"
 write_param DURATION "$DURATION"
 write_param CONNECTIONS "$CONNECTIONS"
@@ -286,6 +302,8 @@ artifact_tgz="${REMOTE_STAGE}/artifacts.tgz"
 guest_created=false
 guest_id="$PROXMOX_GUEST_ID"
 guest_ip=""
+guest_ssh_host=""
+guest_scp_host=""
 guest_ssh_key="$REMOTE_STAGE/vm_ssh_key"
 host_meta="$REMOTE_STAGE/proxmox-host-metadata.txt"
 
@@ -350,7 +368,7 @@ run_guest() {
   if [[ "$PROXMOX_MODE" == lxc-smoke ]]; then
     pct exec "$guest_id" -- bash -lc "$cmd"
   else
-    ssh -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$guest_ip" "$cmd"
+    ssh -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$guest_ssh_host" "$cmd"
   fi
 }
 
@@ -360,7 +378,7 @@ push_guest() {
   if [[ "$PROXMOX_MODE" == lxc-smoke ]]; then
     pct push "$guest_id" "$src" "$dst"
   else
-    scp -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "root@$guest_ip:$dst"
+    scp -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "root@${guest_scp_host}:$dst"
   fi
 }
 
@@ -370,7 +388,15 @@ pull_guest() {
   if [[ "$PROXMOX_MODE" == lxc-smoke ]]; then
     pct pull "$guest_id" "$src" "$dst"
   else
-    scp -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$guest_ip:$src" "$dst"
+    scp -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@${guest_scp_host}:$src" "$dst"
+  fi
+}
+
+set_guest_ssh_targets() {
+  guest_ssh_host="$guest_ip"
+  guest_scp_host="$guest_ip"
+  if [[ "$guest_ip" == *:* ]]; then
+    guest_scp_host="[$guest_ip]"
   fi
 }
 
@@ -467,9 +493,10 @@ create_kvm() {
   [[ "$guest_id" =~ ^[0-9]+$ ]] || die "invalid VM id: $guest_id"
   qm status "$guest_id" >/dev/null 2>&1 && die "VM $guest_id already exists; pass --guest-id with an unused VMID"
 
-  local disk_storage image_path ipconfig
+  local disk_storage image_path ipconfig snippets_storage snippet_ref snippet_path
   disk_storage="$(storage_with_content images "$PROXMOX_ROOTFS_STORAGE")"
   [[ -n "$disk_storage" ]] || die "no active Proxmox storage with images content found"
+  snippets_storage="$(storage_with_content snippets "$PROXMOX_SNIPPETS_STORAGE")"
   image_path="$PROXMOX_VM_IMAGE"
   if [[ "$image_path" =~ ^https?:// ]]; then
     image_path="$REMOTE_STAGE/debian-genericcloud.qcow2"
@@ -486,6 +513,26 @@ create_kvm() {
     ipconfig="ip=${PROXMOX_GUEST_IP},gw=${PROXMOX_VM_GATEWAY}"
   fi
 
+  snippet_ref=""
+  if [[ -n "$snippets_storage" ]]; then
+    snippet_ref="${snippets_storage}:snippets/tardigrade-perf-${guest_id}-user-data.yaml"
+    snippet_path="$(pvesm path "$snippet_ref" 2>/dev/null || true)"
+    [[ -n "$snippet_path" ]] || die "could not resolve snippets path for $snippet_ref"
+    mkdir -p "$(dirname "$snippet_path")"
+    cat >"$snippet_path" <<'EOF'
+#cloud-config
+package_update: true
+packages:
+  - openssh-server
+  - qemu-guest-agent
+runcmd:
+  - [ systemctl, enable, --now, qemu-guest-agent.service ]
+  - [ systemctl, enable, --now, ssh.service ]
+EOF
+  else
+    say "warning: no active snippets storage found; falling back to DHCP neighbor discovery without qemu-guest-agent bootstrap" >&2
+  fi
+
   say "==> creating VM $guest_id ($PROXMOX_GUEST_NAME)"
   qm create "$guest_id" \
     --name "$PROXMOX_GUEST_NAME" \
@@ -499,13 +546,18 @@ create_kvm() {
     --vga serial0 \
     --ostype l26
   qm importdisk "$guest_id" "$image_path" "$disk_storage" >/dev/null
-  qm set "$guest_id" \
+  qm_set_args=(
     --scsi0 "${disk_storage}:vm-${guest_id}-disk-0" \
     --boot order=scsi0 \
     --ide2 "${disk_storage}:cloudinit" \
     --ciuser root \
     --sshkeys "${guest_ssh_key}.pub" \
-    --ipconfig0 "$ipconfig" >/dev/null
+    --ipconfig0 "$ipconfig"
+  )
+  if [[ -n "$snippet_ref" ]]; then
+    qm_set_args+=(--cicustom "user=${snippet_ref}")
+  fi
+  qm set "$guest_id" "${qm_set_args[@]}" >/dev/null
   qm resize "$guest_id" scsi0 "${PROXMOX_GUEST_DISK_GB}G" >/dev/null || true
   qm start "$guest_id"
   guest_created=true
@@ -516,13 +568,31 @@ create_kvm() {
       guest_ip="${PROXMOX_GUEST_IP%%/*}"
     elif qm agent "$guest_id" ping >/dev/null 2>&1; then
       guest_ip="$(qm guest cmd "$guest_id" network-get-interfaces 2>/dev/null | grep -Eo '"ip-address" *: *"([0-9]{1,3}\.){3}[0-9]{1,3}"' | sed -E 's/.*"(([0-9]{1,3}\.){3}[0-9]{1,3})"/\1/' | grep -v '^127\.' | head -1 || true)"
+    else
+      guest_ip="$(discover_vm_ip_from_neighbors "$guest_id" || true)"
     fi
-    if [[ -n "$guest_ip" ]] && ssh -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 "root@$guest_ip" 'test -r /etc/os-release && getent hosts deb.debian.org >/dev/null 2>&1' >/dev/null 2>&1; then
+    if [[ -n "$guest_ip" ]]; then
+      set_guest_ssh_targets
+    fi
+    if [[ -n "$guest_ip" ]] && ssh -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 "root@$guest_ssh_host" 'test -r /etc/os-release && getent hosts deb.debian.org >/dev/null 2>&1' >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
   done
   die "VM did not become reachable over SSH; use --keep-guest for manual inspection"
+}
+
+discover_vm_ip_from_neighbors() {
+  local id="$1"
+  local mac bridge
+  mac="$(qm config "$id" 2>/dev/null | sed -nE 's/^net0:.*virtio=([A-Fa-f0-9:]+).*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')"
+  bridge="$(qm config "$id" 2>/dev/null | sed -nE 's/^net0:.*bridge=([^,]+).*/\1/p' | head -1)"
+  [[ -n "$mac" && -n "$bridge" ]] || return 1
+  ip neigh show dev "$bridge" 2>/dev/null | awk -v mac="$mac" -v bridge="$bridge" '
+    tolower($0) ~ mac && $1 ~ /^[0-9.]+$/ { print $1; found=1; exit }
+    tolower($0) ~ mac && $1 ~ /^fe80:/ && ! found { candidate=$1 "%" bridge }
+    END { if (!found && candidate != "") print candidate }
+  '
 }
 
 install_guest_dependencies() {
@@ -531,7 +601,7 @@ install_guest_dependencies() {
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl xz-utils tar jq wrk nginx haproxy caddy nghttp2-client openssl python3 procps iproute2 psmisc coreutils findutils gawk strace linux-perf
+    apt-get install -y ca-certificates curl xz-utils tar jq wrk nginx haproxy caddy nghttp2-client openssl python3 procps iproute2 psmisc coreutils findutils gawk strace linux-perf git build-essential autoconf automake libtool pkg-config cmake libev-dev zlib1g-dev libc-ares-dev libssl-dev libxml2-dev libevent-dev libjansson-dev
     if ! command -v k6 >/dev/null 2>&1; then
       if apt-cache show k6 >/dev/null 2>&1; then
         apt-get install -y k6
@@ -586,6 +656,12 @@ load_source_and_zig() {
 
 run_campaign_in_guest() {
   local guest_script="$REMOTE_STAGE/run-guest-campaign.sh"
+  {
+    printf 'PROXMOX_GUEST_ID='
+    printf '%q\n' "$guest_id"
+    printf 'PROXMOX_GUEST_IP_EFFECTIVE='
+    printf '%q\n' "$guest_ip"
+  } >>"$REMOTE_STAGE/campaign.env"
   cat >"$guest_script" <<'GUEST'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -595,6 +671,10 @@ die() { echo "error: $*" >&2; exit 1; }
 canonical=false
 if [[ "$PROXMOX_MODE" == kvm && "$PROXMOX_NONCANONICAL" != true ]]; then
   canonical=true
+fi
+kvm_mode=false
+if [[ "$PROXMOX_MODE" == kvm ]]; then
+  kvm_mode=true
 fi
 
 cd /work/Tardigrade
@@ -606,6 +686,58 @@ if [[ -n "$H2LOAD_PATH" ]]; then
   ln -sf "$H2LOAD_PATH" /usr/local/bin/h2load
 fi
 
+ensure_quic_h2load() {
+  if [[ -n "$H2LOAD_PATH" ]]; then
+    return 0
+  fi
+  if ! $kvm_mode; then
+    return 0
+  fi
+  h2load_prefix=/opt/tardigrade-h2load
+  h2load_src=/opt/tardigrade-h2load-src
+  h2load_bin="$h2load_prefix/bin/h2load"
+  if [[ -x "$h2load_bin" ]] && ldd "$h2load_bin" 2>/dev/null | grep -Eq 'libngtcp2|libnghttp3'; then
+    ln -sf "$h2load_bin" /usr/local/bin/h2load
+    return 0
+  fi
+  rm -rf "$h2load_prefix" "$h2load_src"
+  mkdir -p "$h2load_prefix" "$h2load_src"
+  jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
+  git clone --depth 1 --branch "$H2LOAD_NGHTTP3_REF" https://github.com/ngtcp2/nghttp3.git "$h2load_src/nghttp3"
+  (
+    cd "$h2load_src/nghttp3"
+    git submodule update --init --depth 1
+    autoreconf -i
+    ./configure --prefix="$h2load_prefix" --enable-lib-only
+    make -j"$jobs"
+    make install
+  )
+  git clone --depth 1 --branch "$H2LOAD_NGTCP2_REF" https://github.com/ngtcp2/ngtcp2.git "$h2load_src/ngtcp2"
+  (
+    cd "$h2load_src/ngtcp2"
+    git submodule update --init --depth 1
+    autoreconf -i
+    PKG_CONFIG_PATH="$h2load_prefix/lib/pkgconfig" ./configure --prefix="$h2load_prefix" --enable-lib-only --with-openssl
+    make -j"$jobs"
+    make install
+  )
+  git clone --depth 1 --branch "$H2LOAD_NGHTTP2_REF" https://github.com/nghttp2/nghttp2.git "$h2load_src/nghttp2"
+  (
+    cd "$h2load_src/nghttp2"
+    git submodule update --init --depth 1
+    autoreconf -i
+    PKG_CONFIG_PATH="$h2load_prefix/lib/pkgconfig" \
+      LDFLAGS="-Wl,-rpath,$h2load_prefix/lib" \
+      ./configure --prefix="$h2load_prefix" --enable-app --enable-http3 --without-libxml2 --without-jemalloc --without-libsystemd --without-mruby
+    make -j"$jobs" h2load
+    make install
+  )
+  test -x "$h2load_bin"
+  ln -sf "$h2load_bin" /usr/local/bin/h2load
+}
+
+ensure_quic_h2load
+
 {
   printf 'date_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'mode=%s\n' "$PROXMOX_MODE"
@@ -613,6 +745,7 @@ fi
   printf 'guest_hostname=%s\n' "$(hostname)"
   printf 'guest_id=%s\n' "$PROXMOX_GUEST_ID"
   printf 'guest_name=%s\n' "$PROXMOX_GUEST_NAME"
+  printf 'guest_ip_effective=%s\n' "${PROXMOX_GUEST_IP_EFFECTIVE:-}"
   printf 'tardigrade_ref=%s\n' "$TARDIGRADE_REF"
   printf 'tardigrade_sha=%s\n' "$TARDIGRADE_SHA"
   printf 'source_archive_sha256=%s\n' "$(awk '{print $1}' /root/source.tgz.sha256)"
@@ -629,6 +762,9 @@ fi
   haproxy -v 2>&1 | head -1 || true
   caddy version 2>&1 || true
   h2load --version 2>&1 | head -1 || true
+  printf 'h2load_path=%s\n' "$(command -v h2load || true)"
+  printf 'h2load_ldd<<EOF\n'; ldd "$(command -v h2load)" 2>&1 || true; printf 'EOF\n'
+  printf 'h2load_refs=nghttp2:%s nghttp3:%s ngtcp2:%s\n' "$H2LOAD_NGHTTP2_REF" "$H2LOAD_NGHTTP3_REF" "$H2LOAD_NGTCP2_REF"
   k6 version 2>&1 | head -1 || true
   strace -V 2>&1 | head -1 || true
   perf --version 2>&1 | head -1 || true
@@ -639,13 +775,56 @@ cp "$out/environment.txt" .zig-cache/proxmox-performance-campaign/environment.tx
 
 zig build -Doptimize=ReleaseFast -Dversion="$TARDIGRADE_SHA"
 
-if $canonical; then
+probe_io_uring_runtime() {
+  probe_dir="$out/io-uring-preflight"
+  mkdir -p "$probe_dir"
+  probe_conf="$probe_dir/tardigrade.conf"
+  probe_log="$probe_dir/service.log"
+  cat >"$probe_conf" <<EOF
+pid $probe_dir/tardigrade.pid;
+listen 19089;
+access_log $probe_dir/access.log;
+error_log $probe_dir/error.log;
+location = /health {
+    return 200 ok;
+}
+EOF
+  TARDIGRADE_EVENT_LOOP_BACKEND=io_uring \
+  TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
+    ./zig-out/bin/tardi run -c "$probe_conf" >"$probe_log" 2>&1 &
+  probe_pid=$!
+  for _ in $(seq 1 100); do
+    if curl -fsS http://127.0.0.1:19089/health >/dev/null 2>&1; then
+      break
+    fi
+    if ! kill -0 "$probe_pid" >/dev/null 2>&1; then
+      cat "$probe_log" >&2 || true
+      die "io_uring startup probe exited before health check"
+    fi
+    sleep 0.1
+  done
+  if ! curl -fsS http://127.0.0.1:19089/health >/dev/null 2>&1; then
+    cat "$probe_log" >&2 || true
+    kill "$probe_pid" >/dev/null 2>&1 || true
+    wait "$probe_pid" >/dev/null 2>&1 || true
+    die "io_uring startup probe failed health check"
+  fi
+  if ! grep -q 'io_uring' "$probe_log"; then
+    cat "$probe_log" >&2 || true
+    kill "$probe_pid" >/dev/null 2>&1 || true
+    wait "$probe_pid" >/dev/null 2>&1 || true
+    die "io_uring startup probe did not prove selected backend"
+  fi
+  kill "$probe_pid" >/dev/null 2>&1 || true
+  wait "$probe_pid" >/dev/null 2>&1 || true
+}
+
+if $kvm_mode; then
   ldd "$(command -v h2load)" 2>/dev/null | grep -Eq 'libngtcp2|libnghttp3' || die "h2load is not QUIC-capable; pass --h2load-path with a pinned ngtcp2/nghttp3-linked build"
   strace -c true >/dev/null 2>&1 || die "strace unavailable"
   perf stat -e task-clock true >/dev/null 2>&1 || die "perf_event unavailable"
   tc qdisc show dev lo >/dev/null 2>&1 || die "tc unavailable"
-  TARDIGRADE_EVENT_LOOP_BACKEND=io_uring ./zig-out/bin/tardi --help >/dev/null 2>&1 || true
-  TARDIGRADE_EVENT_LOOP_BACKEND=io_uring timeout 5s ./zig-out/bin/tardi run --help >/dev/null 2>&1 || die "io_uring runtime preflight unavailable"
+  probe_io_uring_runtime
 fi
 
 if [[ "$RUN_COMPETITIVE" == true ]]; then
@@ -692,56 +871,129 @@ if [[ "$RUN_BACKEND_COMPARISON" == true ]]; then
   python3 benchmarks/fixtures/upstream_server.py --port "$backend_upstream_port" >"$out/backend-upstream.log" 2>&1 &
   backend_upstream_pid=$!
   trap 'kill "$backend_upstream_pid" >/dev/null 2>&1 || true' EXIT
-  for backend in epoll io_uring; do
-    backend_dir="$out/backend-comparison/$backend"
-    mkdir -p "$backend_dir"
-    backend_conf="$backend_dir/tardigrade.conf"
-    cat >"$backend_conf" <<EOF
-pid $backend_dir/tardigrade.pid;
-listen 19092;
-access_log $backend_dir/access.log;
-error_log $backend_dir/error.log;
+  start_backend_server() {
+    local backend="$1"
+    local dir="$2"
+    local port="$3"
+    local mode="$4"
+    local conf="$dir/tardigrade.conf"
+    cat >"$conf" <<EOF
+pid $dir/tardigrade.pid;
+listen $port;
+access_log $dir/access.log;
+error_log $dir/error.log;
 location = /tiny.txt {
     return 200 ok;
 }
 location = /proxy/health {
     proxy_pass http://127.0.0.1:$backend_upstream_port/health;
 }
+location = /proxy/payload-16m.bin {
+    proxy_pass http://127.0.0.1:$backend_upstream_port/payload-16m.bin;
+}
 EOF
-    (
-      cd /work/Tardigrade
-      exec env TARDIGRADE_EVENT_LOOP_BACKEND="$backend" \
-        strace -qq -f -c -o "$backend_dir/strace-summary.txt" \
-        ./zig-out/bin/tardi run -c "$backend_conf"
-    ) >"$backend_dir/service.log" 2>&1 &
-    backend_pid=$!
+    if [[ "$mode" == strace ]]; then
+      env TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
+        strace -qq -f -c -o "$dir/strace-summary.txt" \
+        ./zig-out/bin/tardi run -c "$conf" >"$dir/service.log" 2>&1 &
+    else
+      env TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
+        ./zig-out/bin/tardi run -c "$conf" >"$dir/service.log" 2>&1 &
+    fi
+    server_pid=$!
     for _ in $(seq 1 100); do
-      curl -fsS http://127.0.0.1:19092/health >/dev/null 2>&1 && break
-      if ! kill -0 "$backend_pid" >/dev/null 2>&1; then
-        cat "$backend_dir/service.log" >&2 || true
+      curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1 && return 0
+      if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+        cat "$dir/service.log" >&2 || true
         die "$backend backend exited before health check"
       fi
       sleep 0.1
     done
-    curl -fsS http://127.0.0.1:19092/health >/dev/null 2>&1 || die "$backend backend did not become healthy"
+    cat "$dir/service.log" >&2 || true
+    die "$backend backend did not become healthy"
+  }
+  stop_backend_server() {
+    local pid="$1"
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  }
+  run_attached_perf_pass() {
+    local backend="$1"
+    local dir="$2"
+    local port="$3"
+    local workload="$4"
+    local path header=()
+    case "$workload" in
+      static) path=/tiny.txt ;;
+      proxy-small) path=/proxy/health ;;
+      proxy-large-streaming) path=/proxy/payload-16m.bin ;;
+      churn) path=/tiny.txt; header=(-H "Connection: close") ;;
+      *) die "unknown backend perf workload: $workload" ;;
+    esac
+    wrk --latency -s benchmarks/wrk-summary.lua -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" "${header[@]}" "http://127.0.0.1:${port}${path}" >"$dir/${workload}.perf-load.wrk.txt" 2>&1 &
+    load_pid=$!
+    if ! perf stat -p "$server_pid" -e task-clock,context-switches,cpu-migrations,page-faults -o "$dir/${workload}.perf-stat.txt" -- sleep "$DURATION"; then
+      wait "$load_pid" >/dev/null 2>&1 || true
+      die "$backend $workload perf stat failed"
+    fi
+    wait "$load_pid"
+
+    wrk --latency -s benchmarks/wrk-summary.lua -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" "${header[@]}" "http://127.0.0.1:${port}${path}" >"$dir/${workload}.perf-record-load.wrk.txt" 2>&1 &
+    load_pid=$!
+    if ! perf record -g -p "$server_pid" -o "$dir/${workload}.perf.data" -- sleep "$DURATION" >"$dir/${workload}.perf-record.stdout" 2>"$dir/${workload}.perf-record.stderr"; then
+      wait "$load_pid" >/dev/null 2>&1 || true
+      die "$backend $workload perf record failed"
+    fi
+    wait "$load_pid"
+  }
+  for backend in epoll io_uring; do
+    backend_dir="$out/backend-comparison/$backend"
+    mkdir -p "$backend_dir"
     printf 'backend=%s\n' "$backend" >"$backend_dir/commands.txt"
-    for workload in static proxy keepalive; do
-      case "$workload" in
-        static) path=/tiny.txt ;;
-        proxy) path=/proxy/health ;;
-        keepalive) path=/tiny.txt ;;
-      esac
-      wrk_args=(-t "$THREADS" -c "$CONNECTIONS" -d "${DURATION}s" "http://127.0.0.1:19092${path}")
-      if [[ "$workload" == keepalive ]]; then
-        wrk_args+=(-H "Connection: keep-alive")
-      fi
-      printf 'perf stat wrk %q ' "${wrk_args[@]}" >>"$backend_dir/commands.txt"
-      printf '\n' >>"$backend_dir/commands.txt"
-      perf stat -e task-clock,context-switches,cpu-migrations,page-faults -o "$backend_dir/${workload}.perf-stat.txt" -- wrk "${wrk_args[@]}" >"$backend_dir/${workload}.wrk.txt" 2>&1
-      perf record -g -o "$backend_dir/${workload}.perf.data" -p "$backend_pid" -- sleep "$DURATION" >/dev/null 2>"$backend_dir/${workload}.perf-record.txt" || true
+    primary_dir="$backend_dir/primary"
+    mkdir -p "$primary_dir"
+    start_backend_server "$backend" "$primary_dir" 19092 primary
+    primary_pid="$server_pid"
+    ./benchmarks/run.sh \
+      --host 127.0.0.1 \
+      --port 19092 \
+      --driver "proxmox-backend-comparison" \
+      --config-label "$backend" \
+      --pid "$primary_pid" \
+      --duration "$DURATION" \
+      --connections "$CONNECTIONS" \
+      --threads "$THREADS" \
+      --static-path /tiny.txt \
+      --keepalive-path /tiny.txt \
+      --proxy-path /proxy/health \
+      --proxy-payload-16m-path /proxy/payload-16m.bin \
+      --scenarios static-http1,proxy-http1,proxy-payload-16m,keepalive-starvation \
+      --save "$backend_dir/primary-results.json"
+    wrk --latency -s benchmarks/wrk-summary.lua -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" -H "Connection: close" "http://127.0.0.1:19092/tiny.txt" >"$backend_dir/primary-connection-churn.wrk.txt" 2>&1
+    churn_summary="$(grep 'WRK_SUMMARY ' "$backend_dir/primary-connection-churn.wrk.txt" | tail -1 | sed 's/^.*WRK_SUMMARY //')"
+    [[ -n "$churn_summary" ]] || die "$backend connection churn did not emit WRK_SUMMARY"
+    jq -n \
+      --arg backend "$backend" \
+      --argjson churn "$churn_summary" \
+      '{backend: $backend, "connection-churn-http1": $churn}' >"$backend_dir/primary-connection-churn.json"
+    stop_backend_server "$primary_pid"
+
+    perf_dir="$backend_dir/perf"
+    mkdir -p "$perf_dir"
+    start_backend_server "$backend" "$perf_dir" 19093 primary
+    perf_pid="$server_pid"
+    for workload in static proxy-small proxy-large-streaming churn; do
+      run_attached_perf_pass "$backend" "$perf_dir" 19093 "$workload"
     done
-    kill "$backend_pid" >/dev/null 2>&1 || true
-    wait "$backend_pid" >/dev/null 2>&1 || true
+    stop_backend_server "$perf_pid"
+
+    strace_dir="$backend_dir/strace"
+    mkdir -p "$strace_dir"
+    start_backend_server "$backend" "$strace_dir" 19094 strace
+    strace_pid="$server_pid"
+    wrk --latency -s benchmarks/wrk-summary.lua -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" "http://127.0.0.1:19094/tiny.txt" >"$strace_dir/static.wrk.txt" 2>&1
+    wrk --latency -s benchmarks/wrk-summary.lua -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" "http://127.0.0.1:19094/proxy/health" >"$strace_dir/proxy-small.wrk.txt" 2>&1
+    stop_backend_server "$strace_pid"
   done
   kill "$backend_upstream_pid" >/dev/null 2>&1 || true
   trap - EXIT
