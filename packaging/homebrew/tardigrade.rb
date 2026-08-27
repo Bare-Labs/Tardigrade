@@ -4,29 +4,29 @@
 class Tardigrade < Formula
   desc "Small Zig edge server for static file serving, reverse proxying, and TLS termination"
   homepage "https://github.com/Bare-Systems/Tardigrade"
-  version "0.6.2"
+  version "0.6.3"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.2/tardigrade-darwin-arm64.tar.gz"
-      sha256 "bb7fef4507809a5da3bb99d92876520c78ef43382c373fbe90b1c19d09db8cfa"
+      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.3/tardigrade-darwin-arm64.tar.gz"
+      sha256 "507b741358f20ab5a45e2442e594b664a16a17dc247c711b21d76d36e47a440a"
     end
     on_intel do
-      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.2/tardigrade-darwin-x86_64.tar.gz"
-      sha256 "487c710daac951a22a657614c9fea419ef5e1ad7978af36c18646b041bd0596a"
+      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.3/tardigrade-darwin-x86_64.tar.gz"
+      sha256 "4caa11a627aeda75ffb256ae557d2faf027a343408b32aeb8dc1f16dda60d7cd"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.2/tardigrade-linux-aarch64.tar.gz"
-      sha256 "53eb30986d5b951f870dee2985755c4df82cc4eb45d9ee89c5e8ee771a4e0d64"
+      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.3/tardigrade-linux-aarch64.tar.gz"
+      sha256 "84e3415e9647bd03dc1c16026853d8671487fb61286867d0eae4bb1f60294902"
     end
 
     on_intel do
-      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.2/tardigrade-linux-x86_64.tar.gz"
-      sha256 "2f98ed94aaf9caf652d4add7045bc446e6056b07845387dd0b3e0f3d919c2a03"
+      url "https://github.com/Bare-Systems/Tardigrade/releases/download/v0.6.3/tardigrade-linux-x86_64.tar.gz"
+      sha256 "8445df63584ca2a6343574e77176c83e651ff81fe7b3a4b1d54443446a664fc3"
     end
   end
 
