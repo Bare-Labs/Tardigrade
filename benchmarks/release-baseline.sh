@@ -10,18 +10,19 @@ BENCH_DIR="${REPO_ROOT}/benchmarks"
 TAG="$(git -C "${REPO_ROOT}" describe --tags --always 2>/dev/null || echo unknown)"
 META_FILE="${BENCH_DIR}/targets/release-baseline.json"
 BASELINE_FILE=""
-README_FILE=""
+UPDATE_TARGET=""
 REPORT_FILE=""
 RUN_ARGS=()
 HAS_SCENARIOS_OVERRIDE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tag)           TAG="$2";            shift 2 ;;
-        --meta-file)     META_FILE="$2";      shift 2 ;;
-        --baseline)      BASELINE_FILE="$2";  shift 2 ;;
-        --update-readme) README_FILE="$2";    shift 2 ;;
-        --report-file)   REPORT_FILE="$2";    shift 2 ;;
+        --tag)           TAG="$2";             shift 2 ;;
+        --meta-file)     META_FILE="$2";       shift 2 ;;
+        --baseline)      BASELINE_FILE="$2";   shift 2 ;;
+        --update-report) UPDATE_TARGET="$2";   shift 2 ;;
+        --update-readme) UPDATE_TARGET="$2";   shift 2 ;;
+        --report-file)   REPORT_FILE="$2";     shift 2 ;;
         --scenarios)
             HAS_SCENARIOS_OVERRIDE=true
             RUN_ARGS+=("$1" "$2")
@@ -36,7 +37,8 @@ Options:
   --tag TAG             Output file tag (default: current git describe)
   --meta-file FILE      Metadata JSON merged into _meta
   --baseline FILE       Previous baseline JSON for comparison
-  --update-readme FILE  Refresh the README benchmark report block
+  --update-report FILE  Refresh the generated benchmark block in a Markdown file
+  --update-readme FILE  Compatibility alias for --update-report
   --report-file FILE    Output markdown report path
   --help                Show this help and exit
 
@@ -89,6 +91,6 @@ fi
 "${BENCH_DIR}/report.sh" "${report_args[@]}" > "${REPORT_FILE}"
 echo "Wrote report: ${REPORT_FILE}"
 
-if [[ -n "${README_FILE}" ]]; then
-    "${BENCH_DIR}/report.sh" "${report_args[@]}" --update-readme "${README_FILE}"
+if [[ -n "${UPDATE_TARGET}" ]]; then
+    "${BENCH_DIR}/report.sh" "${report_args[@]}" --update-report "${UPDATE_TARGET}"
 fi

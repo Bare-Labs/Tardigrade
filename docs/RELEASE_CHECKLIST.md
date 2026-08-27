@@ -19,7 +19,7 @@ Use this checklist before tagging and distributing a Tardigrade release.
       rerun summary
 - [ ] Compare against the previous saved baseline JSON
 - [ ] Generate the markdown report for the new baseline
-- [ ] Refresh the README benchmark report block from the saved baseline data
+- [ ] Refresh the generated benchmark report block in `benchmarks/README.md` from the saved baseline data
 - [ ] If a dedicated target was unavailable and a local fallback run was used, record that exception explicitly and do not treat it as the canonical release number
 - [ ] Record any known benchmark caveats in the release notes
 
