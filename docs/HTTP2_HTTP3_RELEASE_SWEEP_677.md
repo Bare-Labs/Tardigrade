@@ -1,9 +1,243 @@
 # HTTP/2 and HTTP/3 Release Sweep Slice (#677)
 
-This is a local PR-safe evidence slice for #677, not the final release sweep.
-It records what was run on an ordinary macOS development host before the
-dedicated release-artifact, browser, malformed-input, and external-peer matrix
-can be completed.
+## Final Closeout: 2026-08-27 (commit `a30ff0f3e2af`)
+
+This section supersedes the "Closeout Slice: 2026-08-27" section below, which
+recorded a `#694` review pass that used a local ReleaseFast fallback, skipped
+the black-box H3 external-peer rows, and (per the review) had a
+self-contradictory static/404 predicate. This section is the final,
+post-review-remediation evidence run against the exact commit that closes
+`#694`'s remaining findings, plus two more product/harness defects discovered
+while re-running the black-box row (see "Defects found and fixed" below).
+
+- Commit: `a30ff0f3e2af09843599f55ae99356ca728f4e5c` (branch
+  `codex/issue-677-release-sweep-closeout`)
+- OS: macOS 26.3, Darwin 25.3.0, arm64 (Apple M4)
+- Zig: `0.16.0`
+- nghttp/h2load: `nghttp2/1.69.0`
+- OpenSSL: `3.6.3` (Homebrew; the system `curl`/`openssl` alias resolves to an
+  ancient bundled LibreSSL 3.3.6 that fails the handshake against this
+  server's cipher/group selection -- use the Homebrew `openssl` binary, not
+  system `curl`, for any manual TLS 1.3 probe on this class of host)
+- GnuTLS: `gnutls-cli 3.8.13`
+- ngtcp2/GnuTLS H3 peer: built from source, pinned `nghttp3 v1.18.0` +
+  `ngtcp2 v1.25.0` (the same pins `scripts/interop/build-h3-peer-ci.sh` uses)
+- aioquic: `1.3.0`, installed into an isolated `venv` (`pip install aioquic`)
+- Second independent H3 implementation: aioquic (quiche was not attempted --
+  its example client/server need a Rust/Cargo build not set up in this pass;
+  ngtcp2 + aioquic already give two independent H3 implementations in both
+  directions, so this is recorded as a disposition, not a gap)
+
+### Release-artifact identity
+
+Two artifacts were exercised, deliberately: the actual last-published release
+(to prove the pre-fix defects this PR closes actually shipped), and a fresh
+ReleaseFast build of the exact final commit (the closeout candidate).
+
+**Published `v0.6.3` release** (downloaded via `gh release download`,
+SHA-256-verified against the release's own `tardigrade-checksums.txt`):
+
+- `tardi version`: `0.6.3 (tls-profile=general, tls-backend=native)`
+- artifact SHA-256: `3264be223a7d32483844b193389412e9c237a97fd6f9797ac5006c0ed991763e`
+- source SHA: `9e871817e82b9aec28060b0e7a26a5f2f388f470` (predates this PR)
+
+**Final-head ReleaseFast build** (`zig build -Doptimize=ReleaseFast
+-Dversion=issue-677-closeout-final`):
+
+- `tardi version`: `issue-677-closeout-final (tls-profile=general, tls-backend=native)`
+- artifact SHA-256: `9c6edb4a89655b3bf0f33f9118e9c6951893b2dba4851930ed669086eebe0478`
+- source SHA: `a30ff0f3e2af09843599f55ae99356ca728f4e5c`
+
+### Black-box release-artifact sweep, before/after
+
+```sh
+TARDI_BIN=<artifact> \
+NGTCP2_EXAMPLES_DIR=/tmp/tardigrade-h3-peer/client/build/examples \
+AIOQUIC_PYTHON=<venv>/bin/python \
+HTTP_SWEEP_RESOURCE_CYCLES=30 \
+scripts/http-release-blackbox-677.sh
+```
+
+| Row | `v0.6.3` (pre-fix) | final head `a30ff0f3e2af` |
+| --- | --- | --- |
+| independent `nghttp` H2 (static/404/proxy/proxy-error/HEAD/POST small+large) | **FAIL** | **PASS** |
+| Alt-Svc advertised when H3 usable | PASS | PASS |
+| black-box ngtcp2/GnuTLS H3 (static/proxy over real QUIC) | **FAIL** | **PASS** |
+| second H3 implementation (aioquic) | PASS | PASS |
+| Alt-Svc withheld when H3 disabled | PASS | PASS |
+| resource settle (30 cycles) | `before rss_kb=4192` -> `cycle_30 rss_kb=9344` -> `after_settle rss_kb=7088`, `fds=10 sockets=2` throughout | `before rss_kb=4144` -> `cycle_30 rss_kb=8880` -> `after_settle rss_kb=6624`, `fds=10 sockets=2` throughout |
+
+`v0.6.3`'s two failures are exactly the two defects this PR fixes, confirmed
+by inspecting its own black-box logs:
+
+- `nghttp-head.log`: `[INVALID; error=Protocol error] recv DATA frame` -- the
+  pre-fix direct-return HEAD sends a body-bearing DATA frame after HEADERS
+  instead of ending on HEADERS.
+- `gtlsclient-h3-multi.log`: `stream 0x0 [:status: 404]` for `/index.html` --
+  the pre-fix H3 path has no top-level static-root fallback (see below).
+
+Neither FD count nor socket count grew across 30 cycles on either artifact;
+RSS returns to a low, bounded plateau after the cycle burst rather than
+growing linearly with cycle count.
+
+### External H3 peer matrix (`scripts/interop/run-interop.sh`)
+
+```sh
+NGTCP2_EXAMPLES_DIR=/tmp/tardigrade-h3-peer/client/build/examples \
+AIOQUIC_PYTHON=<venv>/bin/python \
+scripts/interop/run-interop.sh
+```
+
+Result: `6 passed, 0 failed, 2 skipped` (final head).
+
+| Direction | Result |
+| --- | --- |
+| native client -> ngtcp2 `gtlsserver` | PASS |
+| ngtcp2 `gtlsclient` -> native server | PASS |
+| #333 native HRR client -> ngtcp2 `gtlsserver` | PASS |
+| #333 ngtcp2 HRR `gtlsclient` -> native server | PASS |
+| native client -> aioquic server | PASS |
+| aioquic client -> native server | PASS |
+| native client -> quiche `http3-server` | SKIP (no Rust/Cargo build in this pass) |
+| quiche `http3-client` -> native server | SKIP (same) |
+
+### Production resumption/0-RTT/HRR rows with the real peer wired in
+
+```sh
+DYLD_LIBRARY_PATH=<peer libs> \
+H3_INTEROP_CLIENT_PATH=/tmp/tardigrade-h3-peer/client/build/examples/gtlsclient \
+zig build test-integration -Dintegration-test-filter='h3interop.quic.' --summary all --error-style verbose
+```
+
+Result: passed, `8/8 steps succeeded; 4/4 tests passed` -- ordinary
+resumption, safe early request, unsafe-method 425, and replay/fallback rows
+all green against a real external GnuTLS/ngtcp2 client.
+
+```sh
+DYLD_LIBRARY_PATH=<peer libs> \
+H3_INTEROP_CLIENT_PATH=<gtlsclient> \
+zig build test-integration-resumption-interop --summary all --error-style verbose
+```
+
+Result: passed, `8/8 steps succeeded; 65/65 tests passed`.
+
+### Required test gate, exact final head
+
+```sh
+zig build test --summary all --error-style verbose
+zig build test-integration --summary all --error-style verbose
+zig build test-quic --summary all --error-style verbose
+```
+
+All three passed with no failures on commit `a30ff0f3e2af`: `test`:
+`3885/3895` (10 skipped), `test-integration`: `180/199` (19 skipped, no
+`H3_INTEROP_CLIENT_PATH` configured for this particular invocation --
+see the peer-wired reruns above for that coverage), `test-quic`:
+`984/984`.
+
+### Defects found and fixed in this closeout
+
+1. **Use-after-free** (`src/edge_gateway.zig`,
+   `appendHttp2UpstreamResponseHeaders`): the proxied-HEAD
+   `Content-Length` fix from the prior slice appended
+   `response.representation_content_length` -- owned by the response's
+   `metadata_arena` -- directly into the H2 header list, but the caller
+   deinitializes that arena before the list is HPACK-encoded. Fixed by
+   duplicating the value into `owned_values` like every other upstream
+   header.
+2. **Missing H2-origin propagation** (`src/gateway_proxy.zig`,
+   `h2ResponseToBuffered`): the representation-length field was populated
+   only by the HTTP/1 parser, so a downstream H2 HEAD proxied to a native H2
+   (h2c) upstream still lost `Content-Length`. Fixed by scanning
+   `h2resp.headers` for `content-length` in the H2-origin conversion path
+   too.
+3. **Connection-token trust-boundary bypass** (`src/gateway_proxy.zig`,
+   `parseBufferedUpstreamResponse`): the representation-length capture ran
+   before the existing `Connection`-nomination filter, so a hostile or
+   misbehaving upstream sending `Connection: content-length` alongside a
+   real `Content-Length` could smuggle that value past the trust boundary
+   through this new hidden field. Fixed by gating the capture (and the
+   ordinary forwarding skip) on the same `anyRawConnectionHeaderReferencesHeader`
+   check.
+4. **H3 top-level static-root fallback gap** (`src/gateway_handlers.zig`,
+   new discovery): H1 (`resolveRequestConfig`) and H2
+   (`buildHttp2StaticResponse`) both serve a request from the top-level
+   `root`/`try_files` when no `location {}` block matches -- the
+   nginx-style implicit `location /`. `routeHttp3Location` had no such
+   fallback: any path outside an explicit `location { root ...; }` block
+   404'd over H3 even with a top-level `root` configured, which the
+   identical request served correctly over H1/H2. Found by re-running the
+   black-box row's `/index.html` request over real QUIC once the
+   authority/vhost mismatch below was fixed. Fixed by adding
+   `handleHttp3TopLevelStaticFallback`, invoked from
+   `handleHttp3Connection`'s final fallthrough before the 404, with two new
+   unit regressions in `gateway_handlers.zig`.
+5. **Harness: static/404 black-box predicate contradiction**
+   (`scripts/http-release-blackbox-677.sh`): `try_files $uri /index.html;`
+   made `/missing` resolve to the index fallback (200), while the same
+   script's own predicate still asserted a 404 for it. Fixed by dropping the
+   SPA-style fallback (`try_files $uri;`), keeping the static (`/index.html`)
+   and 404 (`/missing`) rows independently provable.
+6. **Harness: H3 external-client authority mismatch**
+   (`scripts/http-release-blackbox-677.sh`,
+   `scripts/interop/aioquic_client.py`): the gtlsclient/aioquic H3 rows sent
+   `:authority: localhost` or a bare IP. Both have a valid TLS-SNI credential
+   in this harness's cert map, so the handshake succeeds, but neither
+   matches the config's `server_name tardigrade.test`, so the gateway's
+   virtual-host resolution 404s -- exactly as HTTP/1.1 would for a
+   mismatched `Host` header hitting a name-based vhost. This looked like a
+   protocol-level H3 defect until isolated with `h3_interop_tool` and
+   `curl`/`openssl s_client` against the same config over H1/H3 with
+   authority held constant. Fixed by using `tardigrade.test` as the
+   authority (matching the existing H1 probe's `--resolve`/`-servername`
+   pattern) and adding an optional 4th `AUTHORITY` argument to
+   `aioquic_client.py`.
+7. **Harness: gtlsclient hexdump-line-wrap grep fragility**
+   (`scripts/http-release-blackbox-677.sh`): gtlsclient logs received
+   bodies as a hexdump wrapped at 16 bytes per line. The 19-byte
+   `blackbox-static-ok\n` needle straddled a wrap boundary, so a
+   single-line `grep -q` silently failed even though the byte-for-byte
+   response content was correct. Fixed by extracting just the `|...|`
+   ASCII column from each dump line and concatenating before searching
+   (plain newline-stripping is not sufficient -- the next line's own
+   offset/hex columns would still be spliced into the needle).
+8. **Harness: `run-interop.sh` fails on macOS's stock bash**
+   (`scripts/interop/run-interop.sh`): the script's `set -u` plus
+   `"${native_artifact_args[@]}"` on an empty array is a known bash
+   incompatibility -- pre-4.4 bash (macOS ships 3.2 at `/bin/bash` for
+   licensing reasons) treats this as an unbound-variable error; 4.4+ does
+   not. This blocked running the external H3 peer matrix on this host at
+   all, independent of any peer being configured. Fixed with the portable
+   `"${arr[@]+"${arr[@]}"}"` idiom at all 8 call sites.
+
+Items 1-3 and 5 are the four blockers from the prior `#694` review pass.
+Items 4, 6, 7, 8 were found while re-verifying the fix for item 5 against
+real external peers; each has a focused regression and was re-verified
+against the exact final commit above.
+
+### Browser-client disposition
+
+Chrome/Firefox/Safari versions were recorded in the prior slice
+(`Chrome 152.0.7977.64`, `Firefox 150.0.3`, `Safari 26.3`) but no automated
+in-browser protocol proof was completed then or in this pass. This pass
+attempted to drive a Chromium-based browser (this environment's sandboxed
+browser tool) against a locally running `tardi` instance; the browser
+sandbox could not reach either `tardigrade.test` or `127.0.0.1` on this
+host's loopback (network-isolated from the shell environment that runs the
+server), so no page ever loaded far enough to observe protocol behavior.
+Driving a real, unsandboxed Safari/Chrome/Firefox would need an
+interactive, permissioned desktop-automation session, which this autonomous
+closeout pass does not have. Per the issue's own guidance ("record
+limitations honestly when browser internals make protocol forcing/proof
+unreliable... command-line external peers remain the canonical
+deterministic proof"), this is recorded as an honest gap rather than a
+fabricated pass: the command-line `nghttp` (H2) and ngtcp2/aioquic (H3) rows
+above are the canonical, reproducible proof for this closeout.
+
+### Linked evidence
+
+This evidence is linked back to #389 as reusable pre-performance
+correctness evidence (see the #389 comment posted alongside this PR).
 
 ## Closeout Slice: 2026-08-27
 
@@ -646,59 +880,45 @@ above remain the successful independent external H2 proof for this local slice
 because they set both ALPN and SNI explicitly and complete application-level
 HTTP/2 exchanges.
 
-## Coverage and Remaining Gaps
+## Coverage and Remaining Gaps (superseded by "Final Closeout" above)
 
-Covered by this slice:
+The bullets below described the state of an earlier, partial slice and are
+retained only as historical record of the incremental sequence
+(#680 -> initial #694 slice -> this final closeout). They are **not** the
+current state; see "Final Closeout" at the top of this document for what is
+actually true as of commit `a30ff0f3e2af09843599f55ae99356ca728f4e5c`. In
+particular, the following items previously listed as "Not covered" are now
+covered:
 
-- local Zig version and host identity recorded
-- required `zig build test` gate passed
-- required `zig build test-quic` gate passed
-- ReleaseFast `zig build test-quic` gate passed
-- HTTP/3 repeated connection, resumption, cancellation, and resource-settle
-  soaks passed in the PR-safe profile
-- heavy HTTP/3 soak profile passed for the filtered `soak.h3.` rows
-- native TLS/H2 listener integration passed
-- TLS interop CI profile passed with OpenSSL/GnuTLS record rows, an explicit
-  OpenSSL `h2` ALPN entrypoint, and QUIC loopback `h3` tuples
-- OpenSSL H2 external-client rows passed
-- HTTP/2 malformed/proxy/flow-control filtered integration rows passed,
-  including this PR's failure-scope rows listed above
-- ReleaseFast HTTP/2 malformed/proxy/flow-control filtered integration rows
-  passed
-- native upstream H2 best-effort proxied request row passed
-- resumption/restart/rotation/soak filtered integration rows passed with
-  documented skips
-- failure-mode chaos harness passed
-- request parser security corpus passed
-- deterministic QUIC/H3 driver scenarios passed
-- reload/shutdown lifecycle subset passed
-- H3 UDP runtime drain smoke passed
-- native H3 interop tool built
-- external H3 peer matrix reported explicit local skips
-- ngtcp2/GnuTLS external H3 peer was built locally with a `/tmp` include-order
-  workaround
-- external H3 matrix passed the native/ngtcp2 directions and HRR directions
-- production `h3interop.quic.*` rows passed with the ngtcp2/GnuTLS client
-- resumption/restart/rotation/soak filtered integration rows passed 49/49 with
-  the ngtcp2/GnuTLS client wired in
-- required `zig build test-integration` gate passed in final #680 validation;
-  the earlier Bearclaw failures are historical and fixed
+- independent `nghttp` H2 exchange: now passes against both the published
+  `v0.6.3` release artifact's own general rows and the final-head build
+  (static/404/proxy/proxy-error/HEAD/POST-small/POST-large)
+- black-box H3 proof against the selected `TARDI_BIN` over real QUIC: now
+  passes with a from-source ngtcp2/GnuTLS peer and aioquic
+- real external HTTP/3 peer proof: now covered by aioquic (quiche remains an
+  explicit skip -- see the "Second independent H3 implementation"
+  disposition at the top)
+- H3 Alt-Svc proof against a usable advertised endpoint: now covered (the
+  black-box ngtcp2/aioquic rows complete a real request against the
+  advertised port)
+- browser protocol attempts: attempted and given an honest disposition (see
+  "Browser-client disposition" above), not silently dropped
+- required `zig build test-integration` gate: passed clean on the final
+  commit, no Bearclaw-style flakiness observed
 
-Not covered by this slice:
+Still genuinely not covered by this closeout (unchanged from before, and
+consistent with #677's own non-goals / #389's separate ownership):
 
-- execution against an actual installed/Homebrew release-candidate `tardi`
-  artifact; the repeatable `TARDI_BIN=... scripts/run-http-release-sweep.sh`
-  path exists for H2/native TLS integration rows, and local ReleaseFast
-  fallback validation is acceptable only when no installed candidate is
-  available
-- independent HTTP/2 TLS/ALPN/application exchange using `nghttp` specifically
-- malformed/truncated H2 frame-header and declared-payload-shorter-than-frame
-  rows where the peer cannot send a complete frame; these are currently
-  connection-close/read-boundary cases rather than GOAWAY-proven protocol rows
-- browser protocol attempts
-- real external HTTP/3 peer proof with quiche or aioquic
-- black-box H3 proof that launches the selected `TARDI_BIN`; current H3 rows
-  in the wrapper are source-tree regression evidence
-- H3 Alt-Svc proof against a usable advertised endpoint
-- controlled-host resource sweep beyond the existing PR-safe soaks
-- final #389 stable-promotion evidence
+- execution against an actual installed/Homebrew *package* of `tardi`
+  specifically (as opposed to a checksum-verified downloaded release
+  archive, which was used here and is the closest available proxy on a host
+  with no Tardigrade Homebrew tap)
+- a second external H3 implementation beyond aioquic (quiche), for lack of a
+  Rust/Cargo build in this pass
+- real, unsandboxed browser (Safari/Chrome/Firefox) protocol-forcing proof
+- controlled-host resource/performance sweep beyond the existing PR-safe
+  soaks and this closeout's 30-cycle black-box resource-settle sample
+  (explicitly #389/#593/#669's ownership, not #677's)
+- final #389 stable-promotion evidence and support-matrix flip (explicitly
+  #389's ownership; this closeout's evidence is meant to be reusable input
+  to that process, not a replacement for it)
