@@ -35,6 +35,10 @@ Run benchmarks on a dedicated, isolated benchmark target by default.
 # Canonical competitor numbers still belong on a dedicated idle host.
 ./benchmarks/competitive/run.sh
 
+# Proxmox LXC campaign: create a fresh container, build this checkout, run the
+# competitive suite, collect artifacts, and tear the container down.
+./scripts/run-proxmox-performance-campaign.sh
+
 # Listener-sharding suite: starts the same gateway command twice, with
 # TARDIGRADE_LISTENER_SHARDS=1 and =N, then saves comparable workload results
 # and per-shard accept metrics. Canonical numbers still belong on a dedicated
@@ -58,6 +62,39 @@ Install at least one load-generation tool. The runner auto-detects in this order
 | [`k6`](https://k6.io/) | `brew install k6` / apt | HTTP/1.1 + HTTP/2 (over TLS) + behavioral scenarios |
 
 `jq` is required for result formatting, baseline comparison, and report generation.
+
+## Proxmox LXC campaign
+
+`scripts/run-proxmox-performance-campaign.sh` is the repeatable #593
+fresh-host path for lab Proxmox runs. It connects to a Proxmox host over SSH,
+creates a disposable Debian LXC, installs the benchmark dependencies inside the
+container, builds the current checkout with Zig 0.16.0, runs the selected suite,
+pulls `benchmarks/results/` artifacts back to the local workspace, and destroys
+the container by default.
+
+The default SSH target is `root@10.250.250.2` with local source address
+`10.250.250.1`, matching the direct MacBook-to-Proxmox benchmark link used for
+control traffic and artifact transfer. Published benchmark traffic still runs
+inside the container against `127.0.0.1`, per the benchmark policy above.
+
+Useful examples:
+
+```bash
+# Full default competitive suite in a fresh CT.
+./scripts/run-proxmox-performance-campaign.sh
+
+# Bounded validation run that keeps the CT for inspection.
+./scripts/run-proxmox-performance-campaign.sh \
+  --duration 5 --connections 8 --threads 2 --keep-container
+
+# Also run the accept-batching/listener-sharding suite in the same fresh CT.
+./scripts/run-proxmox-performance-campaign.sh \
+  --suite competitive --suite listener-sharding \
+  --duration 30 --connections 50 --threads 4 --shards 4
+```
+
+The script accepts Proxmox-specific overrides for VMID, template, storage,
+bridge, CT sizing, and output directory. Run `--help` for the full option list.
 
 ## Release baseline process
 
