@@ -6,6 +6,10 @@ Tracking issues:
   engine conformance matrix.
 - [#358](https://github.com/Bare-Systems/Tardigrade/issues/358) — TLS-over-TCP
   OpenSSL interoperability harness.
+- [#674](https://github.com/Bare-Systems/Tardigrade/issues/674) — v0.6.x
+  release-hardening run of the full `--profile full` matrix against installed
+  OpenSSL and GnuTLS. Result:
+  [`docs/TLS_INTEROP_HARDENING_674.md`](TLS_INTEROP_HARDENING_674.md).
 
 This suite proves that the TLS 1.3 engine Tardigrade ships — one engine, two
 transports — interoperates with independent implementations across every

@@ -1,0 +1,143 @@
+generating interop certificates in /Users/joecaruso/Projects/BareSystems/Tardigrade/.claude/worktrees/issue-674-implementation-46131b/artifacts/tls-interop/certs
+
+shared-TLS-engine conformance matrix (#338), profile=full
+workdir: /Users/joecaruso/Projects/BareSystems/Tardigrade/.claude/worktrees/issue-674-implementation-46131b/artifacts/tls-interop
+openssl: OpenSSL 3.6.3 9 Jun 2026 (Library: OpenSSL 3.6.3 9 Jun 2026)
+gnutls:  gnutls-cli 3.8.13
+
+== record transport: positive tuples ==
+record/server/openssl/aes128-gcm-sha256/x25519/ed25519           PASS suite=aes128-gcm-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes128-gcm-sha256/x25519/ed25519           PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4026 peer_close=clean
+record/server/gnutls/aes128-gcm-sha256/x25519/ed25519            PASS suite=aes128-gcm-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes128-gcm-sha256/x25519/ed25519            PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=782
+record/server/openssl/aes128-gcm-sha256/x25519/ecdsa-p256-sha256 PASS suite=aes128-gcm-sha256 group=x25519 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes128-gcm-sha256/x25519/ecdsa-p256-sha256 PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4045 peer_close=clean
+record/server/gnutls/aes128-gcm-sha256/x25519/ecdsa-p256-sha256  PASS suite=aes128-gcm-sha256 group=x25519 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes128-gcm-sha256/x25519/ecdsa-p256-sha256  PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=791
+record/server/openssl/aes128-gcm-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=x25519 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes128-gcm-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4052 peer_close=clean
+record/server/gnutls/aes128-gcm-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=x25519 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes128-gcm-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=788
+record/server/openssl/aes128-gcm-sha256/secp256r1/ed25519        PASS suite=aes128-gcm-sha256 group=secp256r1 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes128-gcm-sha256/secp256r1/ed25519        PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4031 peer_close=clean
+record/server/gnutls/aes128-gcm-sha256/secp256r1/ed25519         PASS suite=aes128-gcm-sha256 group=secp256r1 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes128-gcm-sha256/secp256r1/ed25519         PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=785
+record/server/openssl/aes128-gcm-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes128-gcm-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4050 peer_close=clean
+record/server/gnutls/aes128-gcm-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes128-gcm-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=794
+record/server/openssl/aes128-gcm-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes128-gcm-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4057 peer_close=clean
+record/server/gnutls/aes128-gcm-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes128-gcm-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=791
+record/server/openssl/aes256-gcm-sha384/x25519/ed25519           PASS suite=aes256-gcm-sha384 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes256-gcm-sha384/x25519/ed25519           PASS suite=aes256-gcm-sha384 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4058 peer_close=clean
+record/server/gnutls/aes256-gcm-sha384/x25519/ed25519            PASS suite=aes256-gcm-sha384 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes256-gcm-sha384/x25519/ed25519            PASS suite=aes256-gcm-sha384 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=782
+record/server/openssl/aes256-gcm-sha384/x25519/ecdsa-p256-sha256 PASS suite=aes256-gcm-sha384 group=x25519 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes256-gcm-sha384/x25519/ecdsa-p256-sha256 PASS suite=aes256-gcm-sha384 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4077 peer_close=clean
+record/server/gnutls/aes256-gcm-sha384/x25519/ecdsa-p256-sha256  PASS suite=aes256-gcm-sha384 group=x25519 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes256-gcm-sha384/x25519/ecdsa-p256-sha256  PASS suite=aes256-gcm-sha384 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=791
+record/server/openssl/aes256-gcm-sha384/x25519/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=x25519 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes256-gcm-sha384/x25519/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4084 peer_close=clean
+record/server/gnutls/aes256-gcm-sha384/x25519/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=x25519 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes256-gcm-sha384/x25519/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=788
+record/server/openssl/aes256-gcm-sha384/secp256r1/ed25519        PASS suite=aes256-gcm-sha384 group=secp256r1 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes256-gcm-sha384/secp256r1/ed25519        PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4063 peer_close=clean
+record/server/gnutls/aes256-gcm-sha384/secp256r1/ed25519         PASS suite=aes256-gcm-sha384 group=secp256r1 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes256-gcm-sha384/secp256r1/ed25519         PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=785
+record/server/openssl/aes256-gcm-sha384/secp256r1/ecdsa-p256-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes256-gcm-sha384/secp256r1/ecdsa-p256-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4082 peer_close=clean
+record/server/gnutls/aes256-gcm-sha384/secp256r1/ecdsa-p256-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes256-gcm-sha384/secp256r1/ecdsa-p256-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=794
+record/server/openssl/aes256-gcm-sha384/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/aes256-gcm-sha384/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4089 peer_close=clean
+record/server/gnutls/aes256-gcm-sha384/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/aes256-gcm-sha384/secp256r1/rsa-pss-rsae-sha256 PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=791
+record/server/openssl/chacha20-poly1305-sha256/x25519/ed25519    PASS suite=chacha20-poly1305-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/chacha20-poly1305-sha256/x25519/ed25519    PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4053 peer_close=clean
+record/server/gnutls/chacha20-poly1305-sha256/x25519/ed25519     PASS suite=chacha20-poly1305-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/chacha20-poly1305-sha256/x25519/ed25519     PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=794
+record/server/openssl/chacha20-poly1305-sha256/x25519/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/chacha20-poly1305-sha256/x25519/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4072 peer_close=clean
+record/server/gnutls/chacha20-poly1305-sha256/x25519/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/chacha20-poly1305-sha256/x25519/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=803
+record/server/openssl/chacha20-poly1305-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/chacha20-poly1305-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4079 peer_close=clean
+record/server/gnutls/chacha20-poly1305-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/chacha20-poly1305-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=800
+record/server/openssl/chacha20-poly1305-sha256/secp256r1/ed25519 PASS suite=chacha20-poly1305-sha256 group=secp256r1 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/chacha20-poly1305-sha256/secp256r1/ed25519 PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4058 peer_close=clean
+record/server/gnutls/chacha20-poly1305-sha256/secp256r1/ed25519  PASS suite=chacha20-poly1305-sha256 group=secp256r1 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/chacha20-poly1305-sha256/secp256r1/ed25519  PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=797
+record/server/openssl/chacha20-poly1305-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/chacha20-poly1305-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4077 peer_close=clean
+record/server/gnutls/chacha20-poly1305-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 signature=ecdsa-p256-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/chacha20-poly1305-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=806
+record/server/openssl/chacha20-poly1305-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/openssl/chacha20-poly1305-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4084 peer_close=clean
+record/server/gnutls/chacha20-poly1305-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 signature=rsa-pss-rsae-sha256 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/client/gnutls/chacha20-poly1305-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=803
+
+== record transport: HTTP protocol entrypoints ==
+record/server/openssl/http2_entrypoint                           PASS suite=aes128-gcm-sha256 group=x25519 signature=ed25519 alpn=h2 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=33 peer_close=clean
+
+== record transport: HelloRetryRequest ==
+record/server/openssl/hrr                                        PASS suite=aes128-gcm-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=true app_bytes=18 peer_close=clean
+record/client/openssl/hrr                                        PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=true app_bytes=4026 peer_close=clean
+
+== record transport: post-handshake KeyUpdate ==
+record/server/openssl/key-update/reciprocal                      PASS suite=aes128-gcm-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 key_updates_sent=1 key_updates_received=1
+record/client/openssl/key-update/reciprocal                      PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4026 key_updates_sent=1 key_updates_received=1 peer_close=clean
+record/client/openssl/key-update/one-way                         PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=4026 key_updates_sent=1 key_updates_received=0 peer_close=clean
+
+== record transport: record_size_limit (RFC 8449) ==
+record/server/gnutls/record-size-limit                           PASS suite=aes128-gcm-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18
+record/client/gnutls/record-size-limit                           PASS suite=aes128-gcm-sha256 group=x25519 alpn=http/1.1 sni=tardigrade.test certificate=valid hrr=false app_bytes=782
+record/server/openssl/close_notify                               PASS suite=aes128-gcm-sha256 group=x25519 signature=ed25519 alpn=http/1.1 sni=tardigrade.test certificate=not_checked hrr=false app_bytes=18 peer_close=clean
+record/server/openssl/truncation                                 PASS error=TruncatedStream app_bytes=42
+
+== record transport: negative conformance ==
+record/negative/alpn_no_overlap                                  PASS error=AlpnMismatch alert=no_application_protocol alert_origin=local app_bytes=0
+record/negative/tls12_downgrade                                  PASS error=UnsupportedProtocolVersion alert=protocol_version alert_origin=local app_bytes=0
+record/negative/cipher_no_overlap                                PASS error=NoMutualParameters alert=handshake_failure alert_origin=local app_bytes=0
+record/negative/group_no_overlap                                 PASS error=NoMutualParameters alert=handshake_failure alert_origin=local app_bytes=0
+record/negative/signature_no_overlap                             PASS error=NoApplicableCredential alert=handshake_failure alert_origin=local app_bytes=0
+record/negative/sni_absent                                       PASS error=MissingExtension alert=missing_extension alert_origin=local app_bytes=0
+record/negative/malformed_ordering                               PASS error=UnexpectedRecordContent app_bytes=0
+record/negative/ccs_before_clienthello                           PASS error=UnexpectedRecordContent app_bytes=0
+record/negative/wrong_pinned_certificate                         PASS error=CertificateInvalid alert=bad_certificate alert_origin=local app_bytes=0
+
+== record transport: server certificate selection ==
+record/selection/sni_ed25519                                     PASS signature=ed25519
+record/selection/sni_ecdsa_p256                                  PASS signature=ecdsa-p256-sha256
+record/selection/sni_rsa                                         PASS signature=rsa-pss-rsae-sha256
+record/selection/unknown_sni_uses_default                        PASS signature=ed25519
+record/selection/sigalgs_ed25519                                 PASS signature=ed25519
+record/selection/sigalgs_rsa_pss                                 PASS signature=rsa-pss-rsae-sha256
+record/selection/no_applicable_credential                        PASS error=NoApplicableCredential alert=handshake_failure alert_origin=local app_bytes=0
+
+== QUIC transport: the same tuples ==
+quic/loopback/aes128-gcm-sha256/x25519/ed25519                   PASS suite=aes128-gcm-sha256 group=x25519 alpn=h3 hrr=false
+quic/loopback/aes128-gcm-sha256/x25519/ecdsa-p256-sha256         PASS suite=aes128-gcm-sha256 group=x25519 alpn=h3 hrr=false
+quic/loopback/aes128-gcm-sha256/x25519/rsa-pss-rsae-sha256       PASS suite=aes128-gcm-sha256 group=x25519 alpn=h3 hrr=false
+quic/loopback/aes128-gcm-sha256/secp256r1/ed25519                PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/aes128-gcm-sha256/secp256r1/ecdsa-p256-sha256      PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/aes128-gcm-sha256/secp256r1/rsa-pss-rsae-sha256    PASS suite=aes128-gcm-sha256 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/aes256-gcm-sha384/x25519/ed25519                   PASS suite=aes256-gcm-sha384 group=x25519 alpn=h3 hrr=false
+quic/loopback/aes256-gcm-sha384/x25519/ecdsa-p256-sha256         PASS suite=aes256-gcm-sha384 group=x25519 alpn=h3 hrr=false
+quic/loopback/aes256-gcm-sha384/x25519/rsa-pss-rsae-sha256       PASS suite=aes256-gcm-sha384 group=x25519 alpn=h3 hrr=false
+quic/loopback/aes256-gcm-sha384/secp256r1/ed25519                PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/aes256-gcm-sha384/secp256r1/ecdsa-p256-sha256      PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/aes256-gcm-sha384/secp256r1/rsa-pss-rsae-sha256    PASS suite=aes256-gcm-sha384 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/chacha20-poly1305-sha256/x25519/ed25519            PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=h3 hrr=false
+quic/loopback/chacha20-poly1305-sha256/x25519/ecdsa-p256-sha256  PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=h3 hrr=false
+quic/loopback/chacha20-poly1305-sha256/x25519/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=x25519 alpn=h3 hrr=false
+quic/loopback/chacha20-poly1305-sha256/secp256r1/ed25519         PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/chacha20-poly1305-sha256/secp256r1/ecdsa-p256-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=h3 hrr=false
+quic/loopback/chacha20-poly1305-sha256/secp256r1/rsa-pss-rsae-sha256 PASS suite=chacha20-poly1305-sha256 group=secp256r1 alpn=h3 hrr=false
+
+----------------------------------------------------------------
+pass=116 fail=0 skip=0
+logs:        /Users/joecaruso/Projects/BareSystems/Tardigrade/.claude/worktrees/issue-674-implementation-46131b/artifacts/tls-interop/logs
+transcripts: /Users/joecaruso/Projects/BareSystems/Tardigrade/.claude/worktrees/issue-674-implementation-46131b/artifacts/tls-interop/transcripts

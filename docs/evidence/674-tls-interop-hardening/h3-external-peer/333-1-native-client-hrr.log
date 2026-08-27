@@ -1,0 +1,10 @@
+h3-interop: established, alpn_h3=true
+status: 200
+server: ngtcp2 server
+content-type: text/plain
+content-length: 22
+
+hello-from-ngtcp2-hrr
+h3-interop: tls retry_state=hrr_received
+tls-interop: outcome=ok transport=quic role=client suite=aes128-gcm-sha256 group=x25519 alpn=h3 hrr=true
+h3-interop: client ok
