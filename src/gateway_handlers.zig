@@ -2496,27 +2496,29 @@ fn handleHttp3StaticLocation(
     }
 
     // Compress the body for HTTP/3 responses (all H3 responses are buffered —
-    // no sendfile path). Compression is skipped for HEAD, 304, or when config
-    // or client do not allow it.
+    // no sendfile path). Compression is computed from the GET-equivalent
+    // representation regardless of method: HEAD must report the exact
+    // Content-Length/Content-Encoding/Vary a GET would have gotten (mirroring
+    // the H1 static owner in gateway_static_runtime.zig, which computes
+    // compression before ever deciding whether to transmit the body), then
+    // only the transmitted body bytes are suppressed for HEAD -- H3's
+    // sendResponse() has no separate head-only flag, so the response's body
+    // must actually be emptied here rather than merely not written.
     const is_head_req = std.mem.eql(u8, request.method, "HEAD");
-    const raw_body: []const u8 = if (is_head_req) "" else (served.body orelse "");
+    const source_body: []const u8 = served.body orelse "";
     var compress_result: http.compression.CompressionResult = .{ .body = null, .compressed = false };
     defer if (compress_result.body) |b| allocator.free(b);
-    if (!is_head_req and raw_body.len > 0) {
+    if (source_body.len > 0) {
         compress_result = http.compression.compressResponse(
             allocator,
-            raw_body,
+            source_body,
             served.content_type,
             request.headers.get("accept-encoding"),
             ctx.state.compression_config,
         );
     }
-    const out_body: []const u8 = compress_result.body orelse raw_body;
-    // HEAD must report the GET-equivalent representation length even though
-    // no body bytes are actually sent: `served.content_length` is the true
-    // served size, while `out_body.len` was forced to 0 above by emptying
-    // `raw_body` for HEAD before it ever reached compression.
-    const content_length: usize = if (is_head_req) served.content_length else out_body.len;
+    const representation_body: []const u8 = compress_result.body orelse source_body;
+    const out_body: []const u8 = if (is_head_req) "" else representation_body;
     _ = response
         .setStatus(served.status_code)
         .setBodyOwned(try allocator.dupe(u8, out_body))
@@ -2532,7 +2534,7 @@ fn handleHttp3StaticLocation(
     }
     _ = response
         .setHeader("server", http.SERVER_NAME)
-        .setContentLength(content_length);
+        .setContentLength(representation_body.len);
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(@intFromEnum(served.status_code));
     return true;
@@ -2574,24 +2576,25 @@ fn handleHttp3TopLevelStaticFallback(
     })) orelse return false;
     defer served.deinit(allocator);
 
+    // Same fix as handleHttp3StaticLocation above: compute compression from
+    // the GET-equivalent representation regardless of method (so HEAD's
+    // Content-Length/Content-Encoding/Vary match what a GET would return),
+    // then only suppress the transmitted body bytes for HEAD.
     const is_head_req = std.mem.eql(u8, request.method, "HEAD");
-    const raw_body: []const u8 = if (is_head_req) "" else (served.body orelse "");
+    const source_body: []const u8 = served.body orelse "";
     var compress_result: http.compression.CompressionResult = .{ .body = null, .compressed = false };
     defer if (compress_result.body) |b| allocator.free(b);
-    if (!is_head_req and raw_body.len > 0) {
+    if (source_body.len > 0) {
         compress_result = http.compression.compressResponse(
             allocator,
-            raw_body,
+            source_body,
             served.content_type,
             request.headers.get("accept-encoding"),
             ctx.state.compression_config,
         );
     }
-    const out_body: []const u8 = compress_result.body orelse raw_body;
-    // Same HEAD representation-length fix as handleHttp3StaticLocation above:
-    // `out_body.len` is 0 for HEAD (body intentionally suppressed), but the
-    // client still needs the true served length, not the transmitted one.
-    const content_length: usize = if (is_head_req) served.content_length else out_body.len;
+    const representation_body: []const u8 = compress_result.body orelse source_body;
+    const out_body: []const u8 = if (is_head_req) "" else representation_body;
     _ = response
         .setStatus(served.status_code)
         .setBodyOwned(try allocator.dupe(u8, out_body))
@@ -2607,7 +2610,7 @@ fn handleHttp3TopLevelStaticFallback(
     }
     _ = response
         .setHeader("server", http.SERVER_NAME)
-        .setContentLength(content_length);
+        .setContentLength(representation_body.len);
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(@intFromEnum(served.status_code));
     return true;
@@ -2756,6 +2759,156 @@ test "handleHttp3Connection preserves representation length for HEAD against a l
     try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
     try std.testing.expectEqual(@as(usize, 0), if (response.body) |b| b.len else 0);
     try std.testing.expectEqualStrings("18", response.headers.get("content-length") orelse "");
+}
+
+test "handleHttp3Connection HEAD matches GET's gzip representation for the top-level static fallback" {
+    // Regression: the HEAD representation-length fix must derive
+    // Content-Length from the *compressed* representation when compression
+    // applies, not the uncompressed served.content_length -- otherwise HEAD
+    // metadata disagrees with what the equivalent GET actually returns.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const compressible_body = "a" ** 512;
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = compressible_body });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    state.compression_config = .{ .min_size = 0 };
+    var blocks = [_]http.location_router.LocationBlock{};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.doc_root = root_path;
+    cfg.try_files = "$uri";
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+
+    var get_request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/index.html"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    try get_request.headers.append("accept-encoding", "gzip");
+    defer get_request.deinit();
+    var get_response = http.Response.init(allocator);
+    defer get_response.deinit();
+    try handleHttp3Connection(allocator, &get_request, &get_response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(get_response.status));
+    try std.testing.expectEqualStrings("gzip", get_response.headers.get("content-encoding") orelse "");
+    const get_content_length = get_response.headers.get("content-length") orelse "";
+    try std.testing.expect(!std.mem.eql(u8, get_content_length, "512"));
+    const get_body_len = if (get_response.body) |b| b.len else 0;
+    const parsed_get_content_length = try std.fmt.parseInt(usize, get_content_length, 10);
+    try std.testing.expectEqual(get_body_len, parsed_get_content_length);
+
+    var head_request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "HEAD"),
+        .path = try allocator.dupe(u8, "/index.html"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    try head_request.headers.append("accept-encoding", "gzip");
+    defer head_request.deinit();
+    var head_response = http.Response.init(allocator);
+    defer head_response.deinit();
+    try handleHttp3Connection(allocator, &head_request, &head_response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(head_response.status));
+    try std.testing.expectEqual(@as(usize, 0), if (head_response.body) |b| b.len else 0);
+    try std.testing.expectEqualStrings("gzip", head_response.headers.get("content-encoding") orelse "");
+    try std.testing.expectEqualStrings(get_content_length, head_response.headers.get("content-length") orelse "");
+}
+
+test "handleHttp3Connection HEAD matches GET's gzip representation for a location-block static root" {
+    // Same fix, for the pre-existing location-block static path.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const compressible_body = "a" ** 512;
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = compressible_body });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    state.compression_config = .{ .min_size = 0 };
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/index.html",
+        .priority = 0,
+        .action = .{ .static_root = .{
+            .root = root_path,
+            .alias = false,
+            .autoindex = false,
+            .index = "",
+            .try_files = "$uri",
+        } },
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+
+    var get_request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/index.html"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    try get_request.headers.append("accept-encoding", "gzip");
+    defer get_request.deinit();
+    var get_response = http.Response.init(allocator);
+    defer get_response.deinit();
+    try handleHttp3Connection(allocator, &get_request, &get_response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(get_response.status));
+    try std.testing.expectEqualStrings("gzip", get_response.headers.get("content-encoding") orelse "");
+    const get_content_length = get_response.headers.get("content-length") orelse "";
+    try std.testing.expect(!std.mem.eql(u8, get_content_length, "512"));
+    const get_body_len = if (get_response.body) |b| b.len else 0;
+    const parsed_get_content_length = try std.fmt.parseInt(usize, get_content_length, 10);
+    try std.testing.expectEqual(get_body_len, parsed_get_content_length);
+
+    var head_request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "HEAD"),
+        .path = try allocator.dupe(u8, "/index.html"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    try head_request.headers.append("accept-encoding", "gzip");
+    defer head_request.deinit();
+    var head_response = http.Response.init(allocator);
+    defer head_response.deinit();
+    try handleHttp3Connection(allocator, &head_request, &head_response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(head_response.status));
+    try std.testing.expectEqual(@as(usize, 0), if (head_response.body) |b| b.len else 0);
+    try std.testing.expectEqualStrings("gzip", head_response.headers.get("content-encoding") orelse "");
+    try std.testing.expectEqualStrings(get_content_length, head_response.headers.get("content-length") orelse "");
 }
 
 test "handleHttp3Connection still 404s an unmatched path when no top-level root is configured" {

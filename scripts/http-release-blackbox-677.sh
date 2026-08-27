@@ -109,8 +109,10 @@ python3 - "$workdir/upstream.py" <<'PY'
 import pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(r'''
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import sys
+import os, sys, time
 LENGTHS_PATH = sys.argv[2]
+ADMITTED_PATH = sys.argv[3]
+RELEASE_PATH = sys.argv[4]
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, fmt, *args): pass
@@ -122,8 +124,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+    def _handle_slow(self):
+        # Prove admission (the request actually reached the upstream, i.e.
+        # tardi proxied it) before blocking, then wait -- bounded -- for the
+        # external harness to release it. Threaded server: this does not
+        # block other concurrent upstream connections.
+        with open(ADMITTED_PATH, "w"):
+            pass
+        deadline = time.time() + 15
+        while not os.path.exists(RELEASE_PATH) and time.time() < deadline:
+            time.sleep(0.05)
+        self._send(200, "slow-ok")
     def do_GET(self):
-        if self.path.startswith("/proxy-error"):
+        if self.path.startswith("/slow"):
+            self._handle_slow()
+        elif self.path.startswith("/proxy-error"):
             self._send(500, "proxy-upstream-error")
         else:
             self._send(200, "proxy-ok" if self.path.startswith("/proxy") else "upstream-ok")
@@ -144,7 +159,9 @@ PY
 upstream_port="$(free_tcp_port)"
 post_lengths="$workdir/post-lengths.txt"
 : >"$post_lengths"
-python3 "$workdir/upstream.py" "$upstream_port" "$post_lengths" >"$logs/upstream.log" 2>&1 &
+drain_admitted="$workdir/drain-admitted"
+drain_release="$workdir/drain-release"
+python3 "$workdir/upstream.py" "$upstream_port" "$post_lengths" "$drain_admitted" "$drain_release" >"$logs/upstream.log" 2>&1 &
 upstream_pid=$!
 
 tcp_port="$(free_tcp_port)"
@@ -172,6 +189,10 @@ location = /proxy-error {
     proxy_pass http://127.0.0.1:$upstream_port/proxy-error;
 }
 
+location = /slow {
+    proxy_pass http://127.0.0.1:$upstream_port/slow;
+}
+
 EOF
 
 # shellcheck disable=SC2317,SC2329 # invoked by trap on script exit
@@ -196,7 +217,18 @@ TARDIGRADE_QUIC_PORT="$udp_port" \
 TARDIGRADE_HTTP3_ALT_SVC=auto \
 TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS=60 \
 TARDIGRADE_ERROR_LOG_PATH="$logs/tardi-app.log" \
+TARDIGRADE_UPSTREAM_TIMEOUT_MS=25000 \
 "$tardi_bin" run -c "$config" >"$logs/tardi.stdout" 2>"$logs/tardi.stderr" &
+# Discovered while building the GOAWAY/drain row below: on an otherwise-idle
+# H3 connection (no other traffic since admission), the drain GOAWAY frame
+# can take on the order of 10s to actually reach the peer -- well inside the
+# 30s graceful-shutdown deadline the drain contract itself promises, but
+# tight against the default 10s TARDIGRADE_UPSTREAM_TIMEOUT_MS, which could
+# spuriously 504 an admitted in-flight proxied request during that specific
+# idle-connection-plus-rolling-restart combination. Bumped above so this row
+# proves the actual contract (admitted work completes, new work explicitly
+# rejected) rather than racing an unrelated, tighter proxy timeout. Recorded
+# as an observation for follow-up, not a #677/#694 blocker (#677, #694).
 tardi_pid=$!
 
 if ! wait_tcp "$tcp_port"; then
@@ -409,18 +441,21 @@ curl -sk --noproxy '*' --resolve "tardigrade.test:$tcp_port:127.0.0.1" -D "$logs
   "https://tardigrade.test:$tcp_port/healthz" >"$logs/altsvc-disabled-prestop.curl.log" 2>&1 || true
 
 if [ -n "${AIOQUIC_PYTHON:-}" ] && [ -x "${AIOQUIC_PYTHON:-}" ]; then
-  # GOAWAY/drain boundary, against the selected artifact: complete one
-  # ordinary request, signal readiness, SIGTERM the server (the same signal
-  # the enabled-instance shutdown below already uses), then attempt a new
-  # stream on the SAME already-open connection. aioquic does not surface the
-  # GOAWAY frame itself as a public event, so this proves the boundary's
-  # effect instead: admitted work completing plus new work being refused.
+  # GOAWAY/drain boundary, against the selected artifact, with every half
+  # observed rather than inferred from silence: send a request to the slow
+  # upstream route (which admits it -- via drain_admitted -- before
+  # blocking on drain_release), signal readiness once admitted, SIGTERM the
+  # server, require an actual observed GOAWAY control frame, release the
+  # upstream and require the already-admitted request to complete with 200,
+  # then require a *new* stream to be explicitly rejected (stream reset or
+  # connection termination, not a bare timeout).
   drain_ready="$workdir/drain-ready"
-  rm -f "$drain_ready"
-  "$AIOQUIC_PYTHON" "$here/interop/aioquic_drain_client.py" 127.0.0.1 "$udp_port" tardigrade.test /healthz "$drain_ready" \
+  rm -f "$drain_ready" "$drain_admitted" "$drain_release"
+  "$AIOQUIC_PYTHON" "$here/interop/aioquic_drain_client.py" 127.0.0.1 "$udp_port" tardigrade.test /slow \
+    "$drain_admitted" "$drain_ready" "$drain_release" \
     >"$logs/aioquic-drain-client.log" 2>&1 &
   drain_client_pid=$!
-  for _ in $(seq 1 50); do
+  for _ in $(seq 1 100); do
     [ -f "$drain_ready" ] && break
     sleep 0.1
   done
@@ -430,12 +465,13 @@ if [ -n "${AIOQUIC_PYTHON:-}" ] && [ -x "${AIOQUIC_PYTHON:-}" ]; then
   wait "$tardi_pid" 2>/dev/null
   tardi_pid=""
   if [ "$drain_client_status" -eq 0 ] &&
-     grep -q 'pre-drain status: 200' "$logs/aioquic-drain-client.log" &&
-     grep -q 'post-drain refused: True' "$logs/aioquic-drain-client.log"; then
-    say "PASS black-box H3 GOAWAY/drain boundary (admitted work completes, new work refused)"
+     grep -q 'goaway received' "$logs/aioquic-drain-client.log" &&
+     grep -q 'admitted request status: 200' "$logs/aioquic-drain-client.log" &&
+     grep -q 'post-boundary explicit rejection: True' "$logs/aioquic-drain-client.log"; then
+    say "PASS black-box H3 GOAWAY/drain boundary (observed GOAWAY, admitted work completes, new work explicitly rejected)"
     printf 'blackbox_h3_drain=PASS\n' >>"$summary"
   else
-    say "FAIL black-box H3 GOAWAY/drain boundary (admitted work completes, new work refused)"
+    say "FAIL black-box H3 GOAWAY/drain boundary (observed GOAWAY, admitted work completes, new work explicitly rejected)"
     printf 'blackbox_h3_drain=FAIL\n' >>"$summary"
     status=1
   fi
