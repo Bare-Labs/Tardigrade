@@ -4,9 +4,10 @@
 # Usage:
 #   ./benchmarks/report.sh <results.json>                              # print to stdout
 #   ./benchmarks/report.sh <results.json> --compare <baseline.json>   # add Δ column vs baseline
-#   ./benchmarks/report.sh <results.json> --update-readme <file>      # update README in-place
+#   ./benchmarks/report.sh <results.json> --update-report <file>      # update a markdown report block in-place
+#   ./benchmarks/report.sh <results.json> --update-readme <file>      # compatibility alias for --update-report
 #
-# The README update mode replaces content between:
+# Update mode replaces content between:
 #   <!-- BENCHMARK_REPORT_START --> and <!-- BENCHMARK_REPORT_END -->
 #
 # Prerequisites: jq
@@ -15,12 +16,13 @@ set -euo pipefail
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 RESULTS_FILE=""
-UPDATE_README=""
+UPDATE_TARGET=""
 COMPARE_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --update-readme) UPDATE_README="$2"; shift 2 ;;
+        --update-report) UPDATE_TARGET="$2"; shift 2 ;;
+        --update-readme) UPDATE_TARGET="$2"; shift 2 ;;
         --compare)       COMPARE_FILE="$2";  shift 2 ;;
         --help)
             sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1
@@ -32,7 +34,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$RESULTS_FILE" ]]; then
-    echo "Usage: $0 <results.json> [--compare <baseline.json>] [--update-readme <readme.md>]" >&2
+    echo "Usage: $0 <results.json> [--compare <baseline.json>] [--update-report <markdown-file>]" >&2
     exit 1
 fi
 
@@ -152,32 +154,32 @@ ${table}
 > driver: \`${meta_driver}\` · env: \`${meta_env}\` · workers: \`${meta_workers}\` · config: \`${meta_config}\`
 > CPU/RSS columns are sampled from the target Tardigrade process only when the run used \`--pid\` or \`--pid-file\`; otherwise they remain \`-\`.${compare_note}
 >
-> Run \`./benchmarks/run.sh --save benchmarks/baselines/\$(git describe --tags).json\` then \`./benchmarks/report.sh <file> --update-readme README.md\` to refresh this table.
+> Run \`./benchmarks/run.sh --save benchmarks/baselines/\$(git describe --tags).json\` then \`./benchmarks/report.sh <file> --update-report benchmarks/README.md\` to refresh this table.
 EOF
 }
 
 REPORT=$(build_report)
 
 # ── Output ────────────────────────────────────────────────────────────────────
-if [[ -z "$UPDATE_README" ]]; then
+if [[ -z "$UPDATE_TARGET" ]]; then
     echo "$REPORT"
     exit 0
 fi
 
-if [[ ! -f "$UPDATE_README" ]]; then
-    echo "README file not found: $UPDATE_README" >&2
+if [[ ! -f "$UPDATE_TARGET" ]]; then
+    echo "Markdown report target not found: $UPDATE_TARGET" >&2
     exit 1
 fi
 
 # Both markers must be present, or the awk replacement below will either
 # silently drop everything after a missing END marker, or silently no-op
 # (report success without inserting anything) if START is missing.
-if ! grep -qF '<!-- BENCHMARK_REPORT_START -->' "$UPDATE_README"; then
-    echo "README update marker not found: <!-- BENCHMARK_REPORT_START --> is missing from $UPDATE_README" >&2
+if ! grep -qF '<!-- BENCHMARK_REPORT_START -->' "$UPDATE_TARGET"; then
+    echo "Benchmark report marker not found: <!-- BENCHMARK_REPORT_START --> is missing from $UPDATE_TARGET" >&2
     exit 1
 fi
-if ! grep -qF '<!-- BENCHMARK_REPORT_END -->' "$UPDATE_README"; then
-    echo "README update marker not found: <!-- BENCHMARK_REPORT_END --> is missing from $UPDATE_README" >&2
+if ! grep -qF '<!-- BENCHMARK_REPORT_END -->' "$UPDATE_TARGET"; then
+    echo "Benchmark report marker not found: <!-- BENCHMARK_REPORT_END --> is missing from $UPDATE_TARGET" >&2
     exit 1
 fi
 
@@ -199,8 +201,8 @@ awk \
         in_block = 0
     }
     !in_block { print }
-    ' "$UPDATE_README" > "${UPDATE_README}.tmp" \
-    && mv "${UPDATE_README}.tmp" "$UPDATE_README"
+    ' "$UPDATE_TARGET" > "${UPDATE_TARGET}.tmp" \
+    && mv "${UPDATE_TARGET}.tmp" "$UPDATE_TARGET"
 rm -f "$rep_tmp"
 
-echo "Updated: $UPDATE_README"
+echo "Updated: $UPDATE_TARGET"
