@@ -1,18 +1,18 @@
 # HTTP/2 and HTTP/3 Release Sweep Slice (#677)
 
-## Final Closeout: 2026-08-27 (commit `bcf17040`)
+## Final Closeout: 2026-08-27 (commit `447104c3`)
 
 This section supersedes the "Closeout Slice: 2026-08-27" section below,
 which recorded a `#694` review pass that used a local ReleaseFast fallback,
 skipped the black-box H3 external-peer rows, and (per review) had a
-self-contradictory static/404 predicate. It has been through two rounds of
-`#694` review remediation since; this is the evidence for the second round,
-run against the exact commit closing all currently-known findings. **One
-item -- the installed/public-artifact wrapper passing -- cannot close from
-this PR at all; see "Installed/public artifact wrapper" below for why, with
-concrete evidence.**
+self-contradictory static/404 predicate. It has been through three rounds
+of `#694` review remediation since; this is the evidence for the third
+round, run against the exact commit closing all currently-known findings.
+**One item -- the installed/public-artifact wrapper passing -- cannot close
+from this PR at all; see "Installed/public artifact wrapper" below for why,
+with concrete evidence.**
 
-- Commit: `bcf170401592dd09bb053b4a64a6a3550f122264` (branch
+- Commit: `447104c3572bdd24412e7c019069ce606c147645` (branch
   `codex/issue-677-release-sweep-closeout`)
 - OS: macOS 26.3, Darwin 25.3.0, arm64 (Apple M4)
 - Zig: `0.16.0`
@@ -47,8 +47,8 @@ SHA-256-verified against the release's own `tardigrade-checksums.txt`):
 -Dversion=issue-677-closeout-final`):
 
 - `tardi version`: `issue-677-closeout-final (tls-profile=general, tls-backend=native)`
-- artifact SHA-256: `1a0e01e4eac706ddcd684c035e7268e6550b2edb3463a143684a53f8097fd0a4`
-- source SHA: `bcf170401592dd09bb053b4a64a6a3550f122264`
+- artifact SHA-256: `eddfabb4e24cb09cffeff21996678dd8b8f330b43a5009b213a0c095b335232e`
+- source SHA: `447104c3572bdd24412e7c019069ce606c147645`
 
 ### Installed/public artifact wrapper (structural finding, not a #694 defect)
 
@@ -88,9 +88,9 @@ HTTP_SWEEP_FULL_GATES=1 \
   scripts/run-http-release-sweep.sh
 ```
 
-Result: **fails**, deterministically, on the exact same 4 tests both times
-this was run (identical on the commit before this round's fixes and on
-`bcf17040`):
+Result: **fails**, deterministically, on the exact same 4 tests all three
+times this was run across three review rounds (identical on the commit
+before round 2's fixes, on `bcf17040`, and on the final `447104c3`):
 
 ```
 error: 'interop.h2.return_directive matches shared H1/H3 redirect and method-enforcement semantics' failed: expected 0, found 5
@@ -128,16 +128,16 @@ HTTP_SWEEP_RESOURCE_CYCLES=30 \
 scripts/http-release-blackbox-677.sh
 ```
 
-| Row | `v0.6.3` (pre-fix) | final head `bcf17040` |
+| Row | `v0.6.3` (pre-fix) | final head `447104c3` |
 | --- | --- | --- |
 | independent `nghttp` H2 (static/404/proxy/proxy-error/HEAD/POST small+large) | **FAIL** | **PASS** |
 | Alt-Svc advertised when H3 usable | PASS | PASS |
 | black-box ngtcp2/GnuTLS H3 (static/proxy/error over real QUIC) | **FAIL** | **PASS** |
 | second H3 implementation (aioquic) | PASS | PASS |
 | H3 RESET_STREAM/STOP_SENDING cancellation + same-connection recovery | PASS (pre-existing QUIC machinery, unaffected by this PR) | **PASS** |
-| H3 GOAWAY/drain boundary (admitted work completes, new work refused) | PASS (same) | **PASS** |
+| H3 GOAWAY/drain boundary (observed GOAWAY frame, admitted work completes, new work explicitly rejected) | PASS (same) | **PASS** |
 | Alt-Svc withheld when H3 disabled | PASS | PASS |
-| resource settle (30 cycles, connect/request/**cancel**/close for H3) | `before rss_kb=4192` -> `cycle_30 rss_kb=6144` -> `after_settle rss_kb=6144`, `fds=10 sockets=2` throughout | `before rss_kb=4128` -> `cycle_30 rss_kb=5712` -> `after_settle rss_kb=5424`, `fds=10 sockets=2` throughout |
+| resource settle (30 cycles, connect/request/**cancel**/close for H3) | `before rss_kb=4128` -> `cycle_30 rss_kb=7168` -> `after_settle rss_kb=5152`, `fds=10 sockets=2` throughout | `before rss_kb=4064` -> `cycle_30 rss_kb=6464` -> `after_settle rss_kb=6464`, `fds=10 sockets=2` throughout |
 
 `v0.6.3`'s two failures are exactly the two defects this PR fixes, confirmed
 by inspecting its own black-box logs:
@@ -168,22 +168,46 @@ unit tests as a substitute:
   connection. Result: the third request completes normally
   (`recovery status: 200`, body `alive`) -- cancellation does not poison
   the connection.
-- `scripts/interop/aioquic_drain_client.py`: completes one ordinary
-  request, signals the shell harness it is safe to proceed, the harness
-  sends `SIGTERM` to the selected artifact's process, the script waits
-  300ms then attempts a **new** stream on the same already-open connection.
-  Result: the pre-signal request completes (`pre-drain status: 200`) and
-  the post-signal stream is refused (`post-drain refused: True`) --
-  admitted work finishes, new work is not served across the drain boundary.
-  The server's own log for this run shows a clean, non-forced drain:
-  `"http3: graceful drain started ..."` followed by
-  `"Graceful shutdown complete (forced_closes=0 drain_timed_out=false)"`.
+- `scripts/interop/aioquic_drain_client.py`: every half of the boundary is
+  an observed protocol event, not an inference from silence. It sends a
+  request to a deliberately slow upstream route (added to the harness's
+  embedded upstream server) that writes an admission marker before
+  blocking on a release marker -- so there is a genuinely in-flight,
+  already-admitted request when the shell signals readiness and sends
+  `SIGTERM`. The client subclasses `H3Connection` as
+  `ObservingH3Connection`, intercepting `_handle_control_frame` to capture
+  the actual GOAWAY control frame (`goaway received: id=4` in the log
+  below). It then releases the upstream and requires the admitted request
+  to complete with 200 (`admitted request status: 200`), then opens a
+  *new* stream beyond the observed boundary and requires an explicit QUIC
+  `StreamReset` or connection termination -- not a bare timeout
+  (`post-boundary explicit rejection: True`). The server's own log for
+  this run shows a clean, non-forced drain: `"http3: graceful drain
+  started ..."` followed by `"Graceful shutdown complete (forced_closes=0
+  drain_timed_out=false)"`.
 
 Both pass on `v0.6.3` and on the final head (this specific QUIC-transport
 cancellation/drain machinery predates this PR and was not touched by it);
 the resource-settle cycle loop above now also does connect/request/
-**cancel**/close for its H3 leg via the same cancellation script, not just
+**cancel**/close for its H3 leg via the cancellation script, not just
 connect/request/close.
+
+**Discovered while building the drain row, recorded as a follow-up
+observation, not a #677/#694 blocker:** on an otherwise-idle H3 connection
+(no traffic since admission), the drain GOAWAY frame took on the order of
+10 seconds to actually reach the peer in repeated local runs --
+comfortably inside the 30-second graceful-shutdown deadline the drain
+contract itself promises (`"Shutdown requested; draining active
+connection work (timeout=30000ms ...)"`), but tight against this harness's
+previous default 10-second `TARDIGRADE_UPSTREAM_TIMEOUT_MS`, which could
+spuriously 504 an admitted in-flight *proxied* request hitting this exact
+idle-connection-plus-rolling-restart combination. The black-box instance
+now sets `TARDIGRADE_UPSTREAM_TIMEOUT_MS=25000` so this row proves the
+actual contract rather than racing an unrelated, tighter proxy timeout.
+Root-causing the ~10s figure itself (a QUIC pacing/idle-timer
+characteristic, not an outright protocol violation -- the outer deadline
+is still honored) is out of scope for this correctness sweep; noted here
+for whoever next touches H3 pacing/drain internals.
 
 ### External H3 peer matrix (`scripts/interop/run-interop.sh`)
 
@@ -234,8 +258,8 @@ zig build test-integration --summary all --error-style verbose
 zig build test-quic --summary all --error-style verbose
 ```
 
-All three passed with no failures on commit `bcf17040`: `test`:
-`3887/3897` (10 skipped), `test-integration`: `180/199` (19 skipped, no
+All three passed with no failures on commit `447104c3`: `test`:
+`3889/3899` (10 skipped), `test-integration`: `180/199` (19 skipped, no
 `H3_INTEROP_CLIENT_PATH` configured for this particular invocation --
 see the peer-wired reruns above for that coverage), `test-quic`:
 `984/984`.
@@ -326,12 +350,44 @@ see the peer-wired reruns above for that coverage), `test-quic`:
    correctly already `0` for 304 and the partial-range length for 206) for
    HEAD in both functions, with two new regressions: one for the top-level
    fallback, one for the pre-existing location-block path.
+10. **H3 HEAD/GET gzip-representation mismatch, in item 9's own fix**
+    (`src/gateway_handlers.zig`): item 9's fix used the *uncompressed*
+    `served.content_length` unconditionally, but both functions skip
+    `compressResponse()` entirely for HEAD. When the client sends
+    `Accept-Encoding: gzip` and the file is compressible, GET returns a
+    gzip body with `Content-Encoding: gzip`, `Vary: Accept-Encoding`, and
+    the *compressed* Content-Length, while HEAD reported the uncompressed
+    length and omitted those headers -- HEAD metadata disagreed with what
+    its own GET actually returns. Fixed by computing compression from the
+    GET-equivalent representation regardless of method (mirroring the H1
+    static owner in `gateway_static_runtime.zig`, which already gets this
+    right), then only suppressing the transmitted body bytes for HEAD.
+    Added GET-vs-HEAD gzip-parity regressions for both paths.
+11. **`aioquic_drain_client.py` inferred the drain boundary from silence**
+    (harness, `scripts/interop/aioquic_drain_client.py`): the "pre-drain"
+    request had already completed *before* the script signaled readiness,
+    so no request was actually in flight when `SIGTERM` fired, and a bare
+    timeout on the post-signal request counted as proof of refusal --
+    which an abruptly dead connection would also satisfy without proving
+    anything about the drain contract. Rewritten so every half is an
+    observed protocol event: a deliberately slow upstream route (new,
+    added to the embedded upstream server) admits the request (writing a
+    marker) before blocking on a release marker, giving a genuinely
+    in-flight admitted request across `SIGTERM`; an `ObservingH3Connection`
+    subclass intercepts the actual GOAWAY control frame (aioquic does not
+    surface it as a public event); the admitted request is required to
+    complete with 200 after release; and a new stream beyond the boundary
+    must produce an explicit QUIC `StreamReset` or connection termination,
+    not a timeout. See "H3 cancellation and GOAWAY/drain" above for the
+    full sequence and the ~10s idle-GOAWAY-latency observation this
+    surfaced.
 
 Items 1-3 and 5 are the four blockers from the prior `#694` review pass.
 Items 4, 6, 7, 8 were found while re-verifying the fix for item 5 against
 real external peers. Item 9 was found by the next review round on item 4's
-own fix. Each has a focused regression and was re-verified against the
-exact final commit above.
+own fix. Items 10 and 11 were found by a third review round, on item 9's
+own fix and on the round-2 drain client respectively. Each has a focused
+regression and was re-verified against the exact final commit above.
 
 ### Browser-client disposition
 
