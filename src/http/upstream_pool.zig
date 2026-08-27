@@ -209,6 +209,7 @@ const HostEntry = struct {
 };
 
 const max_quarantine_drain_batch = 8;
+const max_quarantine_drain_per_host = 1;
 
 pub const UpstreamPool = struct {
     allocator: std.mem.Allocator,
@@ -723,7 +724,8 @@ pub const UpstreamPool = struct {
                 {
                     const list = &entry.value_ptr.quarantined;
                     var i: usize = 0;
-                    while (i < list.items.len) {
+                    var host_taken: usize = 0;
+                    while (i < list.items.len and host_taken < max_quarantine_drain_per_host) {
                         const conn = list.items[i];
                         if (self.isExpired(conn, now_ms)) {
                             self.closeConn(list.orderedRemove(i));
@@ -735,6 +737,7 @@ pub const UpstreamPool = struct {
                                 .conn = list.orderedRemove(i),
                             };
                             batch_len += 1;
+                            host_taken += 1;
                             continue;
                         }
                         i += 1;
@@ -797,12 +800,10 @@ pub const UpstreamPool = struct {
                         };
                     },
                     else => {
-                        recordRejectedReadiness(entry, candidate.readiness);
                         self.closeConn(candidate.conn);
                     },
                 },
                 .plaintext => {
-                    recordRejectedReadiness(entry, candidate.readiness);
                     self.closeConn(candidate.conn);
                 },
             }
@@ -1158,8 +1159,70 @@ test "reapIdle moves only a bounded quarantined batch back to retained capacity"
     pool.reapIdle(0);
 
     const retained = pool.hosts.getPtr("h:80").?;
-    try testing.expectEqual(@as(usize, max_quarantine_drain_batch), retained.idle.items.len);
-    try testing.expectEqual(@as(usize, 2), retained.quarantined.items.len);
+    try testing.expectEqual(@as(usize, 1), retained.idle.items.len);
+    try testing.expectEqual(@as(usize, max_quarantine_drain_batch + 1), retained.quarantined.items.len);
+}
+
+test "reapIdle quarantine resolution does not add checkout retry counters" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const fds = try testPair();
+    defer _ = std.c.close(fds[1]);
+
+    const entry = pool.hostEntry("h:80") orelse return error.TestUnexpectedResult;
+    try entry.quarantined.append(testing.allocator, .{
+        .stream = compat.netStreamFromFd(fds[0]),
+        .created_ms = 0,
+        .last_used_ms = 0,
+    });
+    entry.stats.checkout_quarantined_tls_incomplete = 1;
+    entry.stats.stale_retries_total = 1;
+
+    const ghost = "G";
+    _ = std.c.write(fds[1], ghost.ptr, ghost.len);
+    pool.reapIdle(0);
+
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 1), agg.stale_retries_total);
+    try testing.expectEqual(@as(u64, 1), agg.checkout_quarantined_tls_incomplete);
+    try testing.expectEqual(@as(u64, 0), agg.checkout_stale_plaintext_unexpected);
+    try testing.expectEqual(@as(usize, 0), pool.hosts.getPtr("h:80").?.quarantined.items.len);
+}
+
+test "reapIdle services later origins despite an earlier quarantine backlog" {
+    var pool = UpstreamPool.init(testing.allocator, .{ .max_idle_per_host = max_quarantine_drain_batch + 1 });
+    defer pool.deinit();
+    var peer_fds: [max_quarantine_drain_batch + 1]std.posix.fd_t = undefined;
+    var peer_count: usize = 0;
+    defer {
+        for (peer_fds[0..peer_count]) |fd| _ = std.c.close(fd);
+    }
+
+    const noisy = pool.hostEntry("a:80") orelse return error.TestUnexpectedResult;
+    for (0..max_quarantine_drain_batch) |_| {
+        const fds = try testPair();
+        peer_fds[peer_count] = fds[1];
+        peer_count += 1;
+        try noisy.quarantined.append(testing.allocator, .{
+            .stream = compat.netStreamFromFd(fds[0]),
+            .created_ms = 0,
+            .last_used_ms = 0,
+        });
+    }
+    const quiet_pair = try testPair();
+    peer_fds[peer_count] = quiet_pair[1];
+    peer_count += 1;
+    const quiet = pool.hostEntry("b:80") orelse return error.TestUnexpectedResult;
+    try quiet.quarantined.append(testing.allocator, .{
+        .stream = compat.netStreamFromFd(quiet_pair[0]),
+        .created_ms = 0,
+        .last_used_ms = 0,
+    });
+
+    pool.reapIdle(0);
+
+    try testing.expectEqual(@as(usize, 1), pool.hosts.getPtr("b:80").?.idle.items.len);
+    try testing.expectEqual(@as(usize, 0), pool.hosts.getPtr("b:80").?.quarantined.items.len);
 }
 
 test "reapIdle evicts aged connections and refreshes the gauge" {
