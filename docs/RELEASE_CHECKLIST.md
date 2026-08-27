@@ -9,6 +9,11 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] `zig build test-integration`
 - [ ] For any HTTP/3 support-status change, complete the closeout evidence
       contract in [HTTP3_VALIDATION_EVIDENCE.md](HTTP3_VALIDATION_EVIDENCE.md)
+- [ ] Run the full TLS conformance/interop matrix
+      (`scripts/interop/run-tls-interop.sh --profile full`) with both OpenSSL
+      and GnuTLS peer tooling installed and record a fresh hardening result
+      for zero unexplained FAIL/SKIP rows, following the pattern in
+      [TLS_INTEROP_HARDENING_674.md](TLS_INTEROP_HARDENING_674.md)
 
 ## Performance
 
