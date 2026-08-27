@@ -450,6 +450,19 @@ pub const UpstreamTlsConn = struct {
     /// uses before ever calling `waitForFd()`. Fails closed (reports
     /// "ready", i.e. do not reuse) on a drive error or on hitting the
     /// iteration bound, rather than risking a false "clean" result.
+    ///
+    /// A stalled drive (`made_progress == false`) is not by itself proof of
+    /// "nothing pending": `drive()` can consume a prefix of a record into
+    /// the parser without ever producing plaintext, if the record is only
+    /// partially present. A hostile origin can trickle a ghost response's
+    /// first few ciphertext bytes before release and complete it only after
+    /// the connection is checked out again, and a check that only looks at
+    /// `inbound_plaintext`/`peer_closed` would call that "clean" the moment
+    /// the drive stalls waiting for the rest (#673 review round 10). So a
+    /// stall is only treated as clean if the record layer isn't still
+    /// holding onto anything -- raw carrier bytes not yet parsed, or a
+    /// parser mid-record -- via the same three buffers
+    /// `inboundCiphertextOwned()` sums internally.
     pub fn drainQueuedRecordsAndCheckReady(self: *UpstreamTlsConn) bool {
         const record = &self.state.record;
         var iterations: usize = 0;
@@ -459,7 +472,10 @@ pub const UpstreamTlsConn = struct {
             iterations += 1;
             const result = record.drive() catch return true;
             if (record.inbound_plaintext.len > 0 or record.peer_closed) return true;
-            if (!result.made_progress) return false;
+            if (!result.made_progress) {
+                const owned_ciphertext = record.inbound_carrier.len + record.initial_parser.len + record.ciphertext_parser.len;
+                return owned_ciphertext > 0;
+            }
         }
     }
 

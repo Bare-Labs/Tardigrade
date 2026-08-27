@@ -360,32 +360,31 @@ pub const UpstreamPool = struct {
     /// essentially every freshly-pooled TLS connection as "stale" and
     /// defeat TLS connection pooling outright (caught by an integration
     /// test asserting a second proxied HTTPS request reuses the pooled
-    /// connection). Use `UpstreamTlsConn.readReady()` instead: it reports
-    /// only already-decrypted, buffered plaintext the record layer has
-    /// promoted to application data (`pending() > 0`), or a completed
-    /// clean TLS shutdown (`close_notify`) — genuine signals that this
-    /// connection actually has something an unrelated caller should not
-    /// see, without decoding the mere presence of encrypted bytes as
-    /// staleness.
+    /// connection).
     ///
-    /// This does not catch every conceivable timing of a hostile TLS
-    /// origin's ghost bytes (raw ciphertext that has arrived but not yet
-    /// been fed through the record layer looks the same as "nothing
-    /// pending" here) -- #673 review round 8 correctly flagged this gap and
-    /// a nonblocking-drive-then-check variant
-    /// (`UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`) was built to
-    /// close it. That variant passed locally and in this platform's CI, but
-    /// broke `"native upstream https: two proxied requests reuse the
-    /// pooled TLS connection"` on Linux ARM CI specifically (reused_total
-    /// stayed at 0), indicating a cross-platform behavior difference in the
-    /// drive loop that could not be safely root-caused without access to
-    /// that environment. Reverted to `readReady()` -- proven stable across
-    /// every CI platform -- rather than ship an active-draining approach
-    /// with an unexplained platform-dependent failure mode. This is a
-    /// strict improvement over having no TLS staleness check at all (the
-    /// pre-round-7 state), even though it does not fully close the
-    /// undriven-ghost-ciphertext gap; see `docs/SECURITY_TEST_PLAN.md`
-    /// defect 27 for the honestly-scoped remaining gap.
+    /// TLS connections currently use
+    /// `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which
+    /// nonblockingly drives the record layer through everything already
+    /// queued before deciding, and fails closed if it still owns any
+    /// not-yet-resolved ciphertext once the drive stalls (a partial record
+    /// is not proof of "nothing pending" -- see that function's doc comment
+    /// in `src/http/upstream_tls.zig` for the full rationale, including a
+    /// round-10 fix for a prefix-consumed-without-plaintext false-clean
+    /// gap). A simpler alternative, `readReady()` (already-decrypted
+    /// plaintext or a completed clean shutdown only, never driving new
+    /// ciphertext), is kept available on `UpstreamTlsConn` as a fallback:
+    /// this drive-based approach previously caused a Linux-ARM-only CI
+    /// failure on the pooled-TLS-reuse integration test that could not be
+    /// reproduced or explained, prompting a revert to `readReady()` that a
+    /// documentation/code mismatch briefly failed to actually apply in code
+    /// (#673 review round 10). It was re-enabled, with the false-clean gap
+    /// above fixed, once the reviewer's own re-review of the exact reverted
+    /// head observed the previously-failing Linux ARM job passing on this
+    /// same drive-based code -- evidence the original failure was more
+    /// likely transient than a deterministic platform difference. If a
+    /// genuine platform-specific failure resurfaces, prefer reverting this
+    /// one line to `tls.readReady()` over re-diagnosing under pressure; see
+    /// `docs/SECURITY_TEST_PLAN.md` defect 27 for the full history.
     fn hasUnexpectedReadableBytes(conn: PooledConn) bool {
         if (conn.tls) |tls| return tls.drainQueuedRecordsAndCheckReady();
         var pfds = [_]std.posix.pollfd{.{

@@ -547,34 +547,84 @@ deterministic regression tests:
     `read()`/`writeAll()` drive decrypts the ghost as if it were the
     unrelated next request's response.
 
-    **Attempted fix, reverted after a cross-platform CI failure**: added
-    `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which nonblockingly
-    drives the record layer through everything currently queued on the raw
-    fd (the fd is already nonblocking for this client, so `drive()` never
-    waits on the network -- the same primitive `read()` itself uses before
-    ever calling `waitForFd()`) and reports "do not reuse" only if genuine
-    application plaintext or a clean shutdown actually emerges from that.
-    This passed locally (macOS) and in that platform's own CI run, but
-    broke `"native upstream https: two proxied requests reuse the pooled
-    TLS connection"` on Linux ARM CI specifically (`reused_total` stayed at
-    0) -- a cross-platform behavior difference in the drive loop that could
-    not be safely root-caused without access to that environment. Reverted
-    to `readReady()` rather than ship an active-draining approach with an
-    unexplained platform-dependent failure mode; `drainQueuedRecordsAndCheckReady()`
-    remains in `src/http/upstream_tls.zig` as dead code pending a safe fix,
-    not wired into `UpstreamPool.checkout()`.
+    Fixed with `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which
+    nonblockingly drives the record layer through everything currently
+    queued on the raw fd (the fd is already nonblocking for this client, so
+    `drive()` never waits on the network -- the same primitive `read()`
+    itself uses before ever calling `waitForFd()`) and reports "do not
+    reuse" only if genuine application plaintext or a clean shutdown
+    actually emerges from that, correctly letting protocol-only traffic
+    like a `NewSessionTicket` through without discarding a still-healthy
+    connection. This is the function actually wired into
+    `UpstreamPool.checkout()` (`hasUnexpectedReadableBytes()` in
+    `src/http/upstream_pool.zig`) as of this writing; the simpler
+    `readReady()` (already-decrypted plaintext or a completed clean
+    shutdown only) remains defined on `UpstreamTlsConn` as a documented
+    fallback, not currently called from the pool.
 
-    **Remaining gap**: `readReady()` does not catch a hostile TLS origin's
-    ghost application-data record that has arrived as raw, not-yet-driven
-    ciphertext -- this is a real, currently-open gap, not merely an
-    untested one. It is a strict improvement over having no TLS staleness
-    check at all (the pre-round-7 state, when `checkout()` never examined a
-    TLS connection's readiness before reuse), but does not fully close
-    defect 25 for TLS upstreams specifically. Safely closing it requires
-    either root-causing the platform-specific drive-loop failure (which
-    would need Linux ARM access this session did not have) or building new
-    in-process two-sided TLS handshake test infrastructure to validate a
-    fix with confidence before shipping it -- tracked as follow-up work.
+    **This fix has a two-round history worth recording in full, because
+    both rounds surfaced real problems:**
+
+    Round 8's first version of the drive-based fix passed locally (macOS)
+    and in that platform's own CI, but broke `"native upstream https: two
+    proxied requests reuse the pooled TLS connection"` on **Linux ARM CI**
+    specifically (`reused_total` stayed at 0). Round 9 could not safely
+    root-cause a cross-platform behavior difference without access to that
+    environment, and reverted the intended call site to `readReady()` --
+    but the revert was only made in the doc comment, PR description,
+    `CHANGELOG.md`, and this file; the actual `return` statement in
+    `hasUnexpectedReadableBytes()` still called
+    `tls.drainQueuedRecordsAndCheckReady()`. Round 10's re-review caught
+    this code/documentation mismatch directly: the shipped commit was
+    running the drive-based behavior the surrounding text claimed had been
+    removed. This is itself the kind of gap this whole campaign exists to
+    catch -- an unreviewed discrepancy between what the evidence describes
+    and what the binary actually does -- so it is recorded here rather than
+    quietly corrected without a trace.
+
+    Separately, round 10 also found a genuine logic gap in the drive-based
+    check itself: a stalled drive (`made_progress == false`, meaning no
+    more progress is possible without waiting for more bytes) is not by
+    itself proof that nothing is pending. `drive()` can consume a prefix of
+    a record into the parser without ever producing plaintext, if the
+    record is only partially present on the wire -- so a hostile origin
+    could trickle a ghost response's first few ciphertext bytes before
+    release and complete it only after the connection is checked out again,
+    and the original check would call that stall "clean" the moment it
+    happened. Fixed by also checking, whenever the drive stalls, whether
+    the record layer still owns any not-yet-resolved ciphertext -- the sum
+    of `inbound_carrier.len + initial_parser.len + ciphertext_parser.len`,
+    the same three buffers `PureZigRecordStream`'s own (private)
+    `inboundCiphertextOwned()` sums internally -- and failing closed
+    (treating the connection as unsafe to reuse) if that sum is nonzero.
+
+    Once both issues were fixed, the corrected code/doc-consistent
+    drive-based check was re-enabled as the active `checkout()` behavior.
+    The reviewer's own re-review of the exact (mismatched) reverted head
+    observed the previously-failing Linux ARM CI job passing on that same
+    drive-based code -- evidence the original Linux ARM failure was more
+    likely transient (a CI-environment race, similar to this same
+    workflow's already-observed flaky "best-effort, not CI-gated" H2 test)
+    than a deterministic platform difference in the drive logic itself,
+    though this could not be proven with certainty absent direct access to
+    that environment.
+
+    **Known coverage gap**: this fix's correctness rests on code review
+    (draining through the exact primitive `read()` already trusts in
+    production, plus the now-closed partial-ciphertext gap) and on
+    cross-platform CI -- including the Linux ARM job that previously
+    failed -- rather than on a dedicated deterministic unit test that
+    drives a real two-sided TLS handshake and injects a hostile ghost
+    record before checkout. Building that requires in-process client+server
+    TLS handshake test infrastructure this codebase does not currently
+    have (the only precedent, `test-integration-native-tls`, spawns two
+    full separate `tardi` processes, which cannot be made to act hostile
+    without a purpose-built malicious TLS origin) -- tracked as follow-up
+    work rather than blocking this fix. If a genuine, reproducible
+    platform-specific failure resurfaces, the safest immediate mitigation
+    is reverting `hasUnexpectedReadableBytes()`'s TLS branch to
+    `tls.readReady()` (one line, `src/http/upstream_pool.zig`) while
+    re-diagnosing, rather than attempting a fix under time pressure again.
 28. `isValidHeaderName()` -- the function `isValidTrailerLine()` (defect 26)
     delegates field-name validation to -- claimed to implement RFC 7230
     §3.2.6's `token`/`tchar` grammar but actually only rejected control

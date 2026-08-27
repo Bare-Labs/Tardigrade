@@ -469,21 +469,24 @@ application data — that ciphertext shows up as immediately readable on the
 raw fd regardless, which would flag essentially every freshly-pooled TLS
 connection as stale and defeat TLS connection pooling outright.
 
-TLS connections check `UpstreamTlsConn.readReady()`: already-decrypted
-buffered plaintext, or a completed clean TLS shutdown. This only reflects
-what a *prior* `read()` call already decrypted — a hostile TLS origin's
-ghost application-data record can already be queued as raw ciphertext on
-the fd, not yet fed through the record layer, and `readReady()` reports
-"nothing pending" for that exactly as it would for a harmless session
-ticket (#673 review round 8). A fix closing that gap
-(`UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`, which nonblockingly
-drives the record layer through everything queued before checking) was
-built and passed on this platform, but broke TLS connection pooling on
-Linux ARM CI specifically for reasons that could not be safely
-root-caused without access to that environment, and was reverted (#673
-review round 9) — see `docs/SECURITY_TEST_PLAN.md` defect 27 for the
-current, honestly-open state of this gap. `drainQueuedRecordsAndCheckReady()`
-remains defined in `src/http/upstream_tls.zig` but is not currently called.
+TLS connections check `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()`:
+it nonblockingly drives the record layer through everything already
+queued on the raw fd (the fd is already nonblocking for this client, so
+`drive()` never waits on the network) and reports "do not reuse" only if
+genuine application plaintext or a clean shutdown actually emerges from
+that — correctly letting protocol-only traffic like a `NewSessionTicket`
+through, unlike the raw-fd poll a plain connection uses. It also fails
+closed if the record layer still owns any not-yet-resolved ciphertext when
+the drive stalls (a partial record is not proof that nothing is pending —
+a hostile origin could otherwise trickle a ghost response's first bytes
+before release and complete it only after reuse). A simpler alternative,
+`UpstreamTlsConn.readReady()` (already-decrypted plaintext or a completed
+clean shutdown only, never driving new ciphertext), remains defined as a
+documented fallback but is not currently called from the pool; see
+`docs/SECURITY_TEST_PLAN.md` defect 27 for the full history of this
+check, including a Linux-ARM-only CI failure this drive-based approach
+previously caused and a code/documentation mismatch that briefly
+shipped an unapplied revert.
 
 Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `parseBufferedUpstreamResponse()`, `detectResponseFraming()`,
@@ -491,9 +494,9 @@ Implementation: `exchangeBoundedBufferedHttpRequest()`,
 `readUpstreamHead()`/`streamProxyOverTransport()`/`relayUpstreamBody()`
 (the streaming path's equivalents) in `src/gateway_proxy.zig`;
 `UpstreamPool.checkout()`/`hasUnexpectedReadableBytes()` in
-`src/http/upstream_pool.zig`; `UpstreamTlsConn.readReady()`/`pending()`
-(currently used) and `drainQueuedRecordsAndCheckReady()` (defined but not
-currently called; see the reverted-fix note above) in
+`src/http/upstream_pool.zig`;
+`UpstreamTlsConn.drainQueuedRecordsAndCheckReady()` (currently used) and
+`readReady()`/`pending()` (documented fallback, not currently called) in
 `src/http/upstream_tls.zig`.
 
 ## 12. Directory Traversal — Static File Serving

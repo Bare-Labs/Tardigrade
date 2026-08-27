@@ -134,14 +134,18 @@ All notable user-facing changes to Tardigrade are documented here.
     connections (a raw-fd poll on TLS connections flagged routine
     post-handshake protocol chatter, e.g. session tickets, as staleness and
     broke TLS connection pooling outright -- caught before merge by the
-    native-TLS integration suite), and `UpstreamTlsConn.readReady()` for
-    TLS connections. A follow-up that nonblockingly drove the record layer
-    through queued ciphertext to also catch a hostile origin's
-    not-yet-decrypted ghost record was built and passed locally, but broke
-    TLS connection pooling on Linux ARM CI for reasons not safely
-    root-caused without access to that environment, and was reverted; this
-    gap remains open for TLS upstreams specifically (documented in
-    `docs/SECURITY_TEST_PLAN.md`).
+    native-TLS integration suite), and for TLS connections, nonblockingly
+    driving the record layer through everything already queued and
+    checking whether genuine application plaintext or a clean shutdown
+    emerges -- also failing closed if the record layer still owns
+    unresolved ciphertext when the drive stalls, since a partial record is
+    not proof nothing is pending. This went through two more rounds of
+    scrutiny before landing: a first version broke TLS pooling on Linux ARM
+    CI for reasons not fully explained, prompting an attempted revert that
+    a documentation/code mismatch briefly failed to actually apply; a
+    second review caught both the mismatch and a genuine false-clean gap in
+    the drive logic itself. See `docs/SECURITY_TEST_PLAN.md` defect 27 for
+    the full history.
   - The two newly-added chunked-body trailer checks validated only "does
     this line contain a colon", not real `field-name: value` syntax -- and
     two more production trailer-consuming implementations (the streaming
