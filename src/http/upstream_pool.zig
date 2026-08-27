@@ -247,6 +247,7 @@ pub const UpstreamPool = struct {
     /// Count streaming uploads that requested h2/h2c but still had to use h1
     /// because the h2 pool was unavailable for the exchange.
     h2_streaming_upload_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    quarantine_reap_cursor: usize = 0,
     lock_wait_ns_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     lock_acquires_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -698,7 +699,7 @@ pub const UpstreamPool = struct {
     /// origin's idle gauge. Intended to run from the gateway maintenance tick.
     pub fn reapIdle(self: *UpstreamPool, now_ms: u64) void {
         const QuarantineCandidate = struct {
-            key: []const u8,
+            key: []u8,
             conn: PooledConn,
             readiness: PoolCheckoutReadiness = .clean,
         };
@@ -707,7 +708,11 @@ pub const UpstreamPool = struct {
 
         var lock_wait_ns = self.lock();
         {
+            const start_cursor = if (self.hosts.count() == 0) 0 else self.quarantine_reap_cursor % self.hosts.count();
+            var next_cursor = start_cursor;
+            var saw_candidate = false;
             var it = self.hosts.iterator();
+            var host_index: usize = 0;
             while (it.next()) |entry| {
                 {
                     const list = &entry.value_ptr.idle;
@@ -723,6 +728,10 @@ pub const UpstreamPool = struct {
                 }
                 {
                     const list = &entry.value_ptr.quarantined;
+                    if (host_index < start_cursor) {
+                        host_index += 1;
+                        continue;
+                    }
                     var i: usize = 0;
                     var host_taken: usize = 0;
                     while (i < list.items.len and host_taken < max_quarantine_drain_per_host) {
@@ -732,18 +741,60 @@ pub const UpstreamPool = struct {
                             continue;
                         }
                         if (batch_len < batch.len) {
+                            const key = self.allocator.dupe(u8, entry.key_ptr.*) catch {
+                                i += 1;
+                                continue;
+                            };
                             batch[batch_len] = .{
-                                .key = entry.key_ptr.*,
+                                .key = key,
                                 .conn = list.orderedRemove(i),
                             };
                             batch_len += 1;
                             host_taken += 1;
+                            saw_candidate = true;
+                            next_cursor = host_index + 1;
                             continue;
                         }
                         i += 1;
                     }
                 }
+                host_index += 1;
             }
+            if (batch_len < batch.len and start_cursor > 0) {
+                it = self.hosts.iterator();
+                host_index = 0;
+                while (it.next()) |entry| : (host_index += 1) {
+                    if (host_index >= start_cursor) break;
+                    const list = &entry.value_ptr.quarantined;
+                    var i: usize = 0;
+                    var host_taken: usize = 0;
+                    while (i < list.items.len and host_taken < max_quarantine_drain_per_host) {
+                        const conn = list.items[i];
+                        if (self.isExpired(conn, now_ms)) {
+                            self.closeConn(list.orderedRemove(i));
+                            continue;
+                        }
+                        if (batch_len < batch.len) {
+                            const key = self.allocator.dupe(u8, entry.key_ptr.*) catch {
+                                i += 1;
+                                continue;
+                            };
+                            batch[batch_len] = .{
+                                .key = key,
+                                .conn = list.orderedRemove(i),
+                            };
+                            batch_len += 1;
+                            host_taken += 1;
+                            saw_candidate = true;
+                            next_cursor = host_index + 1;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    if (batch_len >= batch.len) break;
+                }
+            }
+            self.quarantine_reap_cursor = if (saw_candidate and self.hosts.count() > 0) next_cursor % self.hosts.count() else 0;
         }
         self.unlock(lock_wait_ns);
 
@@ -754,6 +805,7 @@ pub const UpstreamPool = struct {
         lock_wait_ns = self.lock();
         defer self.unlock(lock_wait_ns);
         for (batch[0..batch_len]) |candidate| {
+            defer self.allocator.free(candidate.key);
             const entry = self.hosts.getPtr(candidate.key) orelse {
                 self.closeConn(candidate.conn);
                 continue;
@@ -1223,6 +1275,52 @@ test "reapIdle services later origins despite an earlier quarantine backlog" {
 
     try testing.expectEqual(@as(usize, 1), pool.hosts.getPtr("b:80").?.idle.items.len);
     try testing.expectEqual(@as(usize, 0), pool.hosts.getPtr("b:80").?.quarantined.items.len);
+}
+
+test "reapIdle rotates quarantine start across more origins than the global batch" {
+    const host_count = max_quarantine_drain_batch + 1;
+    var pool = UpstreamPool.init(testing.allocator, .{ .max_idle_per_host = 1 });
+    defer pool.deinit();
+    var peer_fds: [host_count]std.posix.fd_t = undefined;
+    var peer_count: usize = 0;
+    defer {
+        for (peer_fds[0..peer_count]) |fd| _ = std.c.close(fd);
+    }
+
+    for (0..host_count) |idx| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "h{d}:80", .{idx});
+        const entry = pool.hostEntry(key) orelse return error.TestUnexpectedResult;
+        const fds = try testPair();
+        peer_fds[peer_count] = fds[1];
+        peer_count += 1;
+        try entry.quarantined.append(testing.allocator, .{
+            .stream = compat.netStreamFromFd(fds[0]),
+            .created_ms = 0,
+            .last_used_ms = 0,
+        });
+    }
+
+    var serviced = [_]bool{false} ** host_count;
+    for (0..host_count) |_| {
+        pool.reapIdle(0);
+        for (0..host_count) |idx| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "h{d}:80", .{idx});
+            const entry = pool.hosts.getPtr(key) orelse return error.TestUnexpectedResult;
+            if (entry.idle.items.len > 0) {
+                serviced[idx] = true;
+                while (entry.idle.pop()) |conn| {
+                    try entry.quarantined.append(testing.allocator, conn);
+                }
+                entry.stats.idle = entry.idle.items.len;
+            }
+        }
+    }
+
+    for (serviced) |was_serviced| {
+        try testing.expect(was_serviced);
+    }
 }
 
 test "reapIdle evicts aged connections and refreshes the gauge" {
