@@ -63,9 +63,13 @@ TARDI_BIN=/path/to/installed-or-release-candidate/tardi \
   scripts/run-http-release-sweep.sh
 ```
 
-That wrapper targets the selected artifact for the integration/H2 rows. Its
-QUIC/H3 unit and interop-tool steps are source-tree regression evidence until a
-black-box H3 row launches the selected `tardi` binary over UDP.
+That wrapper targets the selected artifact for the integration/H2 rows and now
+also invokes `scripts/http-release-blackbox-677.sh` to launch the selected
+`tardi` binary directly for independent `nghttp` H2, Alt-Svc enabled/disabled,
+resource-settle, and optional black-box H3 peer rows. The H3 rows run only when
+the external peer tools are configured (`NGTCP2_EXAMPLES_DIR/gtlsclient` and one
+of `AIOQUIC_PYTHON` or `QUICHE_EXAMPLES_DIR/http3-client`); otherwise the
+wrapper records explicit skips rather than substituting source-tree proof.
 
 PR-safe evidence may record `"supported": false` H3 benchmark rows when the
 local `h2load` is not genuinely QUIC-capable. That proves the harness rejects a

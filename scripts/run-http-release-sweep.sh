@@ -4,8 +4,9 @@
 # By default this targets the first `tardi` on PATH. Set TARDI_BIN to exercise
 # an installed release candidate, Homebrew package, or a local ReleaseFast
 # binary for integration rows without silently substituting the source-tree
-# debug executable. QUIC/H3 unit and interop-tool rows remain source-tree
-# regression evidence until a black-box H3 artifact row is added.
+# debug executable. Black-box H2/H3 artifact rows are run by default after the
+# PR-safe integration gates; set HTTP_SWEEP_SKIP_BLACKBOX=1 to skip optional
+# external-client work in stripped-down environments.
 set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -46,12 +47,18 @@ fi
 evidence_dir="${HTTP_SWEEP_EVIDENCE_DIR:-$repo/.zig-cache/http-release-sweep-677}"
 mkdir -p "$evidence_dir"
 metadata="$evidence_dir/metadata.txt"
+selected_source_path="$tardi_bin"
+artifact_bin="$evidence_dir/selected-tardi"
+cp "$selected_source_path" "$artifact_bin"
+chmod +x "$artifact_bin"
+tardi_bin="$artifact_bin"
 
 {
   printf 'date_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'repo=%s\n' "$repo"
   printf 'git_sha=%s\n' "$(cd "$repo" && git rev-parse HEAD)"
   printf 'git_branch=%s\n' "$(cd "$repo" && git rev-parse --abbrev-ref HEAD)"
+  printf 'selected_source_path=%s\n' "$selected_source_path"
   printf 'tardi_bin=%s\n' "$tardi_bin"
   printf 'tardi_version='
   "$tardi_bin" version 2>&1 || true
@@ -123,6 +130,11 @@ fi
 
 run_step "native HTTP/3 interop tool build" \
   zig build build-h3-interop --summary all --error-style verbose
+
+if ! enabled "${HTTP_SWEEP_SKIP_BLACKBOX:-}"; then
+  run_step "black-box H2/H3 release-artifact rows" \
+    env TARDI_BIN="$tardi_bin" scripts/http-release-blackbox-677.sh
+fi
 
 say ""
 say "==> external HTTP/3 peer matrix"
