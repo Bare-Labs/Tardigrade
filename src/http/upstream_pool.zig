@@ -261,6 +261,8 @@ pub const UpstreamPool = struct {
         while (it.next()) |entry| {
             for (entry.value_ptr.idle.items) |conn| self.closeConn(conn);
             entry.value_ptr.idle.deinit(self.allocator);
+            for (entry.value_ptr.quarantined.items) |conn| self.closeConn(conn);
+            entry.value_ptr.quarantined.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.hosts.deinit();
@@ -699,6 +701,11 @@ pub const UpstreamPool = struct {
                     switch (readiness) {
                         .clean => {
                             _ = list.orderedRemove(i);
+                            if (entry.value_ptr.idle.items.len >= self.config.max_idle_per_host) {
+                                entry.value_ptr.stats.release_rejected_capacity += 1;
+                                self.closeConn(conn);
+                                continue;
+                            }
                             entry.value_ptr.idle.append(self.allocator, conn) catch {
                                 self.closeConn(conn);
                             };
@@ -710,7 +717,7 @@ pub const UpstreamPool = struct {
                             },
                             else => {
                                 self.closeConn(list.orderedRemove(i));
-                            }
+                            },
                         },
                         .plaintext => {
                             self.closeConn(list.orderedRemove(i));
@@ -932,6 +939,7 @@ test "checkout discards an idle connection with an unsolicited ghost byte instea
     try testing.expectEqual(@as(u64, 0), agg.idle);
     try testing.expectEqual(@as(u64, 0), agg.reused_total);
     try testing.expectEqual(@as(u64, 1), agg.stale_retries_total);
+    try testing.expectEqual(@as(u64, 1), agg.checkout_stale_plaintext_unexpected);
 }
 
 test "checkout discards an idle connection the origin already closed instead of reusing it" {
@@ -998,7 +1006,9 @@ test "release drops a connection past the idle timeout" {
     pool.noteNewConnection("h:80");
     // released 2s later, past the 1s idle timeout → closed, not pooled.
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 2000);
-    try testing.expectEqual(@as(u64, 0), pool.aggregateStats().idle);
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 0), agg.idle);
+    try testing.expectEqual(@as(u64, 1), agg.release_rejected_lifetime);
 }
 
 test "release honors max_idle_per_host" {
@@ -1011,7 +1021,9 @@ test "release honors max_idle_per_host" {
 
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(a[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(b[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
-    try testing.expectEqual(@as(u64, 1), pool.aggregateStats().idle);
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 1), agg.idle);
+    try testing.expectEqual(@as(u64, 1), agg.release_rejected_capacity);
 }
 
 test "reapIdle evicts aged connections and refreshes the gauge" {

@@ -484,7 +484,7 @@ pub const UpstreamTlsConn = struct {
             if (record.peer_closed) return .peer_closed;
             if (iterations >= max_drain_iterations) return .drain_budget_exhausted;
             iterations += 1;
-            const result = record.drive() catch |err| { std.debug.print("\nDRIVE ERROR: {any}\n", .{err}); return .drive_error; };
+            const result = record.drive() catch return .drive_error;
             if (record.inbound_plaintext.len > 0) return .{ .application_plaintext = record.inbound_plaintext.len };
             if (record.peer_closed) return .peer_closed;
             if (!result.made_progress) {
