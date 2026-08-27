@@ -21,7 +21,7 @@ Run benchmarks on a dedicated, isolated benchmark target by default.
 # Capture a release baseline JSON + markdown report
 ./benchmarks/release-baseline.sh \
   --meta-file benchmarks/targets/release-baseline.json \
-  --update-readme README.md \
+  --update-report benchmarks/README.md \
   -- \
   --host 127.0.0.1 \
   --pid-file /run/tardigrade/tardigrade.pid \
@@ -67,10 +67,30 @@ The release benchmark flow is now codified in-repo:
 2. Save the JSON under `benchmarks/baselines/<tag>.json`.
 3. Compare against the previous release baseline JSON.
 4. Emit a markdown report next to the JSON.
-5. Refresh the README benchmark block from that saved baseline.
+5. Refresh the generated benchmark report block below from the saved baseline.
 
 `release-baseline.sh` is a thin wrapper over `run.sh` and `report.sh`. It exists
 to keep the release flow consistent rather than to add a second benchmark engine.
+
+## Latest committed benchmark report
+
+Canonical benchmark runs are captured from a dedicated benchmark target, not a
+local laptop fallback run. Saved benchmark JSON records latency percentiles,
+throughput, errors, and optional target CPU/RSS samples.
+
+<!-- BENCHMARK_REPORT_START -->
+| Scenario | req/s | p50 (ms) | p95 (ms) | p99 (ms) | p999 (ms) | CPU % | Peak RSS (MiB) | MB/s | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `keepalive` | 4700 | 0.4 | - | 41.8 | - | - | - | - | 0 |
+| `proxy-http1` | 1724 | 1.3 | - | 114.9 | - | - | - | - | 0 |
+| `static-http1` | 4586 | 0.4 | - | 46.1 | - | - | - | - | 0 |
+
+> **v0.32.0-18-gb44f8c1** · 2026-05-02 · tool: `wrk` · 4 connections · 30s per scenario · host: `127.0.0.1`
+> driver: `loopback (dedicated benchmark target)` · env: `release-baseline` · workers: `2` · config: `release-baseline config`
+> CPU/RSS columns are sampled from the target Tardigrade process only when the run used `--pid` or `--pid-file`; otherwise they remain `-`.
+>
+> Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-report benchmarks/README.md` to refresh this table.
+<!-- BENCHMARK_REPORT_END -->
 
 ## Metadata
 
@@ -164,7 +184,7 @@ These measure raw request throughput and run with whichever tool is auto-detecte
 | `proxy-upload-large` | Reverse proxy 1 MiB fixed-length upload | Requires `k6`; use `TARDIGRADE_PROXY_STREAMING_MODE=full` for upload streaming |
 | `proxy-slow-client-download` | Reverse proxy download through rate-limited clients | Requires `curl`; use PID sampling to compare bounded RSS |
 | `static-http2` | Static file serving over HTTP/2 | Skipped unless tool is `h2load` or `k6` + `--tls` |
-| `proxy-http2` | Reverse proxy route over HTTP/2 | Skipped unless tool is `h2load` |
+| `proxy-http2` | Reverse proxy route over HTTP/2 | Skipped unless `h2load` |
 | `static-http3` | Static file serving over HTTP/3 (QUIC) | Skipped unless `h2load` with `--h3` support **and** `--tls` |
 | `proxy-http3` | Reverse proxy route over HTTP/3 (QUIC) | Skipped unless `h2load` with `--h3` support **and** `--tls` |
 | `keepalive` | Keep-alive connection reuse | — |
@@ -354,15 +374,15 @@ Examples:
 # Print to stdout
 ./benchmarks/report.sh benchmarks/baselines/v0.61.json
 
-# Update the README performance table in-place (between the marker comments)
-./benchmarks/report.sh benchmarks/baselines/v0.61.json --update-readme README.md
+# Update the benchmark report in-place (between the marker comments)
+./benchmarks/report.sh benchmarks/baselines/v0.61.json --update-report benchmarks/README.md
 ```
 
 The table includes req/s, p50, p95, p99, p999, error count, throughput, and
 sampled CPU/RSS columns when process sampling is enabled. Older baselines remain
 readable; missing columns render as `-`.
 To refresh the table after a release, re-run the benchmark with `--save` and then
-re-run `report.sh --update-readme`.
+re-run `report.sh --update-report benchmarks/README.md`.
 
 ## Baseline files
 
