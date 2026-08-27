@@ -19135,8 +19135,27 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     // These are per-upstream-labeled counters (`{upstream="..."}`), not bare
     // values -- an empty label filter matches whatever upstream reported it,
     // since this test only proxies to the one origin above.
-    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_new_total", &.{}) orelse 0) >= 1);
-    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_reused_total", &.{}) orelse 0) >= 1);
+    const new_total = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_new_total", &.{}) orelse 0;
+    const reused_total = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_reused_total", &.{}) orelse 0;
+    const stale_total = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_stale_retries_total", &.{}) orelse 0;
+    const plaintext_unexpected = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_checkout_stale_plaintext_unexpected_total", &.{}) orelse 0;
+    const tls_application_plaintext = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_checkout_stale_tls_application_plaintext_total", &.{}) orelse 0;
+    const tls_peer_closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_checkout_stale_tls_peer_closed_total", &.{}) orelse 0;
+    const tls_drive_error = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_checkout_stale_tls_drive_error_total", &.{}) orelse 0;
+    const tls_drain_budget = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_checkout_stale_tls_drain_budget_total", &.{}) orelse 0;
+    const quarantined_incomplete = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_checkout_quarantined_tls_incomplete_total", &.{}) orelse 0;
+    const release_lifetime = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_release_rejected_lifetime_total", &.{}) orelse 0;
+    const release_capacity = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_release_rejected_capacity_total", &.{}) orelse 0;
+    const release_not_reusable = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_release_not_reusable_total", &.{}) orelse 0;
+    try std.testing.expect(new_total >= 1);
+    if (reused_total < 1) {
+        std.debug.print(
+            "native upstream TLS pool reuse failed: new={d} reused={d} stale={d} plaintext_unexpected={d} tls_application_plaintext={d} tls_peer_closed={d} tls_drive_error={d} tls_drain_budget={d} quarantine_incomplete={d} release_lifetime={d} release_capacity={d} release_not_reusable={d}\n",
+            .{ new_total, reused_total, stale_total, plaintext_unexpected, tls_application_plaintext, tls_peer_closed, tls_drive_error, tls_drain_budget, quarantined_incomplete, release_lifetime, release_capacity, release_not_reusable },
+        );
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(u64, 0), release_not_reusable);
 }
 
 // #645: proves the native upstream HTTPS client accepts an ordinary

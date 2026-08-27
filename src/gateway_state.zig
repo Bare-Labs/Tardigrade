@@ -1781,6 +1781,24 @@ pub const GatewayState = struct {
                 \\# TYPE tardigrade_upstream_pool_connections_active gauge
                 \\# HELP tardigrade_upstream_pool_stale_retries_total Stale-connection retries per origin
                 \\# TYPE tardigrade_upstream_pool_stale_retries_total counter
+                \\# HELP tardigrade_upstream_pool_checkout_stale_plaintext_unexpected_total Plaintext idle checkouts rejected because unexpected bytes or peer state were readable
+                \\# TYPE tardigrade_upstream_pool_checkout_stale_plaintext_unexpected_total counter
+                \\# HELP tardigrade_upstream_pool_checkout_stale_tls_application_plaintext_total TLS idle checkouts rejected because decrypted application data was queued
+                \\# TYPE tardigrade_upstream_pool_checkout_stale_tls_application_plaintext_total counter
+                \\# HELP tardigrade_upstream_pool_checkout_stale_tls_peer_closed_total TLS idle checkouts rejected because peer close was observed
+                \\# TYPE tardigrade_upstream_pool_checkout_stale_tls_peer_closed_total counter
+                \\# HELP tardigrade_upstream_pool_checkout_stale_tls_drive_error_total TLS idle checkouts rejected because record draining failed
+                \\# TYPE tardigrade_upstream_pool_checkout_stale_tls_drive_error_total counter
+                \\# HELP tardigrade_upstream_pool_checkout_stale_tls_drain_budget_total TLS idle checkouts rejected because the bounded drain budget was exhausted
+                \\# TYPE tardigrade_upstream_pool_checkout_stale_tls_drain_budget_total counter
+                \\# HELP tardigrade_upstream_pool_checkout_quarantined_tls_incomplete_total TLS idle checkouts quarantined because incomplete ciphertext needed later draining
+                \\# TYPE tardigrade_upstream_pool_checkout_quarantined_tls_incomplete_total counter
+                \\# HELP tardigrade_upstream_pool_release_rejected_lifetime_total Released upstream connections closed because pool lifetime bounds rejected them
+                \\# TYPE tardigrade_upstream_pool_release_rejected_lifetime_total counter
+                \\# HELP tardigrade_upstream_pool_release_rejected_capacity_total Released upstream connections closed because the idle pool was full
+                \\# TYPE tardigrade_upstream_pool_release_rejected_capacity_total counter
+                \\# HELP tardigrade_upstream_pool_release_not_reusable_total Released upstream connections closed because HTTP response handling marked them non-reusable
+                \\# TYPE tardigrade_upstream_pool_release_not_reusable_total counter
                 \\# HELP tardigrade_upstream_pool_at_capacity_total Checkouts rejected fail-fast at the per-origin active cap
                 \\# TYPE tardigrade_upstream_pool_at_capacity_total counter
                 \\# HELP tardigrade_upstream_pool_reuse_ratio Reuse ratio (reused / (reused + new)) per origin
@@ -1799,6 +1817,15 @@ pub const GatewayState = struct {
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_idle", snap.host, "{d}", .{s.idle});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_active", snap.host, "{d}", .{s.active});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_total", snap.host, "{d}", .{s.stale_retries_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_plaintext_unexpected_total", snap.host, "{d}", .{s.checkout_stale_plaintext_unexpected});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_tls_application_plaintext_total", snap.host, "{d}", .{s.checkout_stale_tls_application_plaintext});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_tls_peer_closed_total", snap.host, "{d}", .{s.checkout_stale_tls_peer_closed});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_tls_drive_error_total", snap.host, "{d}", .{s.checkout_stale_tls_drive_error});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_tls_drain_budget_total", snap.host, "{d}", .{s.checkout_stale_tls_drain_budget});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_quarantined_tls_incomplete_total", snap.host, "{d}", .{s.checkout_quarantined_tls_incomplete});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_release_rejected_lifetime_total", snap.host, "{d}", .{s.release_rejected_lifetime});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_release_rejected_capacity_total", snap.host, "{d}", .{s.release_rejected_capacity});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_release_not_reusable_total", snap.host, "{d}", .{s.release_not_reusable});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_at_capacity_total", snap.host, "{d}", .{s.at_capacity_total});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_reuse_ratio", snap.host, "{d:.4}", .{ratio});
         }

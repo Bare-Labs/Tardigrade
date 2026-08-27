@@ -463,18 +463,43 @@ pub const UpstreamTlsConn = struct {
     /// holding onto anything -- raw carrier bytes not yet parsed, or a
     /// parser mid-record -- via the same three buffers
     /// `inboundCiphertextOwned()` sums internally.
-    pub fn drainQueuedRecordsAndCheckReady(self: *UpstreamTlsConn) bool {
+    pub const CheckoutReadiness = union(enum) {
+        clean,
+        application_plaintext: usize,
+        peer_closed,
+        drive_error,
+        incomplete_ciphertext: struct {
+            inbound_carrier: usize,
+            initial_parser: usize,
+            ciphertext_parser: usize,
+        },
+        drain_budget_exhausted,
+    };
+
+    pub fn drainQueuedRecordsAndCheckReady(self: *UpstreamTlsConn) CheckoutReadiness {
         const record = &self.state.record;
         var iterations: usize = 0;
         while (true) {
-            if (record.inbound_plaintext.len > 0 or record.peer_closed) return true;
-            if (iterations >= max_drain_iterations) return true;
+            if (record.inbound_plaintext.len > 0) return .{ .application_plaintext = record.inbound_plaintext.len };
+            if (record.peer_closed) return .peer_closed;
+            if (iterations >= max_drain_iterations) return .drain_budget_exhausted;
             iterations += 1;
-            const result = record.drive() catch return true;
-            if (record.inbound_plaintext.len > 0 or record.peer_closed) return true;
+            const result = record.drive() catch return .drive_error;
+            if (record.inbound_plaintext.len > 0) return .{ .application_plaintext = record.inbound_plaintext.len };
+            if (record.peer_closed) return .peer_closed;
             if (!result.made_progress) {
-                const owned_ciphertext = record.inbound_carrier.len + record.initial_parser.len + record.ciphertext_parser.len;
-                return owned_ciphertext > 0;
+                const inbound_carrier = record.inbound_carrier.len;
+                const initial_parser = record.initial_parser.len;
+                const ciphertext_parser = record.ciphertext_parser.len;
+                const owned_ciphertext = inbound_carrier + initial_parser + ciphertext_parser;
+                if (owned_ciphertext > 0) {
+                    return .{ .incomplete_ciphertext = .{
+                        .inbound_carrier = inbound_carrier,
+                        .initial_parser = initial_parser,
+                        .ciphertext_parser = ciphertext_parser,
+                    } };
+                }
+                return .clean;
             }
         }
     }
