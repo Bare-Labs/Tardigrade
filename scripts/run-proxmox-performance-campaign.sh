@@ -47,6 +47,7 @@ TUNE_COMPARISON=true
 RUN_COMPETITIVE=true
 RUN_LISTENER_SHARDING=false
 RUN_BACKEND_COMPARISON=false
+SMOKE=false
 
 LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-$repo/benchmarks/results/$(date -u '+%Y-%m-%d')/proxmox-${PROXMOX_MODE}-campaign-${timestamp}}"
 REMOTE_STAGE="${REMOTE_STAGE:-/tmp/tardigrade-proxmox-perf-${timestamp}}"
@@ -93,6 +94,7 @@ Options:
   --servers LIST            Competitive servers (default: all four)
   --suite NAME              competitive, listener-sharding, backend-comparison.
                             May be passed more than once. Default: competitive.
+  --smoke                   Pass reduced competitive smoke profile through
   --shards N                Listener-sharding profile count (default: 4)
   --k6-version VERSION      k6 release tag/version, or latest (default: latest)
   --allow-missing           Pass --allow-missing to competitive run
@@ -154,6 +156,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --allow-missing) ALLOW_MISSING=true; shift ;;
+    --smoke) SMOKE=true; shift ;;
     --no-tune-comparison) TUNE_COMPARISON=false; shift ;;
     --noncanonical) PROXMOX_NONCANONICAL=true; shift ;;
     --out-dir) LOCAL_OUT_DIR="$2"; shift 2 ;;
@@ -267,6 +270,7 @@ write_param THREADS "$THREADS"
 write_param SHARDS "$SHARDS"
 write_param ALLOW_MISSING "$ALLOW_MISSING"
 write_param TUNE_COMPARISON "$TUNE_COMPARISON"
+write_param SMOKE "$SMOKE"
 write_param RUN_COMPETITIVE "$RUN_COMPETITIVE"
 write_param RUN_LISTENER_SHARDING "$RUN_LISTENER_SHARDING"
 write_param RUN_BACKEND_COMPARISON "$RUN_BACKEND_COMPARISON"
@@ -369,7 +373,7 @@ run_guest() {
   if [[ "$PROXMOX_MODE" == lxc-smoke ]]; then
     pct exec "$guest_id" -- bash -lc "$cmd"
   else
-    ssh -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$guest_ssh_host" "$cmd"
+    ssh -n -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$guest_ssh_host" "$cmd"
   fi
 }
 
@@ -579,7 +583,7 @@ EOF
     if [[ -n "$guest_ip" ]]; then
       set_guest_ssh_targets
     fi
-    if [[ -n "$guest_ip" ]] && ssh -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 "root@$guest_ssh_host" 'test -r /etc/os-release && getent hosts deb.debian.org >/dev/null 2>&1' >/dev/null 2>&1; then
+    if [[ -n "$guest_ip" ]] && ssh -n -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 "root@$guest_ssh_host" 'test -r /etc/os-release && getent hosts deb.debian.org >/dev/null 2>&1' >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
@@ -605,11 +609,17 @@ install_guest_dependencies() {
   run_guest '
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y ca-certificates curl xz-utils tar jq wrk nginx haproxy caddy nghttp2-client openssl python3 procps iproute2 psmisc coreutils findutils gawk strace linux-perf git build-essential autoconf automake libtool pkg-config cmake libev-dev zlib1g-dev libc-ares-dev libssl-dev libxml2-dev libevent-dev libjansson-dev
+    for _ in $(seq 1 180); do
+      if ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x apt >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+    apt-get -o DPkg::Lock::Timeout=300 update
+    apt-get -o DPkg::Lock::Timeout=300 install -y ca-certificates curl xz-utils tar jq wrk nginx haproxy caddy nghttp2-client openssl python3 procps iproute2 psmisc coreutils findutils gawk strace linux-perf git build-essential autoconf automake libtool pkg-config cmake libev-dev zlib1g-dev libc-ares-dev libssl-dev libxml2-dev libevent-dev libjansson-dev
     if ! command -v k6 >/dev/null 2>&1; then
       if apt-cache show k6 >/dev/null 2>&1; then
-        apt-get install -y k6
+        apt-get -o DPkg::Lock::Timeout=300 install -y k6
       else
         tag="'"$K6_VERSION"'"
         if [[ "$tag" == "latest" ]]; then
@@ -734,7 +744,7 @@ ensure_quic_h2load() {
     PKG_CONFIG_PATH="$h2load_prefix/lib/pkgconfig" \
       LDFLAGS="-Wl,-rpath,$h2load_prefix/lib" \
       ./configure --prefix="$h2load_prefix" --enable-app --enable-http3 --without-libxml2 --without-jemalloc --without-libsystemd --without-mruby
-    make -j"$jobs" h2load
+    make -j"$jobs"
     make install
   )
   test -x "$h2load_bin"
@@ -814,8 +824,9 @@ EOF
     wait "$probe_pid" >/dev/null 2>&1 || true
     die "io_uring startup probe failed health check"
   fi
-  if ! grep -q 'io_uring' "$probe_log"; then
+  if ! grep -R -q 'io_uring' "$probe_dir"; then
     cat "$probe_log" >&2 || true
+    cat "$probe_dir/error.log" >&2 || true
     kill "$probe_pid" >/dev/null 2>&1 || true
     wait "$probe_pid" >/dev/null 2>&1 || true
     die "io_uring startup probe did not prove selected backend"
@@ -834,6 +845,7 @@ fi
 
 if [[ "$RUN_COMPETITIVE" == true ]]; then
   args=(./benchmarks/competitive/run.sh --binary ./zig-out/bin/tardi --servers "$SERVERS" --duration "$DURATION" --connections "$CONNECTIONS" --threads "$THREADS" --out-dir "$out/competitive")
+  if [[ "$SMOKE" == true ]]; then args+=(--smoke); fi
   if [[ "$TUNE_COMPARISON" == true ]]; then args+=(--tune-comparison); fi
   if [[ "$ALLOW_MISSING" == true ]]; then args+=(--allow-missing); fi
   printf '%q ' "${args[@]}" >"$out/competitive-command.txt"
