@@ -18763,8 +18763,19 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     // These are per-upstream-labeled counters (`{upstream="..."}`), not bare
     // values -- an empty label filter matches whatever upstream reported it,
     // since this test only proxies to the one origin above.
-    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_new_total", &.{}) orelse 0) >= 1);
-    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_reused_total", &.{}) orelse 0) >= 1);
+    const new_total = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_new_total", &.{}) orelse 0;
+    const reused_total = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_connections_reused_total", &.{}) orelse 0;
+    const quarantined_incomplete = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_checkout_quarantined_tls_incomplete_total", &.{}) orelse 0;
+    const release_not_reusable = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_release_not_reusable_total", &.{}) orelse 0;
+    try std.testing.expect(new_total >= 1);
+    if (reused_total == 0 and quarantined_incomplete == 0) {
+        std.debug.print(
+            "native upstream TLS pool made no reuse and reported no incomplete-ciphertext quarantine: new_total={d} reused_total={d} quarantined_incomplete={d} release_not_reusable={d}\n",
+            .{ new_total, reused_total, quarantined_incomplete, release_not_reusable },
+        );
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(u64, 0), release_not_reusable);
 }
 
 // #645: proves the native upstream HTTPS client accepts an ordinary
