@@ -188,7 +188,12 @@ final `pass=/fail=/skip=` line and failing the job if `fail` or `skip` is
 non-zero, then running `scripts/interop/run-h3-peer-ci.sh` against the pinned
 external H3 peer, and uploading the row list, matrix logs, and H3 peer log as
 a 90-day retained Actions artifact (never the generated `certs/`
-directories).
+directories). `workflow_dispatch` only becomes callable through the GitHub
+API once a workflow file exists on the repository's default branch, so this
+PR could not dispatch it directly before merge; the "H3 external peer"
+section below instead reproduces the workflow's exact pipeline directly for
+this PR's evidence, and the workflow itself takes over as the ongoing gate
+(manual dispatch or the weekly schedule) once merged.
 
 ## H3 external peer — pinned peer, real QUIC/UDP/H3 exchange
 
@@ -197,9 +202,10 @@ directories).
 example peer from source, and are written specifically for a Debian/Ubuntu CI
 runner (`apt-get`, a pinned `clang` toolchain, and Debian-only C++ standard
 library packages), none of which exist on this Darwin/arm64 hardening host.
-The `tls-conformance-full.yml` workflow above runs this exact pipeline on
-`ubuntu-latest` instead, giving #674 a real, repeatable external-peer run
-rather than a permanently-deferred one.
+`tls-conformance-full.yml` runs this exact pipeline on `ubuntu-latest`; for
+this PR's evidence (before the workflow is dispatchable — see above) the same
+pipeline was run directly, unmodified, in a disposable `ubuntu:24.04`
+container against this PR's source tree.
 
 - Native QUIC loopback rows (18/18 tuples PASS, in the full-profile run
   above) prove the same engine's QUIC transport negotiates every supported
@@ -207,10 +213,13 @@ rather than a permanently-deferred one.
 - The external-peer run (`install-h3-peer-deps-ci.sh` →
   `build-h3-peer-ci.sh` → `scripts/interop/run-h3-peer-ci.sh`, which drives
   `scripts/interop/run-interop.sh` against the pinned peer and additionally
-  asserts the two `#333` HRR peer-matrix rows by name) is captured in
-  [`evidence/674-tls-interop-hardening/h3-external-peer-run.md`](evidence/674-tls-interop-hardening/h3-external-peer-run.md),
-  with the peer version/build identity, the workflow run link, and the
-  sanitized matrix log.
+  asserts the two `#333` HRR peer-matrix rows by name) result: **4 passed, 0
+  failed** (native↔external-peer both directions, plus both `#333` HRR
+  directions by name), 4 `SKIP` for the quiche/aioquic peers this pipeline
+  does not build (out of #674's scope; see the evidence doc). Peer
+  version/build identity and the sanitized matrix + HRR diagnostic logs are
+  at
+  [`evidence/674-tls-interop-hardening/h3-external-peer-run.md`](evidence/674-tls-interop-hardening/h3-external-peer-run.md).
 
 ## Failure handling
 
@@ -228,11 +237,11 @@ added.
 - Zero unexplained applicable SKIP rows. ✅
 - HRR, KeyUpdate, record-size-limit, shutdown/truncation, and negative
   negotiation rows are explicitly covered. ✅
-- H3 external-peer rows prove real QUIC/UDP exchange: run via
-  `tls-conformance-full.yml` on `ubuntu-latest` against the pinned external
-  peer; see
+- H3 external-peer rows prove real QUIC/UDP exchange: run against the pinned
+  external peer via `tls-conformance-full.yml`'s exact pipeline; see
   [`evidence/674-tls-interop-hardening/h3-external-peer-run.md`](evidence/674-tls-interop-hardening/h3-external-peer-run.md)
-  for the run link, peer version, and result. ✅
+  for peer version/build identity and result (4 passed / 0 failed, both
+  `#333` HRR directions by name). ✅
 - Every discovered defect has a focused regression and rerun evidence: N/A,
   zero defects discovered in this pass.
 - This result is linked from [`docs/RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md)

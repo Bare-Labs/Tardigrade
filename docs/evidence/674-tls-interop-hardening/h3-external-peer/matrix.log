@@ -1,0 +1,11 @@
+generating interop certificates in /tmp/h3-peer-interop/certs
+native client -> ngtcp2 gtlsserver             PASS
+ngtcp2 gtlsclient -> native server             PASS
+#333 native HRR client -> ngtcp2 gtlsserver    PASS
+#333 ngtcp2 HRR gtlsclient -> native server    PASS
+native client -> quiche http3-server           SKIP
+quiche http3-client -> native server           SKIP
+native client -> aioquic server (optional)     SKIP
+aioquic client -> native server (optional)     SKIP
+
+interop summary: 4 passed, 0 failed, 4 skipped (logs: /tmp/h3-peer-interop/logs)
