@@ -47,6 +47,16 @@ pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
         error.UpstreamAtCapacity,
         error.ProxyBudgetExhausted,
         error.CircuitOpen,
+        // Same reasoning as ProxyBufferCapacityUnavailable/
+        // RequestBufferLimitExceeded just above: classifyUpstreamError()
+        // correctly tells the client this is a local
+        // TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES limit, not the
+        // upstream's fault, so it must not also poison circuit-breaker
+        // health here -- a perfectly healthy origin that happens to answer
+        // with a response over the configured buffer limit would otherwise
+        // burn health/open the circuit for a problem the origin didn't
+        // cause and a retry can't fix.
+        error.StreamTooLong,
         => false,
         else => true,
     };
@@ -2758,4 +2768,24 @@ test "classifyUpstreamError: StreamTooLong reports the real cause instead of a g
     try std.testing.expectEqual(http.Status.bad_gateway, other.status);
     try std.testing.expectEqualStrings("upstream_error", other.code);
     try std.testing.expectEqualStrings("Upstream connection failed", other.message);
+}
+
+test "proxyAttemptErrorCountsAsUpstreamFailure: StreamTooLong does not poison circuit-breaker health" {
+    // Regression, found in review of the classifyUpstreamError fix above:
+    // that fix correctly tells the *client* StreamTooLong is a local
+    // TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES limit, not the
+    // upstream's fault -- but onTerminalAttemptError() still fed the same
+    // error into this classifier, which counted it as an upstream failure
+    // and called recordCircuitFailure(). A perfectly healthy origin that
+    // happens to answer with a response over the configured buffer limit
+    // would burn circuit-breaker health for a problem the origin didn't
+    // cause and a retry can't fix. StreamTooLong must be classified the
+    // same way as the other local/config errors already in this list
+    // (ProxyBufferCapacityUnavailable, RequestBufferLimitExceeded).
+    try std.testing.expect(!proxyAttemptErrorCountsAsUpstreamFailure(error.StreamTooLong));
+    try std.testing.expect(!proxyAttemptErrorCountsAsUpstreamFailure(error.ProxyBufferCapacityUnavailable));
+    try std.testing.expect(!proxyAttemptErrorCountsAsUpstreamFailure(error.RequestBufferLimitExceeded));
+
+    // A genuine connectivity error must still count against upstream health.
+    try std.testing.expect(proxyAttemptErrorCountsAsUpstreamFailure(error.ConnectionRefused));
 }
