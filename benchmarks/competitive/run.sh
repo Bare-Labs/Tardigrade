@@ -320,6 +320,10 @@ start_nginx() {
     local port="$1"
     local dir="${TMP_DIR}/nginx"
     mkdir -p "${dir}/logs" "${dir}/client_body_temp" "${dir}/proxy_temp"
+    # nginx's compiled-in default drops workers to an unprivileged user (no
+    # explicit `user` directive in nginx.conf.in), which must still be able
+    # to write proxy/client-body buffer files under this root-owned dir.
+    chmod -R a+rwX "$dir"
     render_template "${CONFIG_DIR}/nginx.conf.in" "${dir}/nginx.conf" "$port" "${dir}/nginx.pid" "${dir}/logs/error.log"
     nginx -p "$dir" -c "${dir}/nginx.conf" -g "daemon off;" >"${dir}/server.log" 2>&1 &
     EDGE_PID="$!"
@@ -1277,6 +1281,10 @@ fi
 
 mkdir -p "$OUT_DIR"
 TMP_DIR="$(mktemp -d /tmp/tardigrade-competitive-XXXX)"
+# mktemp -d defaults to 0700; competitor servers (e.g. nginx) drop worker
+# privileges to an unprivileged build-time user that must still be able to
+# traverse into this directory to serve static files under it.
+chmod 755 "$TMP_DIR"
 mkdir -p "${TMP_DIR}/public"
 printf 'ok\n' > "${TMP_DIR}/public/tiny.txt"
 dd if=/dev/zero of="${TMP_DIR}/public/large.bin" bs=1024 count=1024 >/dev/null 2>&1

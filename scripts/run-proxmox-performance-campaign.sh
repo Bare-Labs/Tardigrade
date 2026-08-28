@@ -424,6 +424,14 @@ cleanup() {
     fi
     tar -C "$REMOTE_STAGE" -rf "$REMOTE_STAGE/metadata.tar" proxmox-host-metadata.txt guest-config.txt 2>/dev/null || true
   fi
+  if [[ "$PROXMOX_KEEP_GUEST" == true && "$guest_created" == true ]]; then
+    {
+      printf 'guest_mode=%s\n' "$PROXMOX_MODE"
+      printf 'guest_id=%s\n' "$guest_label"
+      printf 'guest_ssh_host=%s\n' "$guest_ssh_host"
+      printf 'guest_ssh_key=%s\n' "$guest_ssh_key"
+    } >"$REMOTE_STAGE/guest-connection.txt"
+  fi
   if [[ "$PROXMOX_KEEP_GUEST" != true && "$guest_created" == true ]]; then
     if [[ "$PROXMOX_MODE" == kvm ]]; then
       say "==> destroying VM $guest_label"
@@ -1073,10 +1081,15 @@ if scp_from_pve "$REMOTE_STAGE/artifacts.tgz" "$LOCAL_OUT_DIR/artifacts.tgz"; th
   if scp_from_pve "$REMOTE_STAGE/guest-config.txt" "$LOCAL_OUT_DIR/guest-config.txt"; then
     :
   fi
+  if scp_from_pve "$REMOTE_STAGE/guest-connection.txt" "$LOCAL_OUT_DIR/guest-connection.txt"; then
+    say "guest connection info: $LOCAL_OUT_DIR/guest-connection.txt"
+  fi
   say "artifacts: $LOCAL_OUT_DIR"
 else
   say "warning: no artifact archive was available on the Proxmox host" >&2
 fi
 
-ssh_pve "rm -rf $(printf '%q' "$REMOTE_STAGE")" >/dev/null 2>&1 || true
+if [[ "$PROXMOX_KEEP_GUEST" != true ]]; then
+  ssh_pve "rm -rf $(printf '%q' "$REMOTE_STAGE")" >/dev/null 2>&1 || true
+fi
 exit "$remote_status"
