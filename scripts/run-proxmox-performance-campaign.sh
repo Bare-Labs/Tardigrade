@@ -968,13 +968,28 @@ EOF
     # SIGKILL a normal graceful shutdown mid-drain, not just a wedged one.
     local pid="$1"
     local waited=0
-    kill "$pid" >/dev/null 2>&1 || true
+    # $pid is strace's PID in the strace pass, not the tardi tracee's PID
+    # (server_pid=$! captures whatever `env ... strace -f -c ... tardi &`
+    # backgrounds, which is strace). Killing or detaching the tracer does
+    # not kill the tracee -- ptrace detaches on tracer death and the tracee
+    # keeps running, reparented away from $pid the instant $pid exits. Any
+    # `pgrep -P "$pid"` done *after* that point would no longer find it, so
+    # capture direct children up front and target them explicitly at every
+    # escalation step. A tardi left alive here stays bound to this pass's
+    # port and contaminates the next backend via SO_REUSEPORT -- the same
+    # stale-server class of bug fixed for listener-sharding.sh in #705.
+    # shellcheck disable=SC2009 # pgrep -P is a substring match; ps+grep needed for exact PPID
+    local children
+    children="$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')"
+    # shellcheck disable=SC2086 # intentional word-splitting: $children is a space-separated PID list
+    kill "$pid" $children >/dev/null 2>&1 || true
     while kill -0 "$pid" >/dev/null 2>&1; do
       if (( waited >= 35 )); then
         # strace -c conventionally dumps its accumulated summary on SIGINT
         # (unlike SIGTERM) even without the tracee exiting -- worth trying
         # before giving up on capturing real syscall counts.
-        kill -INT "$pid" >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        kill -INT "$pid" $children >/dev/null 2>&1 || true
         break
       fi
       sleep 1
@@ -984,13 +999,20 @@ EOF
     while kill -0 "$pid" >/dev/null 2>&1; do
       if (( waited >= 10 )); then
         echo "warning: pid $pid did not exit after SIGTERM/SIGINT; sending SIGKILL" >&2
-        kill -9 "$pid" >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        kill -9 "$pid" $children >/dev/null 2>&1 || true
         break
       fi
       sleep 1
       waited=$((waited + 1))
     done
     wait "$pid" >/dev/null 2>&1 || true
+    # Final guaranteed sweep: whatever happened to $pid above, make sure no
+    # captured child survived it.
+    if [[ -n "$children" ]]; then
+      # shellcheck disable=SC2086
+      kill -9 $children >/dev/null 2>&1 || true
+    fi
   }
   run_attached_perf_pass() {
     local backend="$1"
