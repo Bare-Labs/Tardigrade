@@ -907,6 +907,9 @@ pid $dir/tardigrade.pid;
 listen $port;
 access_log $dir/access.log;
 error_log $dir/error.log;
+location = /health {
+    return 200 ok;
+}
 location = /tiny.txt {
     return 200 ok;
 }
@@ -918,11 +921,11 @@ location = /proxy/payload-16m.bin {
 }
 EOF
     if [[ "$mode" == strace ]]; then
-      env TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
+      env TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
         strace -qq -f -c -o "$dir/strace-summary.txt" \
         ./zig-out/bin/tardi run -c "$conf" >"$dir/service.log" 2>&1 &
     else
-      env TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
+      env TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
         ./zig-out/bin/tardi run -c "$conf" >"$dir/service.log" 2>&1 &
     fi
     server_pid=$!
