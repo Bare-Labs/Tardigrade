@@ -948,8 +948,37 @@ EOF
     die "$backend backend did not become healthy"
   }
   stop_backend_server() {
+    # A plain SIGTERM + blocking wait has been observed to hang indefinitely
+    # (hours, not seconds) when $pid is an `strace -f -c`-wrapped tardi: the
+    # signal doesn't reliably reach a multi-threaded tracee through ptrace,
+    # leaving both strace and tardi asleep and this campaign stalled with no
+    # forward progress. Escalate on bounded timeouts instead of trusting any
+    # single signal to land, so one wedged backend can never block the rest
+    # of the comparison (or the io_uring backend's own pass).
     local pid="$1"
+    local waited=0
     kill "$pid" >/dev/null 2>&1 || true
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      if (( waited >= 10 )); then
+        # strace -c conventionally dumps its accumulated summary on SIGINT
+        # (unlike SIGTERM) even without the tracee exiting -- worth trying
+        # before giving up on capturing real syscall counts.
+        kill -INT "$pid" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+    waited=0
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      if (( waited >= 10 )); then
+        echo "warning: pid $pid did not exit after SIGTERM/SIGINT; sending SIGKILL" >&2
+        kill -9 "$pid" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
     wait "$pid" >/dev/null 2>&1 || true
   }
   run_attached_perf_pass() {
