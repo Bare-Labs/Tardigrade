@@ -927,12 +927,18 @@ location = /proxy/payload-16m.bin {
     proxy_pass http://127.0.0.1:$backend_upstream_port/payload-16m.bin;
 }
 EOF
+    # PROXY_STREAMING_MODE=response matches benchmarks/competitive/run.sh's
+    # own tardigrade startup: without it, proxy responses are buffered in
+    # memory up to TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES (default
+    # 256 KiB), so the required proxy-large-streaming workload's 16 MiB
+    # fixture deterministically 502s (error.StreamTooLong) regardless of
+    # backend -- every request, not just under load.
     if [[ "$mode" == strace ]]; then
-      env TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
+      env TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_PROXY_STREAMING_MODE=response TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
         strace -qq -f -c -o "$dir/strace-summary.txt" \
         ./zig-out/bin/tardi run -c "$conf" >"$dir/service.log" 2>&1 &
     else
-      env TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
+      env TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_PROXY_STREAMING_MODE=response TARDIGRADE_EVENT_LOOP_BACKEND="$backend" TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=256 \
         ./zig-out/bin/tardi run -c "$conf" >"$dir/service.log" 2>&1 &
     fi
     server_pid=$!
