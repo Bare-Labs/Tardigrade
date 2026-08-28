@@ -175,6 +175,13 @@ case "$PROXMOX_MODE" in
   *) die "--mode must be kvm or lxc-smoke" ;;
 esac
 
+# #593 requires the full non-smoke suite for canonical evidence; --smoke
+# intentionally skips the large H3 preflights, so a smoke run must never be
+# recorded as canonical regardless of --mode.
+if $SMOKE; then
+  PROXMOX_NONCANONICAL=true
+fi
+
 case "$DURATION $CONNECTIONS $THREADS $PROXMOX_GUEST_CORES $PROXMOX_GUEST_MEMORY_MB $PROXMOX_GUEST_DISK_GB $SHARDS" in
   *[!0-9\ ]*) die "numeric options must be positive integers" ;;
 esac
