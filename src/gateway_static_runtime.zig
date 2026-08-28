@@ -459,6 +459,46 @@ test "serveTryFilesFallback: top-level root without try_files defaults to $uri" 
     try std.testing.expectEqual(@as(usize, 3), served.content_length);
 }
 
+test "static_file.serve: buffered (non-file-backed) response over 256 KiB is not truncated" {
+    // Regression for #700: every buffered static-file caller (TLS-terminated
+    // HTTP/1.1, since sendfile can't write into an encrypted socket, plus H2
+    // and H3) used to pass gs.MAX_REQUEST_SIZE (256 KiB) as max_bytes here --
+    // a request-size DoS bound, not a response-size limit -- so any file over
+    // 256 KiB threw error.StreamTooLong mid-response. 1 MiB matches the real
+    // #593 campaign failure (the H3 static-large fixture).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_size: usize = 1024 * 1024;
+    const data = try allocator.alloc(u8, file_size);
+    defer allocator.free(data);
+    @memset(data, 'x');
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "large.bin", .data = data });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = http.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try http.static_file.serve(allocator, .{
+        .root = root_path,
+        .request_path = "/large.bin",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = "$uri",
+        .headers = &hdrs,
+        .prefer_file_backed = false,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(http.status.Status.ok, served.status_code);
+    try std.testing.expectEqual(file_size, served.content_length);
+    try std.testing.expectEqual(file_size, served.body.?.len);
+}
+
 test "writeStaticServedResponse: compresses buffered body when compression enabled" {
     // This test exercises the integration path added in #142: when
     // compression_config.enabled is true and the client advertises Accept-Encoding:

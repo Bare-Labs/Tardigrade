@@ -3612,6 +3612,40 @@ fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_confi
     return result;
 }
 
+test "buildHttp2StaticResponse: buffered static response over 256 KiB is not truncated" {
+    // Regression for #700: this H2 path used to pass gs.MAX_REQUEST_SIZE
+    // (256 KiB) as static_file.Options.max_bytes -- a request-size DoS
+    // bound, not a response-size limit -- so any file over 256 KiB threw
+    // error.StreamTooLong mid-response. 1 MiB matches the real #593
+    // campaign failure (the H3 static-large fixture; H2 shares this same
+    // buffered static-file code path since H2 is also always TLS-terminated).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_size: usize = 1024 * 1024;
+    const data = try allocator.alloc(u8, file_size);
+    defer allocator.free(data);
+    @memset(data, 'x');
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "large.bin", .data = data });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.doc_root = root_path;
+    cfg.try_files = "$uri";
+
+    var head = try http.Request.parseHead(allocator, "GET /large.bin HTTP/1.1\r\nHost: example.test\r\n\r\n", 64 * 1024);
+    defer head.request.deinit();
+
+    const result = try buildHttp2StaticResponse(allocator, &cfg, &head.request);
+    try std.testing.expect(result != null);
+    var response = result.?;
+    defer response.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(file_size, response.body.?.len);
+}
+
 fn hasH2Header(headers: *const std.array_list.Managed(http.hpack.HeaderField), name: []const u8) bool {
     for (headers.items) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return true;

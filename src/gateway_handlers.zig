@@ -2663,6 +2663,58 @@ test "handleHttp3Connection serves the top-level static root when no location ma
     try std.testing.expectEqualStrings("blackbox-static-ok", response.body orelse "");
 }
 
+test "handleHttp3Connection: buffered static response over 256 KiB is not truncated" {
+    // Regression for #700: this H3 path (and its location-block sibling,
+    // handleHttp3StaticLocation) used to pass gs.MAX_REQUEST_SIZE (256 KiB)
+    // as static_file.Options.max_bytes -- a request-size DoS bound, not a
+    // response-size limit -- so any file over 256 KiB threw
+    // error.StreamTooLong mid-response. 1 MiB matches the real #593
+    // campaign failure that surfaced this (the H3 static-large fixture).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_size: usize = 1024 * 1024;
+    const data = try allocator.alloc(u8, file_size);
+    defer allocator.free(data);
+    @memset(data, 'x');
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "large.bin", .data = data });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.doc_root = root_path;
+    cfg.try_files = "$uri";
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/large.bin"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Connection(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqual(file_size, response.body.?.len);
+}
+
 test "handleHttp3Connection preserves representation length for HEAD against the top-level static fallback" {
     // Regression for a bug introduced by the fallback above: HEAD correctly
     // suppresses the transmitted body, but the fix must not also zero the
