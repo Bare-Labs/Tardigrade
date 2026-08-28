@@ -961,11 +961,16 @@ EOF
     # forward progress. Escalate on bounded timeouts instead of trusting any
     # single signal to land, so one wedged backend can never block the rest
     # of the comparison (or the io_uring backend's own pass).
+    #
+    # The first bound must clear TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS
+    # (default 30s): a server draining many active connections legitimately
+    # takes up to that long to exit on its own, and escalating sooner would
+    # SIGKILL a normal graceful shutdown mid-drain, not just a wedged one.
     local pid="$1"
     local waited=0
     kill "$pid" >/dev/null 2>&1 || true
     while kill -0 "$pid" >/dev/null 2>&1; do
-      if (( waited >= 10 )); then
+      if (( waited >= 35 )); then
         # strace -c conventionally dumps its accumulated summary on SIGINT
         # (unlike SIGTERM) even without the tracee exiting -- worth trying
         # before giving up on capturing real syscall counts.
