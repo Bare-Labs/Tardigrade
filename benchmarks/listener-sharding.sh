@@ -160,6 +160,29 @@ cleanup_gateway() {
         wait "$gateway_pid" >/dev/null 2>&1 || true
     fi
     gateway_pid=""
+    # Belt-and-suspenders: $gateway_pid ($!) has been observed not to track
+    # the actual long-running gateway process reliably across the
+    # `( ... exec sh -c "$START_COMMAND" ) &` subshell/exec chain, leaving it
+    # alive (reparented to init) and still bound via the platform's
+    # load-balanced SO_REUSEPORT listener when the NEXT profile starts a
+    # fresh server on the same port. Two (or more) servers racing for
+    # accepts on the same port silently corrupts every accept/batch metric
+    # this suite depends on -- reproduced live as accept_batch_size_count
+    # exceeding accept_batch_size_sum, which is impossible for a single
+    # correctly-behaving server (every observation has batch size >= 1, so
+    # the sum can never grow slower than the count). Kill anything still
+    # matching the exact gateway invocation by command line, not just
+    # whatever PID happened to get tracked.
+    #
+    # The pattern is anchored to the start of the command line: $START_COMMAND
+    # itself appears verbatim inside *this script's own* argv (as the
+    # --start-command value), so an unanchored match here would find and
+    # kill this very process -- reproduced live as this trap SIGKILLing its
+    # own listener-sharding.sh mid-run. Only the real gateway process's
+    # argv[0] is the tardi binary path itself.
+    if [[ -n "$START_COMMAND" ]]; then
+        pkill -9 -f "^$(printf '%s' "$START_COMMAND" | sed -E 's/ *>.*$//')" >/dev/null 2>&1 || true
+    fi
     if [[ -n "${profile_tmp}" && -d "${profile_tmp}" ]]; then
         rm -rf "$profile_tmp"
     fi
