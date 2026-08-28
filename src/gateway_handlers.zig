@@ -2449,7 +2449,9 @@ fn handleHttp3StaticLocation(
         .try_files = root_cfg.try_files,
         .autoindex = root_cfg.autoindex,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: that bounds inbound request size (DoS
+        // protection), not how large a file this server can legitimately
+        // serve. Falls through to static_file.Options' own default.
     })) orelse blk: {
         var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request_path, &request.headers, 404)) orelse return false;
         switch (error_page) {
@@ -2572,7 +2574,7 @@ fn handleHttp3TopLevelStaticFallback(
         .try_files = effective_try_files,
         .autoindex = false,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: see handleHttp3StaticLocation above.
     })) orelse return false;
     defer served.deinit(allocator);
 

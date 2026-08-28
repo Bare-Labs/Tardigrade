@@ -3591,7 +3591,10 @@ fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_confi
         .try_files = effective_try_files,
         .autoindex = false,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: that bounds inbound request size (DoS
+        // protection), not how large a file this server can legitimately
+        // serve over HTTP/2. Falls through to static_file.Options' own
+        // default.
         .prefer_file_backed = false,
     })) orelse return null;
     defer served.deinit(allocator);
