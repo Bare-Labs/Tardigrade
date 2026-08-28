@@ -52,6 +52,41 @@ pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
     };
 }
 
+pub const UpstreamErrorResponse = struct {
+    status: http.Status,
+    code: []const u8,
+    message: []const u8,
+};
+
+/// Maps a terminal proxy-attempt error to the status/code/message a client
+/// should actually see. Every non-timeout error used to collapse into a
+/// generic "Upstream connection failed", which is actively misleading for
+/// error.StreamTooLong: that means the upstream answered fine and the
+/// response was simply larger than TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES
+/// (default 256 KiB) -- a configuration/buffering limit, not a connectivity
+/// failure, and operators need the real cause to know to raise the limit or
+/// enable TARDIGRADE_PROXY_STREAMING_MODE=response instead of debugging a
+/// network problem that doesn't exist.
+pub fn classifyUpstreamError(err: anyerror) UpstreamErrorResponse {
+    return switch (err) {
+        error.Timeout, error.TimedOut, error.WouldBlock => .{
+            .status = .gateway_timeout,
+            .code = "upstream_timeout",
+            .message = "Upstream request timed out",
+        },
+        error.StreamTooLong => .{
+            .status = .bad_gateway,
+            .code = "upstream_response_too_large",
+            .message = "Upstream response exceeded the configured buffer limit",
+        },
+        else => .{
+            .status = .bad_gateway,
+            .code = "upstream_error",
+            .message = "Upstream connection failed",
+        },
+    };
+}
+
 fn recordStreamingProxyOutcome(
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
@@ -697,12 +732,10 @@ pub fn handleLocationProxyPass(
                 } else {
                     state.recordProxyUpstreamFailure(cfg, selection.base_url, circuit_permit);
                 }
-                const err_status: http.Status = switch (err) {
-                    error.Timeout, error.WouldBlock => .gateway_timeout,
-                    else => .bad_gateway,
-                };
-                const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-                const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+                const upstream_err = classifyUpstreamError(err);
+                const err_status = upstream_err.status;
+                const err_code = upstream_err.code;
+                const err_msg = upstream_err.message;
                 state.logger.warn(correlation_id, "streaming upstream request failed: {}", .{err});
                 if (downstream_committed) {
                     // The failure happened after streamProxyOverTransport had
@@ -846,12 +879,10 @@ pub fn handleLocationProxyPass(
             // response so the client receives a complete HTTP message instead
             // of an abrupt TCP close (fixes #94).
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            const err_status: http.Status = switch (err) {
-                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
-                else => .bad_gateway,
-            };
-            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+            const upstream_err = classifyUpstreamError(err);
+            const err_status = upstream_err.status;
+            const err_code = upstream_err.code;
+            const err_msg = upstream_err.message;
             state.logger.warn(correlation_id, "upstream request failed after configured retries: {}", .{err});
             try sendApiError(allocator, writer, err_status, err_code, err_msg, correlation_id, keep_alive, state);
             ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(err_status), 0);
@@ -2697,4 +2728,34 @@ test "data-plane response wrapper exposes bounded buffered metadata" {
     try std.testing.expectEqual(@as(usize, body.len), response.bodyLen());
     try std.testing.expectEqualStrings("payload", response.transcriptBody());
     try std.testing.expectEqualStrings("text/plain", response.contentTypeOr("application/octet-stream"));
+}
+
+test "classifyUpstreamError: StreamTooLong reports the real cause instead of a generic connection failure" {
+    // Regression: a terminal error.StreamTooLong from buffering an upstream
+    // response over TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES (default
+    // 256 KiB) used to collapse into the same "upstream_error: Upstream
+    // connection failed" every other non-timeout error produced -- actively
+    // misleading for an upstream that answered fine but sent a response too
+    // large to buffer. Reproduced live proxying a real 16 MiB fixture.
+    const too_large = classifyUpstreamError(error.StreamTooLong);
+    try std.testing.expectEqual(http.Status.bad_gateway, too_large.status);
+    try std.testing.expectEqualStrings("upstream_response_too_large", too_large.code);
+    try std.testing.expectEqualStrings("Upstream response exceeded the configured buffer limit", too_large.message);
+
+    const timeout = classifyUpstreamError(error.Timeout);
+    try std.testing.expectEqual(http.Status.gateway_timeout, timeout.status);
+    try std.testing.expectEqualStrings("upstream_timeout", timeout.code);
+
+    const timed_out = classifyUpstreamError(error.TimedOut);
+    try std.testing.expectEqual(http.Status.gateway_timeout, timed_out.status);
+
+    const would_block = classifyUpstreamError(error.WouldBlock);
+    try std.testing.expectEqual(http.Status.gateway_timeout, would_block.status);
+
+    // An unrelated error still gets the generic connectivity classification
+    // -- only StreamTooLong (and the timeout family) get a distinct message.
+    const other = classifyUpstreamError(error.ConnectionRefused);
+    try std.testing.expectEqual(http.Status.bad_gateway, other.status);
+    try std.testing.expectEqualStrings("upstream_error", other.code);
+    try std.testing.expectEqualStrings("Upstream connection failed", other.message);
 }

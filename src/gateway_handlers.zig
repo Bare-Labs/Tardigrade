@@ -2314,12 +2314,10 @@ const Http3Early425ProxyContinuation = struct {
                     if (permit) |p| self.state.circuitReleasePermit(p);
                     self.circuit_permit = null;
                 }
-                const err_status: http.Status = switch (err) {
-                    error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
-                    else => .bad_gateway,
-                };
-                const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-                const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+                const upstream_err = gproxy_runtime.classifyUpstreamError(err);
+                const err_status = upstream_err.status;
+                const err_code = upstream_err.code;
+                const err_msg = upstream_err.message;
                 try rejectHttp3ProxyErrorWithState(allocator, response, self.state, err_status, err_code, err_msg, self.correlation_id);
                 return;
             };
@@ -2409,12 +2407,10 @@ fn handleHttp3LocationProxyPass(
         },
         .terminal_error => |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            const err_status: http.Status = switch (err) {
-                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
-                else => .bad_gateway,
-            };
-            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+            const upstream_err = gproxy_runtime.classifyUpstreamError(err);
+            const err_status = upstream_err.status;
+            const err_code = upstream_err.code;
+            const err_msg = upstream_err.message;
             try rejectHttp3ProxyError(allocator, response, ctx, err_status, err_code, err_msg, correlation_id);
             return;
         },
