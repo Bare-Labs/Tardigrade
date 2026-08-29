@@ -248,17 +248,61 @@ echo "${server} stopped"
 ' "$GUEST_WORKDIR" "$server"
 }
 
+# Fails closed (rather than just printing) if any benchmark server is
+# running on the guest when it shouldn't be. #705 was exactly this class of
+# bug (stale servers racing on a reused port and corrupting metrics) inside
+# the loopback harness; this guards the same failure mode here.
 verify_idle() {
-    guest_exec '
-ps -ef | grep -E "tardi run|nginx: master|/usr/sbin/haproxy|caddy run" | grep -v grep || echo "(none)"
-' "$GUEST_WORKDIR"
+    local context="$1"
+    local found
+    # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
+    found="$(guest_exec '
+ps -ef | grep -E "tardi run|nginx: master|/usr/sbin/haproxy|caddy run" | grep -v grep || true
+' "$GUEST_WORKDIR")"
+    if [[ -n "$found" ]]; then
+        echo "FATAL: guest is not idle ($context):" >&2
+        echo "$found" >&2
+        exit 1
+    fi
+    echo "(none)"
+}
+
+# Requires --tardigrade-git-sha to match a marker file the deployer is
+# expected to have written into --guest-workdir at archive/extraction time
+# (".tardigrade-source-sha", containing `git rev-parse HEAD` from the
+# machine that built the archive). Without this, a caller-supplied SHA is
+# just an unverified label -- this makes it an assertion against the actual
+# guest artifact instead. Only runs once, for the tardigrade family, since
+# that's the only server this harness's git SHA claim describes.
+require_verified_source() {
+    [[ -n "$TARDIGRADE_GIT_SHA" ]] || return 0
+    local marker
+    # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
+    marker="$(guest_exec '
+cd "$1" && cat .tardigrade-source-sha 2>/dev/null || true
+' "$GUEST_WORKDIR")"
+    marker="$(printf '%s' "$marker" | tr -d '[:space:]')"
+    if [[ -z "$marker" ]]; then
+        echo "FATAL: --tardigrade-git-sha was given but ${GUEST_WORKDIR}/.tardigrade-source-sha" >&2
+        echo "  does not exist on the guest -- the claimed SHA is unverifiable. Write that file" >&2
+        echo "  (containing the exact 'git rev-parse HEAD' the archive was built from) when" >&2
+        echo "  preparing --guest-workdir, or omit --tardigrade-git-sha." >&2
+        exit 1
+    fi
+    if [[ "$marker" != "$TARDIGRADE_GIT_SHA" ]]; then
+        echo "FATAL: --tardigrade-git-sha=${TARDIGRADE_GIT_SHA} does not match" >&2
+        echo "  ${GUEST_WORKDIR}/.tardigrade-source-sha=${marker}" >&2
+        exit 1
+    fi
+    echo "==> verified: guest source matches --tardigrade-git-sha (${TARDIGRADE_GIT_SHA})"
 }
 
 # Independently verifiable identity of whatever is actually running on the
 # guest right now, queried from the guest itself rather than assumed from
 # this machine's own git state (which describes the load generator, not the
 # system under test, and can silently drift from what --guest-workdir was
-# actually built from).
+# actually built from). Called after render_and_start_server, so the
+# rendered config for this pass already exists and can be hashed too.
 capture_sut_meta() {
     local server="$1"
     local out
@@ -267,6 +311,12 @@ capture_sut_meta() {
 set -uo pipefail
 cd "$1"; server="$2"
 kernel="$(uname -a)"
+cpu_model="$(lscpu 2>/dev/null | awk -F: "/Model name:/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}")"
+[[ -z "$cpu_model" && -r /proc/cpuinfo ]] && cpu_model="$(awk -F: "/model name/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}" /proc/cpuinfo)"
+cpu_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown)"
+memory_mb="unknown"
+[[ -r /proc/meminfo ]] && memory_mb="$(awk "/MemTotal:/{printf \"%.0f\", \$2 / 1024}" /proc/meminfo)"
+config_sha256="$(sha256sum "benchmarks/results/crossmachine/${server}.conf" 2>/dev/null | cut -d" " -f1)"
 case "$server" in
     tardigrade|tardigrade-http3)
         version_output="$(./zig-out/bin/tardi version 2>&1)"
@@ -277,35 +327,45 @@ case "$server" in
     caddy)   version_output="$(caddy version 2>&1)"; binary_sha256="" ;;
     *)       version_output=""; binary_sha256="" ;;
 esac
-jq -n --arg kernel "$kernel" --arg version_output "$version_output" --arg binary_sha256 "$binary_sha256" \
-    "{sut_kernel: \$kernel, sut_server_version: \$version_output, sut_binary_sha256: \$binary_sha256}"
+jq -n \
+    --arg kernel "$kernel" --arg cpu_model "$cpu_model" --arg cpu_threads "$cpu_threads" \
+    --arg memory_mb "$memory_mb" --arg config_sha256 "$config_sha256" \
+    --arg version_output "$version_output" --arg binary_sha256 "$binary_sha256" \
+    "{sut_kernel: \$kernel, sut_cpu_model: \$cpu_model, sut_cpu_threads: \$cpu_threads, sut_memory_mb: \$memory_mb, sut_config_sha256: \$config_sha256, sut_server_version: \$version_output, sut_binary_sha256: \$binary_sha256}"
 ' "$GUEST_WORKDIR" "$server" 2>/dev/null)"
     if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
-        out='{"sut_kernel": null, "sut_server_version": null, "sut_binary_sha256": null}'
+        out='{"sut_kernel": null, "sut_cpu_model": null, "sut_cpu_threads": null, "sut_memory_mb": null, "sut_config_sha256": null, "sut_server_version": null, "sut_binary_sha256": null}'
     fi
     if [[ -n "$TARDIGRADE_GIT_SHA" ]]; then
-        out="$(jq --arg sha "$TARDIGRADE_GIT_SHA" '. + {sut_tardigrade_git_sha: $sha}' <<<"$out")"
+        out="$(jq --arg sha "$TARDIGRADE_GIT_SHA" '. + {sut_tardigrade_git_sha: $sha, sut_tardigrade_git_sha_verified: true}' <<<"$out")"
     fi
     printf '%s' "$out"
 }
 
 # Patches a benchmarks/run.sh result file in place: merges SUT provenance
 # into _meta, and marks the run non-canonical if any scenario reported
-# errors, so a clean baseline and an exploratory defect-finding run are
-# never ambiguous from the JSON alone.
+# errors OR this is a --smoke run (a 5s/8-connection smoke pass is
+# intrinsically not canonical #593 evidence regardless of whether it
+# happened to come back error-free), so a clean baseline and an
+# exploratory/reduced run are never ambiguous from the JSON alone.
 finalize_result_file() {
     local save_file="$1" sut_meta_json="$2"
     local total_errors
     total_errors="$(jq '[to_entries[] | select(.key != "_meta") | (.value.errors // 0)] | add // 0' "$save_file")"
     local canonical=true
     [[ "$total_errors" != "0" ]] && canonical=false
-    jq --argjson sut "$sut_meta_json" --argjson total_errors "$total_errors" --argjson canonical "$canonical" \
-        '._meta += $sut | ._meta.total_errors = $total_errors | ._meta.canonical = $canonical' \
+    $SMOKE && canonical=false
+    jq --argjson sut "$sut_meta_json" --argjson total_errors "$total_errors" --argjson canonical "$canonical" --argjson smoke "$SMOKE" \
+        '._meta += $sut | ._meta.total_errors = $total_errors | ._meta.canonical = $canonical | ._meta.smoke = $smoke' \
         "$save_file" > "${save_file}.tmp" && mv "${save_file}.tmp" "$save_file"
     if ! $canonical; then
-        echo "note: ${save_file} has ${total_errors} total error(s) across scenarios -- marked _meta.canonical=false" >&2
+        local why="${total_errors} total error(s) across scenarios"
+        $SMOKE && why="--smoke run"
+        echo "note: ${save_file} marked _meta.canonical=false (${why})" >&2
     fi
 }
+
+require_verified_source
 
 SCENARIOS="static-http1,proxy-http1,keepalive,proxy-payload-16m"
 if $SMOKE; then
@@ -322,7 +382,7 @@ for idx in "${!SERVER_LIST[@]}"; do
     echo ""
     echo "== ${server} (guest port ${port}) =="
     echo "-- guest state before start --"
-    verify_idle
+    verify_idle "before starting ${server}"
 
     render_and_start_server "$server" "$port"
 
@@ -354,7 +414,7 @@ for idx in "${!SERVER_LIST[@]}"; do
 
     stop_server "$server"
     echo "-- guest state after stop --"
-    verify_idle
+    verify_idle "after stopping ${server}"
 done
 
 has_tardigrade() {
@@ -370,7 +430,7 @@ if $WITH_H3 && has_tardigrade; then
     echo ""
     echo "== tardigrade-http3 (guest port ${h3_port}, TLS+QUIC) =="
     echo "-- guest state before start --"
-    verify_idle
+    verify_idle "before starting tardigrade-http3"
 
     # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
     guest_exec '
@@ -433,7 +493,7 @@ exit 1
 
     stop_server "tardigrade-http3"
     echo "-- guest state after stop --"
-    verify_idle
+    verify_idle "after stopping tardigrade-http3"
 fi
 
 # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
