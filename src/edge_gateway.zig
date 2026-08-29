@@ -500,15 +500,20 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
     defer if (http3_runtime) |*runtime| runtime.deinit();
-    // NOTE (#138): defaulting worker_threads to CPU count is correct for a
+    // NOTE (#708): defaulting worker_threads to CPU count is correct for a
     // non-blocking event loop, but Tardigrade currently uses a thread-per-
-    // connection blocking model where a worker is held for a connection's whole
-    // keepalive lifetime. Under that model the tail latency degrades sharply once
-    // concurrent connections exceed the worker count (measured: 4 workers + 10
-    // keepalive conns -> p90 ~26ms; 16 workers -> ~676us). Until idle keepalive
-    // parking (#138) lands, operators should raise TARDIGRADE_WORKER_THREADS to
-    // ~peak concurrent connections. Once parking lands, idle connections no
-    // longer occupy a worker and CPU-count sizing becomes correct again.
+    // connection blocking model where a worker is held for the whole active
+    // portion of a request (read -> for proxy: upstream connect/write/read too
+    // -> write response). Idle keepalive time between requests is parked off
+    // the worker pool (#138, landed), so that part no longer needs oversizing.
+    // What remains is #708: an actively-held worker's critical section is
+    // longer for the proxy path than for static serving, so real client-facing
+    // network latency (not just concurrency) degrades proxy throughput far
+    // more under worker scarcity than static throughput -- measured ~8x on a
+    // real cross-machine link, only partially mitigated by raising
+    // TARDIGRADE_WORKER_THREADS. Fixing this for real needs the active
+    // request path to become non-blocking/event-driven rather than tuning
+    // worker count.
     const worker_count: usize = blk: {
         const configured = if (cfg.worker_threads == 0)
             (std.Thread.getCpuCount() catch 1)

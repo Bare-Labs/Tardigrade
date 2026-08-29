@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds a QUIC-capable h2load for macOS, for cross-machine H3 benchmarking
-# (scripts/run-cross-machine-competitive.sh --with-h3) from the load-driver
+# (benchmarks/run-cross-machine-competitive.sh --with-h3) from the load-driver
 # side (this machine), not the server side.
 #
 # Homebrew's `h2load` (from the `nghttp2` formula) accepts `--h3` syntactically
@@ -19,7 +19,7 @@
 # ~/.tardigrade-h2load/bin first on PATH before running the cross-machine
 # script with --with-h3.
 #
-# Usage: scripts/build-macos-quic-h2load.sh [install_prefix]
+# Usage: benchmarks/build-macos-quic-h2load.sh [install_prefix]
 
 set -euo pipefail
 

@@ -21,7 +21,7 @@
 #     and nginx/haproxy/caddy/python3/wrk/k6 installed
 #
 # Usage:
-#   scripts/run-cross-machine-competitive.sh \
+#   benchmarks/run-cross-machine-competitive.sh \
 #       --guest-ip 192.168.86.58 \
 #       --guest-ssh-host 'fe80::be24:11ff:fe28:59f3%vmbr0' \
 #       --guest-ssh-key /tmp/.../vm_ssh_key \
@@ -51,6 +51,7 @@ THREADS=4
 SMOKE=false
 WITH_H3=false
 H3_TLS_SERVER_NAME="tardigrade.test"
+TARDIGRADE_GIT_SHA=""
 OUT_DIR="${BENCH_DIR}/results/$(date -u +%Y%m%d-%H%M%S)-crossmachine"
 
 while [[ $# -gt 0 ]]; do
@@ -68,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --out-dir)        OUT_DIR="$2"; shift 2 ;;
         --smoke)          SMOKE=true; shift ;;
         --with-h3)        WITH_H3=true; shift ;;
+        --tardigrade-git-sha) TARDIGRADE_GIT_SHA="$2"; shift 2 ;;
         -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -76,26 +78,52 @@ done
 [[ -n "$GUEST_SSH_HOST" ]] || { echo "--guest-ssh-host is required" >&2; exit 1; }
 [[ -n "$GUEST_SSH_KEY" ]]  || { echo "--guest-ssh-key is required" >&2; exit 1; }
 [[ -n "$GUEST_IP" ]]       || { echo "--guest-ip is required" >&2; exit 1; }
+if [[ -z "$TARDIGRADE_GIT_SHA" ]]; then
+    echo "warning: --tardigrade-git-sha not given; results will record a" >&2
+    echo "  binary sha256 and 'tardi version' output as SUT identity, but" >&2
+    echo "  no human-readable source ref -- pass it if you know what ref" >&2
+    echo "  --guest-workdir was built from." >&2
+fi
 
 mkdir -p "$OUT_DIR"
 
 # ── guest control plane ─────────────────────────────────────────────────────
 # Pipes a script into the guest over a (possibly double-hopped) SSH
 # connection and runs it with `bash -s`, forwarding "$@" as script args.
+#
+# "$@" is never interpolated into a shell command string: it's %q-quoted
+# into a `set --` line prepended to the piped script, so the values only
+# ever get parsed once, by `bash -s` reading them as literal source text --
+# not re-parsed by an intermediate remote shell. For the double-hop case,
+# the remote command sent to the Proxmox host (which DOES get parsed by a
+# shell there, since ssh always joins a remote command into one string) is
+# itself built with printf %q, so GUEST_SSH_KEY/GUEST_SSH_HOST survive
+# safely even if they ever contain shell metacharacters.
 guest_exec() {
     local script="$1"; shift
+    local wrapped="set --"
+    local arg
+    for arg in "$@"; do
+        wrapped+=" $(printf '%q' "$arg")"
+    done
+    wrapped+=$'\n'"${script}"
+
     if [[ -n "$PROXMOX_HOST" ]]; then
-        printf '%s' "$script" | ssh -o BatchMode=yes -o ConnectTimeout=10 -b "$PROXMOX_BIND" "$PROXMOX_HOST" \
-            "ssh -i $GUEST_SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 'root@${GUEST_SSH_HOST}' bash -s -- $*"
+        local inner_cmd
+        printf -v inner_cmd 'ssh -i %q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 %q bash -s' \
+            "$GUEST_SSH_KEY" "root@${GUEST_SSH_HOST}"
+        printf '%s' "$wrapped" | ssh -o BatchMode=yes -o ConnectTimeout=10 -b "$PROXMOX_BIND" "$PROXMOX_HOST" "$inner_cmd"
     else
-        printf '%s' "$script" | ssh -i "$GUEST_SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${GUEST_SSH_HOST}" bash -s -- "$@"
+        printf '%s' "$wrapped" | ssh -i "$GUEST_SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${GUEST_SSH_HOST}" bash -s
     fi
 }
 
 echo "==> verifying guest reachability"
+# shellcheck disable=SC2016 # intentional: this runs on the guest, not here
 guest_exec 'echo "guest ok: $(hostname)"'
 
 echo "==> preparing guest fixtures"
+# shellcheck disable=SC2016 # intentional: this runs on the guest, not here
 guest_exec '
 set -euo pipefail
 cd "$1"
@@ -112,6 +140,7 @@ echo "fixtures ready"
 ' "$GUEST_WORKDIR"
 
 echo "==> starting origin fixture on guest"
+# shellcheck disable=SC2016 # intentional: this runs on the guest, not here
 guest_exec '
 set -euo pipefail
 cd "$1"
@@ -129,6 +158,7 @@ exit 1
 
 render_and_start_server() {
     local server="$1" port="$2"
+    # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
     guest_exec '
 set -euo pipefail
 cd "$1"; server="$2"; port="$3"; upstream="$4"; threads="$5"
@@ -196,6 +226,7 @@ exit 1
 
 stop_server() {
     local server="$1"
+    # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
     guest_exec '
 set -uo pipefail
 cd "$1"; server="$2"
@@ -221,6 +252,59 @@ verify_idle() {
     guest_exec '
 ps -ef | grep -E "tardi run|nginx: master|/usr/sbin/haproxy|caddy run" | grep -v grep || echo "(none)"
 ' "$GUEST_WORKDIR"
+}
+
+# Independently verifiable identity of whatever is actually running on the
+# guest right now, queried from the guest itself rather than assumed from
+# this machine's own git state (which describes the load generator, not the
+# system under test, and can silently drift from what --guest-workdir was
+# actually built from).
+capture_sut_meta() {
+    local server="$1"
+    local out
+    # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
+    out="$(guest_exec '
+set -uo pipefail
+cd "$1"; server="$2"
+kernel="$(uname -a)"
+case "$server" in
+    tardigrade|tardigrade-http3)
+        version_output="$(./zig-out/bin/tardi version 2>&1)"
+        binary_sha256="$(sha256sum zig-out/bin/tardi 2>/dev/null | cut -d" " -f1)"
+        ;;
+    nginx)   version_output="$(nginx -v 2>&1)"; binary_sha256="" ;;
+    haproxy) version_output="$(haproxy -v 2>&1 | head -1)"; binary_sha256="" ;;
+    caddy)   version_output="$(caddy version 2>&1)"; binary_sha256="" ;;
+    *)       version_output=""; binary_sha256="" ;;
+esac
+jq -n --arg kernel "$kernel" --arg version_output "$version_output" --arg binary_sha256 "$binary_sha256" \
+    "{sut_kernel: \$kernel, sut_server_version: \$version_output, sut_binary_sha256: \$binary_sha256}"
+' "$GUEST_WORKDIR" "$server" 2>/dev/null)"
+    if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
+        out='{"sut_kernel": null, "sut_server_version": null, "sut_binary_sha256": null}'
+    fi
+    if [[ -n "$TARDIGRADE_GIT_SHA" ]]; then
+        out="$(jq --arg sha "$TARDIGRADE_GIT_SHA" '. + {sut_tardigrade_git_sha: $sha}' <<<"$out")"
+    fi
+    printf '%s' "$out"
+}
+
+# Patches a benchmarks/run.sh result file in place: merges SUT provenance
+# into _meta, and marks the run non-canonical if any scenario reported
+# errors, so a clean baseline and an exploratory defect-finding run are
+# never ambiguous from the JSON alone.
+finalize_result_file() {
+    local save_file="$1" sut_meta_json="$2"
+    local total_errors
+    total_errors="$(jq '[to_entries[] | select(.key != "_meta") | (.value.errors // 0)] | add // 0' "$save_file")"
+    local canonical=true
+    [[ "$total_errors" != "0" ]] && canonical=false
+    jq --argjson sut "$sut_meta_json" --argjson total_errors "$total_errors" --argjson canonical "$canonical" \
+        '._meta += $sut | ._meta.total_errors = $total_errors | ._meta.canonical = $canonical' \
+        "$save_file" > "${save_file}.tmp" && mv "${save_file}.tmp" "$save_file"
+    if ! $canonical; then
+        echo "note: ${save_file} has ${total_errors} total error(s) across scenarios -- marked _meta.canonical=false" >&2
+    fi
 }
 
 SCENARIOS="static-http1,proxy-http1,keepalive,proxy-payload-16m"
@@ -251,6 +335,8 @@ for idx in "${!SERVER_LIST[@]}"; do
     tiny_ok=true
     curl -sf -o /dev/null -m 5 "http://${GUEST_IP}:${port}/tiny.txt" || tiny_ok=false
 
+    sut_meta="$(capture_sut_meta "$server")"
+
     save_file="${OUT_DIR}/${server}.json"
     echo "-- running benchmarks/run.sh from this machine against ${GUEST_IP}:${port} --"
     bash "${BENCH_DIR}/run.sh" \
@@ -260,6 +346,7 @@ for idx in "${!SERVER_LIST[@]}"; do
         --static-path "/tiny.txt" --proxy-path "/proxy/health" --keepalive-path "/tiny.txt" \
         --driver "macbook-5gbe-crossmachine" --config-label "$server" \
         --save "$save_file" || echo "warning: benchmarks/run.sh reported a non-zero exit for ${server}" >&2
+    finalize_result_file "$save_file" "$sut_meta"
     RESULT_FILES+=("$save_file")
     if ! $tiny_ok; then
         echo "note: ${server} /tiny.txt was not reachable before this pass (see ${save_file} for what actually ran)" >&2
@@ -285,6 +372,7 @@ if $WITH_H3 && has_tardigrade; then
     echo "-- guest state before start --"
     verify_idle
 
+    # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
     guest_exec '
 set -euo pipefail
 cd "$1"; port="$2"; upstream="$3"; sni="$4"
@@ -328,6 +416,8 @@ exit 1
         exit 1
     fi
 
+    h3_sut_meta="$(capture_sut_meta "tardigrade-http3")"
+
     h3_save_file="${OUT_DIR}/tardigrade-http3.json"
     echo "-- running benchmarks/run.sh (h2load --h3) from this machine against ${GUEST_IP}:${h3_port} --"
     bash "${BENCH_DIR}/run.sh" \
@@ -338,6 +428,7 @@ exit 1
         --static-path "/tiny.txt" --proxy-path "/proxy/health" \
         --driver "macbook-5gbe-crossmachine" --config-label "tardigrade-http3" \
         --save "$h3_save_file" || echo "warning: benchmarks/run.sh reported a non-zero exit for tardigrade-http3" >&2
+    finalize_result_file "$h3_save_file" "$h3_sut_meta"
     RESULT_FILES+=("$h3_save_file")
 
     stop_server "tardigrade-http3"
@@ -345,6 +436,7 @@ exit 1
     verify_idle
 fi
 
+# shellcheck disable=SC2016 # intentional: this runs on the guest, not here
 guest_exec '
 set -uo pipefail
 cd "$1"
