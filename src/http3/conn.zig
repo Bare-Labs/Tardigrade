@@ -910,6 +910,42 @@ pub fn Conn(comptime Transport: type) type {
             priority: priority.Priority,
         };
 
+        pub const ResponseSendState = struct {
+            status: u16,
+            headers: []const stream_transport.Header,
+            body: []const u8,
+            phase: Phase = .headers,
+            body_offset: usize = 0,
+            frame_buf: [8192]u8 = undefined,
+            frame_len: usize = 0,
+            frame_written: usize = 0,
+            frame_fin: bool = false,
+
+            const Phase = enum {
+                headers,
+                body,
+                done,
+            };
+
+            pub fn init(status: u16, headers: []const stream_transport.Header, body: []const u8) ResponseSendState {
+                return .{
+                    .status = status,
+                    .headers = headers,
+                    .body = body,
+                };
+            }
+
+            fn hasPendingFrame(self: *const ResponseSendState) bool {
+                return self.frame_written < self.frame_len;
+            }
+
+            fn clearPendingFrame(self: *ResponseSendState) void {
+                self.frame_len = 0;
+                self.frame_written = 0;
+                self.frame_fin = false;
+            }
+        };
+
         /// Pop the next fully received request. The exchange borrows the
         /// request session's memory; call `finishRequest` after responding.
         pub fn pollRequest(self: *Self) H3Error!?IncomingRequest {
@@ -944,7 +980,8 @@ pub fn Conn(comptime Transport: type) type {
         /// Encode and send a response with optional body, closing the stream.
         /// The body is framed in bounded DATA chunks; if the transport's send
         /// buffer fills before everything is queued, `error.StreamBackpressure`
-        /// is returned (streamed responses over H3 arrive with #257).
+        /// is returned. Runtime callers that can yield to the QUIC event loop
+        /// should use `sendResponseProgress` and retry the same state later.
         pub fn sendResponse(
             self: *Self,
             transport: *Transport,
@@ -953,26 +990,73 @@ pub fn Conn(comptime Transport: type) type {
             headers: []const stream_transport.Header,
             body: []const u8,
         ) !void {
-            var wire: [8192]u8 = undefined;
-            const header_frame = try session.ResponseEncoder.encodeHeaders(status, headers, &wire);
-            var event_fields: [129]qpack.HeaderField = undefined;
-            var status_buf: [3]u8 = undefined;
-            const status_text = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch "500";
-            event_fields[0] = .{ .name = ":status", .value = status_text };
-            if (headers.len > event_fields.len - 1) return error.TooManyHeaders;
-            for (headers, 0..) |header, i| event_fields[i + 1] = .{ .name = header.name, .value = header.value };
-            self.events.emit(.{ .frame_created = .{ .stream_id = stream_id, .frame = .{ .headers = .{ .fields = event_fields[0 .. headers.len + 1], .raw_length = header_frame.len } } } });
-            try self.writeAll(transport, stream_id, header_frame, body.len == 0);
-
-            var offset: usize = 0;
-            while (offset < body.len) {
-                const chunk_len = @min(body.len - offset, 4096);
-                const chunk = try session.ResponseEncoder.encodeData(body[offset..][0..chunk_len], &wire);
-                offset += chunk_len;
-                self.events.emit(.{ .frame_created = .{ .stream_id = stream_id, .frame = .{ .data = .{ .raw_length = chunk.len } } } });
-                try self.writeAll(transport, stream_id, chunk, offset == body.len);
+            var state = ResponseSendState.init(status, headers, body);
+            while (true) {
+                if (try self.sendResponseProgress(transport, stream_id, &state)) return;
+                return error.StreamBackpressure;
             }
-            self.finishRequest(stream_id);
+        }
+
+        /// Continue encoding and queueing one response. Returns `false` when
+        /// the QUIC stream send buffer is currently full; callers must yield
+        /// to the transport driver and retry the same state later.
+        pub fn sendResponseProgress(
+            self: *Self,
+            transport: *Transport,
+            stream_id: u64,
+            state: *ResponseSendState,
+        ) !bool {
+            while (state.phase != .done or state.hasPendingFrame()) {
+                if (!state.hasPendingFrame()) {
+                    try self.prepareResponseFrame(state, stream_id);
+                }
+                while (state.frame_written < state.frame_len) {
+                    const n = try transport.writeStream(
+                        stream_id,
+                        state.frame_buf[state.frame_written..state.frame_len],
+                        state.frame_fin,
+                    );
+                    if (n == 0) return false;
+                    state.frame_written += n;
+                }
+                state.clearPendingFrame();
+                if (state.phase == .done) {
+                    self.finishRequest(stream_id);
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        fn prepareResponseFrame(self: *Self, state: *ResponseSendState, stream_id: u64) !void {
+            switch (state.phase) {
+                .headers => {
+                    const header_frame = try session.ResponseEncoder.encodeHeaders(state.status, state.headers, &state.frame_buf);
+                    state.frame_len = header_frame.len;
+                    state.frame_written = 0;
+                    state.frame_fin = state.body.len == 0;
+                    state.phase = if (state.body.len == 0) .done else .body;
+
+                    var event_fields: [129]qpack.HeaderField = undefined;
+                    var status_buf: [3]u8 = undefined;
+                    const status_text = std.fmt.bufPrint(&status_buf, "{d}", .{state.status}) catch "500";
+                    event_fields[0] = .{ .name = ":status", .value = status_text };
+                    if (state.headers.len > event_fields.len - 1) return error.TooManyHeaders;
+                    for (state.headers, 0..) |header, i| event_fields[i + 1] = .{ .name = header.name, .value = header.value };
+                    self.events.emit(.{ .frame_created = .{ .stream_id = stream_id, .frame = .{ .headers = .{ .fields = event_fields[0 .. state.headers.len + 1], .raw_length = state.frame_len } } } });
+                },
+                .body => {
+                    const chunk_len = @min(state.body.len - state.body_offset, 4096);
+                    const chunk = try session.ResponseEncoder.encodeData(state.body[state.body_offset..][0..chunk_len], &state.frame_buf);
+                    state.body_offset += chunk_len;
+                    state.frame_len = chunk.len;
+                    state.frame_written = 0;
+                    state.frame_fin = state.body_offset == state.body.len;
+                    if (state.frame_fin) state.phase = .done;
+                    self.events.emit(.{ .frame_created = .{ .stream_id = stream_id, .frame = .{ .data = .{ .raw_length = state.frame_len } } } });
+                },
+                .done => {},
+            }
         }
 
         pub fn sendGoaway(self: *Self, transport: *Transport, stream_id: u64) !void {

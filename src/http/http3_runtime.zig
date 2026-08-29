@@ -997,13 +997,82 @@ const ConnEntry = struct {
     last_stream_metrics: quic.stream.Metrics = .{},
     last_tls_metrics: quic.tls_adapter.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
+    pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
         for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
         self.parked_h3_retries.deinit(allocator);
+        for (self.pending_h3_responses.items) |*pending| pending.deinit(allocator);
+        self.pending_h3_responses.deinit(allocator);
         self.h3.deinit();
         self.conn.deinit();
         allocator.destroy(self.backend);
+    }
+};
+
+const PendingH3Response = struct {
+    stream_id: u64,
+    started_us: u64,
+    headers: []stream_transport.Header,
+    header_names: [][]u8,
+    header_values: [][]u8,
+    body: []u8,
+    send_state: H3.ResponseSendState,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        stream_id: u64,
+        started_us: u64,
+        status: u16,
+        headers: []const stream_transport.Header,
+        body: []const u8,
+    ) !PendingH3Response {
+        const owned_headers = try allocator.alloc(stream_transport.Header, headers.len);
+        errdefer allocator.free(owned_headers);
+        const header_names = try allocator.alloc([]u8, headers.len);
+        errdefer allocator.free(header_names);
+        const header_values = try allocator.alloc([]u8, headers.len);
+        errdefer allocator.free(header_values);
+
+        var copied: usize = 0;
+        errdefer {
+            for (header_names[0..copied]) |name| allocator.free(name);
+            for (header_values[0..copied]) |value| allocator.free(value);
+        }
+        for (headers, 0..) |header, i| {
+            const name = try allocator.dupe(u8, header.name);
+            const value = allocator.dupe(u8, header.value) catch |err| {
+                allocator.free(name);
+                return err;
+            };
+            owned_headers[i] = .{ .name = name, .value = value };
+            header_names[i] = name;
+            header_values[i] = value;
+            copied += 1;
+        }
+
+        const owned_body = try allocator.dupe(u8, body);
+        errdefer allocator.free(owned_body);
+
+        return .{
+            .stream_id = stream_id,
+            .started_us = started_us,
+            .headers = owned_headers,
+            .header_names = header_names,
+            .header_values = header_values,
+            .body = owned_body,
+            .send_state = H3.ResponseSendState.init(status, owned_headers, owned_body),
+        };
+    }
+
+    fn deinit(self: *PendingH3Response, allocator: std.mem.Allocator) void {
+        for (self.header_names) |name| allocator.free(name);
+        for (self.header_values) |value| allocator.free(value);
+        allocator.free(self.header_names);
+        allocator.free(self.header_values);
+        allocator.free(self.headers);
+        allocator.free(self.body);
+        self.* = undefined;
     }
 };
 
@@ -1885,6 +1954,7 @@ pub const Runtime = struct {
             entry.conn.close(code, "h3 protocol error", now);
             return;
         };
+        self.resumePendingH3Responses(entry, now);
         self.resumeParkedH3Retries(entry);
         while (true) {
             const incoming = entry.h3.pollRequest() catch {
@@ -1987,17 +2057,10 @@ pub const Runtime = struct {
     }
 
     fn sendStatusResponse(self: *Runtime, entry: anytype, stream_id: u64, status: u16, started_us: u64) void {
-        defer self.noteRequestCompletedWithLatency(started_us, nowUs());
-        entry.h3.sendResponse(entry.conn, stream_id, status, &.{}, "") catch |err| {
-            self.logger.warn(null, "http3: terminal response send failed: {s}", .{@errorName(err)});
-            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
-            entry.h3.finishRequest(stream_id);
-            return;
-        };
+        self.queueH3Response(entry, stream_id, started_us, status, &.{}, "", "terminal");
     }
 
     fn sendHandlerResponse(self: *Runtime, entry: anytype, stream_id: u64, response: *const response_mod.Response, started_us: u64) void {
-        defer self.noteRequestCompletedWithLatency(started_us, nowUs());
         var headers_buf: [64]stream_transport.Header = undefined;
         var header_count: usize = 0;
         for (response.headers.iterator()) |header| {
@@ -2005,28 +2068,90 @@ pub const Runtime = struct {
             headers_buf[header_count] = .{ .name = header.name, .value = header.value };
             header_count += 1;
         }
-        entry.h3.sendResponse(
-            entry.conn,
+        self.queueH3Response(
+            entry,
             stream_id,
+            started_us,
             response.status.code(),
             headers_buf[0..header_count],
             response.body orelse "",
-        ) catch |err| {
-            self.logger.warn(null, "http3: response send failed: {s}", .{@errorName(err)});
+            "response",
+        );
+    }
+
+    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64, started_us: u64) void {
+        self.queueH3Response(entry, stream_id, started_us, 500, &.{}, "", "fallback");
+    }
+
+    fn queueH3Response(
+        self: *Runtime,
+        entry: anytype,
+        stream_id: u64,
+        started_us: u64,
+        status: u16,
+        headers: []const stream_transport.Header,
+        body: []const u8,
+        label: []const u8,
+    ) void {
+        var pending = PendingH3Response.init(self.allocator, stream_id, started_us, status, headers, body) catch |err| {
+            self.logger.warn(null, "http3: {s} response allocation failed: {s}", .{ label, @errorName(err) });
             entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
             entry.h3.finishRequest(stream_id);
+            self.noteRequestCompletedWithLatency(started_us, nowUs());
+            return;
+        };
+
+        const done = entry.h3.sendResponseProgress(entry.conn, stream_id, &pending.send_state) catch |err| {
+            self.logger.warn(null, "http3: {s} response send failed: {s}", .{ label, @errorName(err) });
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
+            self.noteRequestCompletedWithLatency(started_us, nowUs());
+            pending.deinit(self.allocator);
+            return;
+        };
+        if (done) {
+            self.noteRequestCompletedWithLatency(started_us, nowUs());
+            pending.deinit(self.allocator);
+            return;
+        }
+        entry.pending_h3_responses.append(self.allocator, pending) catch |err| {
+            self.logger.warn(null, "http3: failed to park {s} response after backpressure: {s}", .{ label, @errorName(err) });
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
+            self.noteRequestCompletedWithLatency(started_us, nowUs());
+            pending.deinit(self.allocator);
             return;
         };
     }
 
-    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64, started_us: u64) void {
-        defer self.noteRequestCompletedWithLatency(started_us, nowUs());
-        entry.h3.sendResponse(entry.conn, stream_id, 500, &.{}, "") catch |err| {
-            self.logger.warn(null, "http3: fallback response send failed: {s}", .{@errorName(err)});
-            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
-            entry.h3.finishRequest(stream_id);
-            return;
-        };
+    fn resumePendingH3Responses(self: *Runtime, entry: anytype, now: u64) void {
+        _ = now;
+        var i: usize = 0;
+        while (i < entry.pending_h3_responses.items.len) {
+            var done = false;
+            const stream_id = entry.pending_h3_responses.items[i].stream_id;
+            const started_us = entry.pending_h3_responses.items[i].started_us;
+            done = entry.h3.sendResponseProgress(
+                entry.conn,
+                stream_id,
+                &entry.pending_h3_responses.items[i].send_state,
+            ) catch |err| {
+                self.logger.warn(null, "http3: parked response send failed: {s}", .{@errorName(err)});
+                entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+                entry.h3.finishRequest(stream_id);
+                self.noteRequestCompletedWithLatency(started_us, nowUs());
+                var failed = entry.pending_h3_responses.orderedRemove(i);
+                failed.deinit(self.allocator);
+                continue;
+            };
+            if (!done) {
+                i += 1;
+                continue;
+            }
+            self.noteRequestCompletedWithLatency(started_us, nowUs());
+            var completed = entry.pending_h3_responses.orderedRemove(i);
+            completed.deinit(self.allocator);
+        }
     }
 
     /// Fold one connection's deadlines into the loop's sleep deadline.
@@ -5123,6 +5248,8 @@ const TestH3ResumeConn = struct {
 };
 
 const TestH3ResumeSession = struct {
+    pub const ResponseSendState = H3.ResponseSendState;
+
     send_calls: usize = 0,
     ok_sends: usize = 0,
     internal_error_sends: usize = 0,
@@ -5131,23 +5258,21 @@ const TestH3ResumeSession = struct {
     last_status: u16 = 0,
     last_stream_id: u64 = 0,
 
-    fn sendResponse(
+    fn sendResponseProgress(
         self: *TestH3ResumeSession,
         conn: *TestH3ResumeConn,
         stream_id: u64,
-        status: u16,
-        headers: []const stream_transport.Header,
-        body: []const u8,
-    ) !void {
+        state: *ResponseSendState,
+    ) !bool {
         _ = conn;
-        _ = headers;
-        _ = body;
         self.send_calls += 1;
-        self.last_status = status;
+        self.last_status = state.status;
         self.last_stream_id = stream_id;
-        if (status == 200) self.ok_sends += 1;
-        if (status == 500) self.internal_error_sends += 1;
+        if (state.status == 200) self.ok_sends += 1;
+        if (state.status == 500) self.internal_error_sends += 1;
         if (self.send_fail) return error.StreamBackpressure;
+        self.finishRequest(stream_id);
+        return true;
     }
 
     fn finishRequest(self: *TestH3ResumeSession, stream_id: u64) void {
@@ -5160,10 +5285,13 @@ const TestH3ResumeEntry = struct {
     conn: *TestH3ResumeConn,
     h3: TestH3ResumeSession = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
+    pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,
 
     fn deinit(self: *TestH3ResumeEntry, allocator: std.mem.Allocator) void {
         for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
         self.parked_h3_retries.deinit(allocator);
+        for (self.pending_h3_responses.items) |*pending| pending.deinit(allocator);
+        self.pending_h3_responses.deinit(allocator);
     }
 };
 

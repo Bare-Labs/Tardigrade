@@ -758,6 +758,66 @@ test "e2e: lossless handshake, SETTINGS, request/response, clean close" {
     try testing.expect(!info.local);
 }
 
+test "e2e: H3 response over QUIC stream send buffer resumes after backpressure" {
+    const allocator = testing.allocator;
+    var sim = try Sim.init(allocator, .{
+        .scenario = "large-h3-response-backpressure",
+        .limits = .{
+            .max_iterations = 32_768,
+            .max_queued_datagrams = 256,
+            .max_queued_bytes = 512 * 1024,
+        },
+    });
+    defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
+
+    try sim.runUntil(Sim.bothEstablished, 30_000_000);
+
+    var client_h3 = H3.init(allocator, .client);
+    defer client_h3.deinit();
+    var server_h3 = H3.init(allocator, .server);
+    defer server_h3.deinit();
+    try client_h3.start(sim.client);
+    try server_h3.start(sim.server);
+
+    const body = try allocator.alloc(u8, connection.max_stream_send_buffer + 64 * 1024);
+    defer allocator.free(body);
+    for (body, 0..) |*byte, i| byte.* = @intCast(i & 0xff);
+
+    const request_id = try client_h3.sendRequest(sim.client, .{
+        .authority = "tardigrade.test",
+        .path = "/large.bin",
+    });
+
+    var send_state: ?H3.ResponseSendState = null;
+    var response_stream_id: u64 = 0;
+    var response_done = false;
+    const budget_end = sim.now_us + 60_000_000;
+    while (sim.now_us < budget_end and !response_done) {
+        _ = try sim.step();
+        try server_h3.pump(sim.server);
+        if (send_state == null) {
+            if (try server_h3.pollRequest()) |incoming| {
+                try testing.expectEqualStrings("/large.bin", incoming.exchange.request.path);
+                response_stream_id = incoming.stream_id;
+                send_state = H3.ResponseSendState.init(200, &.{}, body);
+            }
+        }
+        if (send_state) |*state| {
+            _ = try server_h3.sendResponseProgress(sim.server, response_stream_id, state);
+        }
+        try client_h3.pump(sim.client);
+        if (try client_h3.pollResponse(request_id)) |response| {
+            try testing.expectEqual(@as(u16, 200), response.status);
+            try testing.expectEqualSlices(u8, body, response.body);
+            response_done = true;
+        }
+    }
+
+    try testing.expect(response_done);
+    client_h3.releaseResponse(request_id);
+}
+
 test "#488: runtime-backed resumed QUIC connection exchanges HTTP/3 after transport params change" {
     const allocator = testing.allocator;
     const runtime = tls_core.resumption_runtime;

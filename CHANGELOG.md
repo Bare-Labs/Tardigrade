@@ -5,6 +5,12 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [0.6.4] - 2026-08-27
 
 ### Fixed
+- **HTTP/3 responses larger than the QUIC per-stream send buffer now resume
+  after backpressure (#701)** — H3 response writes now keep an explicit send
+  cursor and the runtime parks/resumes large responses across event-loop
+  passes instead of treating a full 256 KiB QUIC stream send buffer as a
+  terminal failure.
+
 - **TLS upstream pooling no longer discards healthy fragmented-record
   connections (#695)** — the post-release TLS staleness check added during the
   F-06 hardening campaign could treat a partial TLS record already buffered in
