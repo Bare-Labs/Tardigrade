@@ -350,6 +350,14 @@ jq -n \
 # exploratory/reduced run are never ambiguous from the JSON alone.
 finalize_result_file() {
     local save_file="$1" sut_meta_json="$2"
+    if [[ ! -f "$save_file" ]]; then
+        echo "FATAL: benchmarks/run.sh did not write ${save_file} -- it likely aborted" >&2
+        echo "  partway through (this machine's own outbound connection churn from" >&2
+        echo "  rapid back-to-back short scenario runs, especially under --smoke, can" >&2
+        echo "  transiently exhaust local ephemeral ports as 'Can't assign requested" >&2
+        echo "  address'). Not a stale/misleading result -- there is no result." >&2
+        exit 1
+    fi
     local total_errors
     total_errors="$(jq '[to_entries[] | select(.key != "_meta") | (.value.errors // 0)] | add // 0' "$save_file")"
     local canonical=true
