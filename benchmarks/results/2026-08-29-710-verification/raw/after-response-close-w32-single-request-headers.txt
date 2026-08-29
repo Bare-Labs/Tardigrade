@@ -1,0 +1,17 @@
+HTTP/1.1 200 OK
+Server: tardigrade
+Connection: keep-alive
+Transfer-Encoding: chunked
+X-Request-ID: tg-1788047516410-455249145d765a67
+X-Correlation-ID: tg-1788047516410-455249145d765a67
+Date: Sat, 29 Aug 2026 23:51:56 GMT
+Content-Type: text/plain
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'self'
+Referrer-Policy: strict-origin-when-cross-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+X-XSS-Protection: 0
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+

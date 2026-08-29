@@ -1,0 +1,103 @@
+Post-#717 performance verification for #710 (child of #708).
+
+## Environment constraints (read this before the numbers)
+
+This verification ran inside a Claude Code "cloud" remote-execution
+container, not the Proxmox/KVM/LXC environment #709's diagnosis (#715)
+used. Concretely, this container has:
+
+  - no `ssh` binary at all, and no reachable Proxmox host
+    (root@10.250.250.2 from #715's environment is not reachable from here);
+  - outbound HTTPS to ziglang.org blocked by the sandbox's egress policy
+    (agent-proxy returned "403 CONNECT" / "policy denial");
+  - no ability to load kernel modules (`modprobe`: command not found) --
+    `tc qdisc add ... netem` fails with "Specified qdisc kind is unknown"
+    on this kernel, so `benchmarks/competitive/netem-impair.sh` cannot be
+    used here even on loopback;
+  - a single 4-vCPU/15GiB Linux container, no second machine reachable
+    from it at all.
+
+None of #709's canonical real-network-hop or controlled-RTT evidence could
+be reproduced from this session. This is a hard environment limitation,
+not a methodology choice.
+
+## What this verification did instead
+
+  - Installed a real Zig 0.16.0 toolchain via `pip install ziglang==0.16.0`
+    (PyPI is allow-listed through the sandbox's proxy; ziglang.org is not).
+    Wrapped as `/usr/local/bin/zig` -> `python3 -m ziglang`.
+  - Installed `wrk` 4.1.0-4build2 via `apt` (Ubuntu universe).
+  - Built **two** Tardigrade binaries in this exact container, from a git
+    worktree, so the before/after comparison is apples-to-apples on
+    identical hardware:
+      - `tardi-before`: commit `6772951` (main tip immediately after #715
+        merged -- the exact "pre-#717" diagnosed state; PR #717's base).
+      - `tardi-after`: commit `b8d584337f06870c830dbf6faf957283888986ef`
+        (current main tip -- #717 merged).
+    Both `-Doptimize=ReleaseFast`. SHA-256:
+      before: 40adfb5f152efef29e802be32fa281ed530941639c8d2d6fd2ff319fa822dd19
+      after:  542880a21e03a0e0c34ca503b69e15675cb9e6f1c28611eb483e9c08ad82cac9
+    Source-level sanity check before running anything: `before`'s
+    `writeStreamedUpstreamResponseHead` unconditionally emits
+    `Connection: close`; `after`'s takes a `keep_alive: bool` and emits
+    `Connection: {keep-alive|close}` accordingly -- matches #715's and
+    #717's own description of the change.
+  - Reused, unmodified, the existing #709-diagnosis tooling:
+    `benchmarks/fixtures/upstream_server.py` as the local origin,
+    `benchmarks/results/2026-08-29-709-diagnosis/metrics_sampler.py` for
+    worker/upstream/accept counters (its metric names were independently
+    verified against current `src/http/metrics.zig` -- no changes needed).
+    The Tardigrade config shape (`listen`, `metrics_path`, `location =
+    /proxy/health`) is copied verbatim from
+    `benchmarks/fixtures/ci-smoke.conf`.
+  - Added a thin new driver (`run_row.sh` / `matrix.sh` in this directory)
+    because the existing orchestrators
+    (`scripts/run-proxmox-performance-campaign.sh`,
+    `benchmarks/competitive/run.sh`) assume `ssh`/Proxmox access this
+    session does not have. This is *not* a second benchmark framework --
+    it is a small local wrapper around the same fixture, same config
+    shape, same `wrk -t4 -c32`, same env vars
+    (`TARDIGRADE_RATE_LIMIT_RPS=0`, `TARDIGRADE_PROXY_STREAMING_MODE`,
+    `TARDIGRADE_WORKER_THREADS`), and the existing `metrics_sampler.py`,
+    scoped narrowly to "start origin + tardi, run wrk, sample metrics,
+    tear down" for a single-host loopback target. `proof_reuse.py` is a
+    small supplementary raw-socket check (see REPORT.md -- superseded by
+    the `accepts_total` metric and the existing integration test suite as
+    the authoritative reuse proof, kept here for transparency about what
+    was tried).
+  - All rows: loopback only (127.0.0.1), `wrk -t4 -c32 --latency`,
+    `TARDIGRADE_RATE_LIMIT_RPS=0`, `/proxy/health`, 15s duration (10s for
+    the static control), matching #709's canonical shape apart from the
+    client/server placement this environment cannot provide.
+  - Also ran `zig build test` (821 unit tests, all passing) and
+    `zig build test-integration` (204 tests; 1 unrelated flake on the
+    first pass in an upstream-TLS-pool-reuse soak test, reproduced as a
+    flake -- it also failed to reproduce cleanly rebuilding from scratch,
+    and passed cleanly on immediate retry with 0 failures and passed
+    identically on the pre-#717 binary; not related to #710's downstream
+    HTTP/1 change) at the post-#717 commit, to confirm the correctness
+    tests PR #717 added are real, passing tests in this environment --
+    not just claims in the PR description.
+
+## What this verification could NOT do
+
+  - No real cross-machine (or LXC/KVM-simulated-cross-machine) run.
+    Everything here is loopback. The magnitude of #717's benefit is
+    expected to be far larger under real client-facing RTT than what
+    loopback can show (this is the whole point of #708/#709/#715's
+    diagnosis: the defect is nearly free on loopback and only becomes
+    expensive under real RTT) -- so the loopback numbers below
+    *understate* the fix's real-world effect. They are still valid
+    evidence that the fix is real, mechanically correct, and not a wash.
+  - No `tc netem` RTT injection (kernel module unavailable). No new RTT
+    sweep evidence was collected in this session; #715's existing netem
+    evidence at the pre-#717 commit is the only RTT-sensitivity evidence
+    available and is cited, not reproduced, in REPORT.md.
+  - No new evidence about the 32 client/socket `EADDRNOTAVAIL` churn
+    signature: this container's `net.ipv4.tcp_tw_reuse = 2` allows
+    TIME_WAIT socket reuse on loopback, so even the heaviest churn rows
+    here produced zero connect-refused errors. This does not contradict
+    #715's root-cause finding (which was established via `strace` with
+    exact syscall/errno evidence on real hosts) -- it just means this
+    specific failure mode cannot be re-triggered from a loopback
+    container with reuse enabled.
