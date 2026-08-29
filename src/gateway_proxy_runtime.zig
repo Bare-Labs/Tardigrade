@@ -798,6 +798,7 @@ pub fn handleLocationProxyPass(
                 correlation_id,
             );
             try propagateStreamingDownstreamAbortAfterStatus(state, &streamed);
+            if (streamed.upstream_aborted) downstream_broken.* = true;
             // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
             // origin". A truncation this proxy caused by running out of buffer
             // capacity is not that, and counting it there would misattribute
