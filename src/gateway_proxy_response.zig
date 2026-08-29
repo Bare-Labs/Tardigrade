@@ -34,6 +34,7 @@ pub fn writeStreamedUpstreamResponse(
     reason: []const u8,
     content_type: []const u8,
     content_disposition: ?[]const u8,
+    keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
     alt_svc: ?[]const u8,
@@ -47,6 +48,7 @@ pub fn writeStreamedUpstreamResponse(
         reason,
         content_type,
         content_disposition,
+        keep_alive,
         correlation_id,
         security,
         alt_svc,
@@ -58,6 +60,7 @@ pub fn writeStreamedUpstreamResponse(
             reason,
             content_type,
             content_disposition,
+            keep_alive,
             correlation_id,
             security,
             alt_svc,
@@ -74,6 +77,7 @@ pub fn writeStreamedUpstreamResponseHead(
     reason: []const u8,
     content_type: []const u8,
     content_disposition: ?[]const u8,
+    keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
     alt_svc: ?[]const u8,
@@ -86,7 +90,7 @@ pub fn writeStreamedUpstreamResponseHead(
 
     try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status_code, phrase });
     try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
-    try writer.writeAll("Connection: close\r\n");
+    try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     try writer.writeAll("Transfer-Encoding: chunked\r\n");
     try writer.print("Content-Type: {s}\r\n", .{content_type});
     try gph.writeRequestIdHeaders(writer, correlation_id);
@@ -108,6 +112,7 @@ pub fn writeStreamedUpstreamResponseHeadFromHeaders(
     reason: []const u8,
     upstream_headers: anytype,
     body_allowed: bool,
+    keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
     alt_svc: ?[]const u8,
@@ -120,7 +125,7 @@ pub fn writeStreamedUpstreamResponseHeadFromHeaders(
 
     try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status_code, phrase });
     try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
-    try writer.writeAll("Connection: close\r\n");
+    try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     if (body_allowed) try writer.writeAll("Transfer-Encoding: chunked\r\n");
     try gph.writeRequestIdHeaders(writer, correlation_id);
     for (upstream_headers) |header| {
@@ -736,6 +741,7 @@ test "writeStreamedUpstreamResponse emits effective Alt-Svc policy" {
         "OK",
         "text/plain",
         null,
+        true,
         "req-stream-alt-svc",
         &http.security_headers.SecurityHeaders.api,
         "h3=\":8443\"; ma=120",
@@ -743,6 +749,7 @@ test "writeStreamedUpstreamResponse emits effective Alt-Svc policy" {
     );
 
     const output = stream.getWritten();
+    try std.testing.expect(std.mem.find(u8, output, "Connection: keep-alive\r\n") != null);
     try std.testing.expect(std.mem.find(u8, output, "Transfer-Encoding: chunked\r\n") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc:"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc: h3=\":8443\"; ma=120\r\n"));
@@ -765,6 +772,7 @@ test "writeStreamedUpstreamResponseHeadFromHeaders strips upstream Alt-Svc and e
         "OK",
         upstream_headers[0..],
         true,
+        true,
         "req-stream-headers-alt-svc",
         &http.security_headers.SecurityHeaders.api,
         "clear",
@@ -772,6 +780,7 @@ test "writeStreamedUpstreamResponseHeadFromHeaders strips upstream Alt-Svc and e
     );
 
     const output = stream.getWritten();
+    try std.testing.expect(std.mem.find(u8, output, "Connection: keep-alive\r\n") != null);
     try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: h3=\":443\"") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc:"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc: clear\r\n"));
