@@ -615,6 +615,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                 upstream_reason,
                 upstream_content_type,
                 upstream_content_disposition,
+                false,
                 correlation_id,
                 &state.security_headers,
                 state.http3_alt_svc,

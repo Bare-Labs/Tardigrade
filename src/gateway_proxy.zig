@@ -986,6 +986,7 @@ fn runNegotiatedH1Exchange(
     alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     correlation_id: []const u8,
+    downstream_keep_alive: bool,
     connect_timeout_ms: u32,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
@@ -995,7 +996,7 @@ fn runNegotiatedH1Exchange(
     downstream_committed: *bool,
 ) !StreamingProxyResult {
     var wrote_downstream = false;
-    const res = streamProxyOverTransport(allocator, transport, fd, relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity) catch |err| {
+    const res = streamProxyOverTransport(allocator, transport, fd, relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity) catch |err| {
         downstream_committed.* = wrote_downstream;
         return err;
     };
@@ -1030,6 +1031,7 @@ fn streamViaH2Pool(
     alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     correlation_id: []const u8,
+    downstream_keep_alive: bool,
     connect_timeout_ms: u32,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
@@ -1079,7 +1081,7 @@ fn streamViaH2Pool(
                 // own, so this is an ordinary HTTP/1 exchange: allocate and
                 // charge at the current config's size, exactly as the h1 path
                 // below does.
-                const result = try runNegotiatedH1Exchange(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global }, downstream_committed);
+                const result = try runNegotiatedH1Exchange(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global }, downstream_committed);
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return result;
             },
@@ -1365,6 +1367,7 @@ fn streamViaH2Pool(
                     reason,
                     stream.headers.items,
                     body_allowed,
+                    downstream_keep_alive,
                     correlation_id,
                     security,
                     alt_svc,
@@ -2843,6 +2846,7 @@ fn streamProxyOverTransport(
     alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     correlation_id: []const u8,
+    downstream_keep_alive: bool,
     connect_timeout_ms: u32,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
@@ -2944,6 +2948,7 @@ fn streamProxyOverTransport(
         reason,
         head.headers,
         body_allowed,
+        downstream_keep_alive,
         correlation_id,
         security,
         alt_svc,
@@ -3033,6 +3038,7 @@ pub fn executeStreamingHttpProxyRequest(
     alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     cancel_token: ?*const CancellationToken,
+    downstream_keep_alive: bool,
     proxy_buffer_observer: proxy_buffer_account.Observer,
     /// Process-wide proxy buffer aggregate (#140). Streams reserve against it
     /// before retaining queued body bytes, so aggregate memory stays bounded no
@@ -3122,7 +3128,7 @@ pub fn executeStreamingHttpProxyRequest(
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) tls_options.? else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global, downstream_committed);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global, downstream_committed);
         }
         if (streaming_body != null) {
             if (pool) |p| p.recordH2StreamingUploadFallback();
@@ -3217,9 +3223,9 @@ pub fn executeStreamingHttpProxyRequest(
         const exchange_start_ms = http.event_loop.monotonicMs();
         const fd = conn.stream.handle;
         const res = (if (conn.tls) |tls|
-            streamProxyOverTransport(allocator, tls, fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)
+            streamProxyOverTransport(allocator, tls, fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)
         else
-            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)) catch |err| {
+            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)) catch |err| {
             // Tear down the connection (release handles active-- and close).
             if (active_pool) |p| {
                 p.release(key, conn, false, http.event_loop.monotonicMs());
@@ -4944,6 +4950,7 @@ fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
         null,
         null,
         "lifetime-test",
+        true,
         2000,
         5000,
         null,
@@ -5016,6 +5023,7 @@ fn runH2CancelExchangeThread(ctx: *H2ExchangeCtx, token: *CancellationToken) voi
         null,
         null,
         "h2-cancel-test",
+        true,
         2000,
         5000,
         token,
@@ -5252,6 +5260,7 @@ test "http2 upload capacity is refused before HEADERS reach the origin" {
             null,
             null,
             "test-correlation-id",
+            false,
             2000,
             2000,
             null,
@@ -5677,6 +5686,7 @@ const Http1ResponseRelay = struct {
             null,
             null,
             "origin-buffer-test",
+            true,
             0,
             self.read_deadline_ms,
             self.cancel_token,
@@ -6155,6 +6165,7 @@ fn runH2GatedExchangeThread(ctx: *H2GatedExchangeCtx) void {
         null,
         null,
         "h2-response-buffer-test",
+        true,
         2000,
         10_000,
         null,
@@ -6721,6 +6732,7 @@ fn runH2TrackedExchange(ctx: *H2TrackedExchangeCtx) void {
         null,
         null,
         "h2-allocation-test",
+        true,
         2000,
         10_000,
         null,

@@ -2363,6 +2363,26 @@ fn readHttpResponseWithTimeout(allocator: std.mem.Allocator, stream: compat.NetS
                 if (headerValue(headers_raw, "Content-Length")) |content_length_raw| {
                     const content_length = std.fmt.parseInt(usize, content_length_raw, 10) catch return error.InvalidHttpResponse;
                     target_len = idx + 4 + content_length;
+                } else if (headerValue(headers_raw, "Transfer-Encoding")) |te| {
+                    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, te, " \t\r\n"), "chunked")) {
+                        target_len = chunkedEncodedMessageEnd(raw_buf.items[idx + 4 ..]) catch |err| switch (err) {
+                            error.IncompleteChunkedBody => null,
+                            else => return err,
+                        };
+                        if (target_len) |body_end| target_len = idx + 4 + body_end;
+                    }
+                }
+            }
+        } else if (target_len == null) {
+            const idx = header_end.?;
+            const headers_raw = raw_buf.items[0 .. idx + 2];
+            if (headerValue(headers_raw, "Transfer-Encoding")) |te| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, te, " \t\r\n"), "chunked")) {
+                    target_len = chunkedEncodedMessageEnd(raw_buf.items[idx + 4 ..]) catch |err| switch (err) {
+                        error.IncompleteChunkedBody => null,
+                        else => return err,
+                    };
+                    if (target_len) |body_end| target_len = idx + 4 + body_end;
                 }
             }
         }
@@ -2406,6 +2426,29 @@ fn readHttpResponseWithTimeout(allocator: std.mem.Allocator, stream: compat.NetS
     };
 }
 
+fn chunkedEncodedMessageEnd(data: []const u8) !?usize {
+    var pos: usize = 0;
+    while (true) {
+        const line_end_rel = std.mem.find(u8, data[pos..], "\r\n") orelse return error.IncompleteChunkedBody;
+        const line = data[pos .. pos + line_end_rel];
+        const semi = std.mem.findScalar(u8, line, ';');
+        const hex = std.mem.trim(u8, if (semi) |idx| line[0..idx] else line, " \t");
+        const chunk_len = std.fmt.parseInt(usize, hex, 16) catch return error.InvalidHttpResponse;
+        pos += line_end_rel + 2;
+        if (chunk_len == 0) {
+            while (true) {
+                const trailer_end_rel = std.mem.find(u8, data[pos..], "\r\n") orelse return error.IncompleteChunkedBody;
+                if (trailer_end_rel == 0) return pos + 2;
+                pos += trailer_end_rel + 2;
+            }
+        }
+        if (pos + chunk_len + 2 > data.len) return error.IncompleteChunkedBody;
+        pos += chunk_len;
+        if (data[pos] != '\r' or data[pos + 1] != '\n') return error.InvalidHttpResponse;
+        pos += 2;
+    }
+}
+
 fn decodeChunkedHttpBody(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
@@ -2433,7 +2476,7 @@ fn readHttpHeadersOnly(allocator: std.mem.Allocator, stream: compat.NetStream) !
     var tmp: [1024]u8 = undefined;
 
     while (true) {
-        const n = try stream.read(&tmp);
+        const n = try readSocketWithPoll(stream.handle, &tmp, 5_000);
         if (n == 0) return error.InvalidHttpResponse;
         try raw_buf.appendSlice(tmp[0..n]);
         if (std.mem.find(u8, raw_buf.items, "\r\n\r\n") != null) break;
@@ -13595,6 +13638,190 @@ test "proxy streaming mode relays upstream body beyond buffered cap" {
     try std.testing.expectEqual(@as(u64, 0), buffered);
 }
 
+test "proxy streaming mode reuses downstream connection after clean streamed response" {
+    const allocator = std.testing.allocator;
+    const payload_len = 128 * 1024;
+    const first_payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(first_payload);
+    const second_payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(second_payload);
+    @memset(first_payload, 'a');
+    @memset(second_payload, 'b');
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{
+            .body = first_payload,
+            .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+        },
+        .{
+            .body = second_payload,
+            .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+        },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/proxy/first.bin");
+    var first = try readHttpResponse(allocator, stream);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("keep-alive", first.header("Connection").?);
+    try std.testing.expectEqualStrings("chunked", first.header("Transfer-Encoding").?);
+    try std.testing.expectEqualStrings(first_payload, first.body);
+
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/proxy/second.bin");
+    var second = try readHttpResponse(allocator, stream);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try std.testing.expectEqualStrings("keep-alive", second.header("Connection").?);
+    try std.testing.expectEqualStrings("chunked", second.header("Transfer-Encoding").?);
+    try std.testing.expectEqualStrings(second_payload, second.body);
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
+test "proxy streaming mode reuses downstream connection after clean h2c upstream stream" {
+    const allocator = std.testing.allocator;
+    const payload_len = 8 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'h');
+
+    var upstream = try H2cUpstreamServer.start(allocator, payload);
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+            .{ .name = "TARDIGRADE_UPSTREAM_PROTOCOL", .value = "h2c" },
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/proxy/h2c-first.bin");
+    var first = try readHttpResponse(allocator, stream);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("keep-alive", first.header("Connection").?);
+    try std.testing.expectEqualStrings("chunked", first.header("Transfer-Encoding").?);
+    try std.testing.expectEqualStrings(payload, first.body);
+
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/proxy/h2c-second.bin");
+    var second = try readHttpResponse(allocator, stream);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try std.testing.expectEqualStrings("keep-alive", second.header("Connection").?);
+    try std.testing.expectEqualStrings("chunked", second.header("Transfer-Encoding").?);
+    try std.testing.expectEqualStrings(payload, second.body);
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
+test "proxy streaming mode preserves downstream close policies" {
+    const allocator = std.testing.allocator;
+    const payload_len = 96 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'c');
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = payload, .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }} },
+        .{ .body = payload, .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }} },
+        .{ .body = payload, .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }} },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+            .{ .name = "TARDIGRADE_MAX_REQUESTS_PER_CONNECTION", .value = "2" },
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    {
+        var close_response = try sendRequest(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/proxy/client-close.bin",
+            .body = null,
+            .headers = &.{},
+        });
+        defer close_response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), close_response.status_code);
+        try std.testing.expectEqualStrings("close", close_response.header("Connection").?);
+        try std.testing.expectEqualStrings("chunked", close_response.header("Transfer-Encoding").?);
+        try std.testing.expectEqualStrings(payload, close_response.body);
+    }
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/proxy/max-first.bin");
+    var first = try readHttpResponse(allocator, stream);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("keep-alive", first.header("Connection").?);
+
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/proxy/max-second.bin");
+    var second = try readHttpResponse(allocator, stream);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try std.testing.expectEqualStrings("close", second.header("Connection").?);
+
+    var probe: [1]u8 = undefined;
+    const n = try readSocketWithPoll(stream.handle, &probe, 5_000);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
 test "proxy route streaming policy overrides global mode" {
     const allocator = std.testing.allocator;
     const payload_len = 256 * 1024;
@@ -13778,6 +14005,90 @@ test "proxy streaming mode handles chunked and no-body upstream responses" {
     try std.testing.expect(not_modified.header("Transfer-Encoding") == null);
 }
 
+test "proxy streaming mode keeps bodiless downstream responses reusable when eligible" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{
+            .body = "head body must not be forwarded",
+            .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+        },
+        .{
+            .status_code = 204,
+            .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+            .omit_body = true,
+        },
+        .{
+            .status_code = 304,
+            .headers = &.{.{ .name = "ETag", .value = "\"abc\"" }},
+            .omit_body = true,
+        },
+        .{
+            .body = "final streamed body",
+            .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+            .chunked = true,
+        },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "2048" },
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    const requests = [_]struct {
+        method: []const u8,
+        path: []const u8,
+        status: u16,
+    }{
+        .{ .method = "HEAD", .path = "/proxy/head", .status = 200 },
+        .{ .method = "GET", .path = "/proxy/no-content", .status = 204 },
+        .{ .method = "GET", .path = "/proxy/not-modified", .status = 304 },
+    };
+
+    for (requests) |request| {
+        const raw_request = try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: keep-alive\r\n\r\n",
+            .{ request.method, request.path, test_host, tardigrade.port },
+        );
+        defer allocator.free(raw_request);
+        try stream.writeAll(raw_request);
+
+        const raw_head = try readHttpHeadersOnly(allocator, stream);
+        defer allocator.free(raw_head);
+        try std.testing.expectEqual(request.status, try parseStatusCode(raw_head));
+        try std.testing.expectEqualStrings("keep-alive", headerValue(raw_head, "Connection").?);
+        try std.testing.expect(headerValue(raw_head, "Transfer-Encoding") == null);
+    }
+
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/proxy/final");
+    var final = try readHttpResponse(allocator, stream);
+    defer final.deinit();
+    try std.testing.expectEqual(@as(u16, 200), final.status_code);
+    try std.testing.expectEqualStrings("keep-alive", final.header("Connection").?);
+    try std.testing.expectEqualStrings("chunked", final.header("Transfer-Encoding").?);
+    try std.testing.expectEqualStrings("final streamed body", final.body);
+    try std.testing.expectEqual(@as(u32, 4), upstream.requestCount());
+}
+
 test "proxy streaming mode records upstream abort after partial body" {
     const allocator = std.testing.allocator;
 
@@ -13821,6 +14132,81 @@ test "proxy streaming mode records upstream abort after partial body" {
     defer metrics.deinit();
     const upstream_aborts = prometheusMetricValue(metrics.body, "tardigrade_proxy_upstream_aborts_total") orelse return error.InvalidHttpResponse;
     try std.testing.expect(upstream_aborts >= 1);
+}
+
+test "proxy streaming mode closes downstream after graceful upstream truncation on keepalive request" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "abcdef",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+        .declared_content_length = 6,
+        .truncate_body_after = 3,
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "1024" },
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /proxy/truncated HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n");
+
+    var raw = std.array_list.Managed(u8).init(allocator);
+    defer raw.deinit();
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = readSocketWithPoll(stream.handle, &tmp, 5_000) catch |err| switch (err) {
+            error.ConnectionResetByPeer => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        try raw.appendSlice(tmp[0..n]);
+    }
+
+    var status_line_count: usize = 0;
+    var it = std.mem.splitSequence(u8, raw.items, "\r\n");
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "HTTP/1.1 ")) status_line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), status_line_count);
+    try assertContains(raw.items, "HTTP/1.1 200 OK");
+    try std.testing.expect(std.mem.find(u8, raw.items, "0\r\n\r\n") == null);
+
+    stream.writeAll("GET /proxy/after-truncate HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n") catch {};
+    var probe: [1]u8 = undefined;
+    const n = readSocketWithPoll(stream.handle, &probe, 5_000) catch |err| switch (err) {
+        error.ConnectionResetByPeer => @as(usize, 0),
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    const upstream_aborts = prometheusMetricValue(metrics.body, "tardigrade_proxy_upstream_aborts_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(upstream_aborts >= 1);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "proxy streaming mode never serializes a second HTTP response after the downstream head is committed" {
@@ -13869,7 +14255,7 @@ test "proxy streaming mode never serializes a second HTTP response after the dow
     var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
     defer stream.close();
     try setStreamTimeouts(&stream, 5_000);
-    try stream.writeAll("GET /proxy/reset HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    try stream.writeAll("GET /proxy/reset HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n");
 
     var raw = std.array_list.Managed(u8).init(allocator);
     defer raw.deinit();
@@ -13892,6 +14278,14 @@ test "proxy streaming mode never serializes a second HTTP response after the dow
     }
     try std.testing.expectEqual(@as(usize, 1), status_line_count);
     try assertContains(raw.items, "HTTP/1.1 200 OK");
+
+    stream.writeAll("GET /proxy/after-reset HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n") catch {};
+    var probe: [1]u8 = undefined;
+    const n = readSocketWithPoll(stream.handle, &probe, 5_000) catch |err| switch (err) {
+        error.ConnectionResetByPeer => @as(usize, 0),
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 0), n);
 }
 
 test "proxy full streaming mode relays fixed-length upload beyond request buffer cap" {

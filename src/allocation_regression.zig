@@ -487,6 +487,7 @@ fn runProxyStreamedHeaderSerializer() !void {
         "OK",
         &upstream_headers,
         true,
+        false,
         "tg-1778460305668-bfebecb410803023",
         &security,
         null,
