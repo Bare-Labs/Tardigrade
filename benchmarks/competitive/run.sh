@@ -268,7 +268,7 @@ wait_for_https() {
     local attempts="${2:-60}"
     local delay="${3:-0.2}"
     local host_header="${4:-}"
-    local extra=()
+    local extra=(--http1.1)
     [[ -n "$host_header" ]] && extra+=(-H "Host: ${host_header}")
     local i
     for ((i = 0; i < attempts; i += 1)); do
@@ -320,6 +320,10 @@ start_nginx() {
     local port="$1"
     local dir="${TMP_DIR}/nginx"
     mkdir -p "${dir}/logs" "${dir}/client_body_temp" "${dir}/proxy_temp"
+    # nginx's compiled-in default drops workers to an unprivileged user (no
+    # explicit `user` directive in nginx.conf.in), which must still be able
+    # to write proxy/client-body buffer files under this root-owned dir.
+    chmod -R a+rwX "$dir"
     render_template "${CONFIG_DIR}/nginx.conf.in" "${dir}/nginx.conf" "$port" "${dir}/nginx.pid" "${dir}/logs/error.log"
     nginx -p "$dir" -c "${dir}/nginx.conf" -g "daemon off;" >"${dir}/server.log" 2>&1 &
     EDGE_PID="$!"
@@ -687,6 +691,7 @@ assert_payload_size() {
     tmp="$(mktemp /tmp/tardigrade-competitive-payload-XXXX)"
     local extra=()
     [[ -n "$host_header" ]] && extra+=(-H "Host: ${host_header}")
+    [[ "$url" == https://* ]] && extra+=(--http1.1)
     # -k is a no-op for plain http:// URLs; needed for the benchmark-only
     # self-signed H3 listener's https:// URLs (#256-G).
     curl -k -fsS "${extra[@]+"${extra[@]}"}" "$url" -o "$tmp"
@@ -854,8 +859,10 @@ run_tardigrade_http3_matrix() {
         return 1
     fi
     assert_payload_size "https://127.0.0.1:${port}/tiny.txt" 3 "$H3_TLS_SERVER_NAME"
-    assert_payload_size "https://127.0.0.1:${port}/large.bin" 1048576 "$H3_TLS_SERVER_NAME"
-    assert_payload_size "https://127.0.0.1:${port}/proxy/payload-1m.bin" 1048576 "$H3_TLS_SERVER_NAME"
+    if ! $SMOKE; then
+        assert_payload_size "https://127.0.0.1:${port}/large.bin" 1048576 "$H3_TLS_SERVER_NAME"
+        assert_payload_size "https://127.0.0.1:${port}/proxy/payload-1m.bin" 1048576 "$H3_TLS_SERVER_NAME"
+    fi
 
     if ! verify_h3_listener "$port"; then
         echo "  H3/QUIC listener did not answer a real HTTP/3 request." >&2
@@ -1274,6 +1281,10 @@ fi
 
 mkdir -p "$OUT_DIR"
 TMP_DIR="$(mktemp -d /tmp/tardigrade-competitive-XXXX)"
+# mktemp -d defaults to 0700; competitor servers (e.g. nginx) drop worker
+# privileges to an unprivileged build-time user that must still be able to
+# traverse into this directory to serve static files under it.
+chmod 755 "$TMP_DIR"
 mkdir -p "${TMP_DIR}/public"
 printf 'ok\n' > "${TMP_DIR}/public/tiny.txt"
 dd if=/dev/zero of="${TMP_DIR}/public/large.bin" bs=1024 count=1024 >/dev/null 2>&1

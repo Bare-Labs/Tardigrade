@@ -35,6 +35,10 @@ Run benchmarks on a dedicated, isolated benchmark target by default.
 # Canonical competitor numbers still belong on a dedicated idle host.
 ./benchmarks/competitive/run.sh
 
+# Proxmox KVM campaign: create a fresh VM, build an immutable Git ref, run the
+# competitive suite, collect artifacts, and tear the VM down.
+./scripts/run-proxmox-performance-campaign.sh
+
 # Listener-sharding suite: starts the same gateway command twice, with
 # TARDIGRADE_LISTENER_SHARDS=1 and =N, then saves comparable workload results
 # and per-shard accept metrics. Canonical numbers still belong on a dedicated
@@ -58,6 +62,57 @@ Install at least one load-generation tool. The runner auto-detects in this order
 | [`k6`](https://k6.io/) | `brew install k6` / apt | HTTP/1.1 + HTTP/2 (over TLS) + behavioral scenarios |
 
 `jq` is required for result formatting, baseline comparison, and report generation.
+
+## Proxmox performance campaign
+
+`scripts/run-proxmox-performance-campaign.sh` is the repeatable #593
+fresh-host path for lab Proxmox runs. It connects to a Proxmox host over SSH,
+creates a disposable Debian guest, installs the benchmark dependencies inside
+the guest, builds a pinned Tardigrade Git ref with Zig 0.16.0, runs the selected
+suite, pulls `benchmarks/results/` artifacts back to the local workspace, and
+destroys the guest by default.
+
+Canonical #593 evidence uses `--mode kvm` (the default). The KVM path provisions
+a Proxmox VM from a Debian cloud image, captures Proxmox host metadata separately
+from guest metadata, refuses to run on a non-idle host unless `--noncanonical` is
+explicitly set, and fails closed if required Linux capabilities are unavailable:
+`perf`, `strace`, `tc`, `io_uring`, and a QUIC-linked `h2load` for H3 rows.
+
+`--mode lxc-smoke` is retained only for cheap orchestration smoke tests. LXC
+results must not be presented as canonical #593 evidence because unprivileged
+containers do not reliably expose `perf_event`, `CAP_NET_ADMIN`/`tc netem`, or
+real `io_uring` behavior.
+
+The default SSH target is `root@10.250.250.2` with local source address
+`10.250.250.1`, matching the direct MacBook-to-Proxmox benchmark link used for
+control traffic and artifact transfer. Published benchmark traffic still runs
+inside the guest against `127.0.0.1`, per the benchmark policy above.
+
+Useful examples:
+
+```bash
+# Full default competitive suite in a fresh KVM VM from the v0.6.4 ref.
+./scripts/run-proxmox-performance-campaign.sh
+
+# Bounded validation run that keeps the VM for inspection.
+./scripts/run-proxmox-performance-campaign.sh \
+  --duration 5 --connections 8 --threads 2 --keep-guest
+
+# Also run the accept-batching/listener-sharding suite in the same fresh VM.
+./scripts/run-proxmox-performance-campaign.sh \
+  --suite competitive --suite listener-sharding \
+  --duration 30 --connections 50 --threads 4 --shards 4
+
+# Non-canonical smoke: validate create/run/destroy mechanics cheaply in LXC.
+./scripts/run-proxmox-performance-campaign.sh \
+  --mode lxc-smoke --tardigrade-ref HEAD \
+  --duration 1 --connections 1 --threads 1 --servers tardigrade
+```
+
+Use `--tardigrade-ref` to select the exact tag or commit being measured. The
+script archives that Git object, records the requested ref, resolved commit, and
+source archive SHA-256 in the result metadata, and avoids labeling mutable
+worktree bytes as a clean release. Run `--help` for the full option list.
 
 ## Release baseline process
 
@@ -408,9 +463,11 @@ Benchmark results are only meaningful when the test environment is controlled:
 Document the test host in each baseline file's `_meta.host` field and merge the
 appropriate benchmark-context JSON with `--meta-file`.
 
-The canonical benchmark target is the **Beelink Mini PC** (4-core Debian LXC).
-Use `benchmarks/targets/beelink.json` with `--meta-file` for release baselines.
-See that file for hardware details and recommended flags.
+Historical Beelink LXC results are useful harness-validation data, but #593's
+canonical target is a dedicated Linux host or Proxmox KVM VM with no contending
+guests and working `perf`, `strace`, `tc/netem`, real `io_uring`, and
+QUIC-capable H3 client tooling. Use `benchmarks/targets/beelink.json` only for
+the historical LXC context recorded in those baselines.
 
 ## Homelab benchmark workflow (Beelink)
 

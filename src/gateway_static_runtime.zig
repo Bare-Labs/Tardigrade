@@ -65,7 +65,12 @@ pub fn maybeResolveStaticErrorPage(
         .try_files = "",
         .autoindex = false,
         .headers = headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: that bounds inbound request size (DoS
+        // protection), not how large a file this server can legitimately
+        // serve. Falls through to static_file.Options' own default. This is
+        // the buffered (non-file-backed) path used whenever sendfile can't
+        // apply -- notably every TLS-terminated connection, since sendfile
+        // can't write directly into an encrypted socket.
     })) orelse return null;
     served.status_code = @enumFromInt(status_code);
     return .{ .served = served };
@@ -93,7 +98,11 @@ pub fn handleStaticLocation(
         .try_files = root_cfg.try_files,
         .autoindex = root_cfg.autoindex,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: see maybeResolveStaticErrorPage above. This
+        // is the request-size limit, not a response/file-size limit; when
+        // prefer_file_backed is false (any TLS connection, since sendfile
+        // can't write into an encrypted socket) the whole file is buffered
+        // in memory and was being truncated at 256 KiB.
         .prefer_file_backed = prefer_file_backed,
     })) orelse blk: {
         var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, 404)) orelse return null;
@@ -186,7 +195,7 @@ pub fn serveTryFilesFallback(
         .try_files = effective_try_files,
         .autoindex = false,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: see handleStaticLocation above.
         .prefer_file_backed = prefer_file_backed,
     })) orelse return error.NoTryFiles;
     defer served.deinit(allocator);
@@ -448,6 +457,46 @@ test "serveTryFilesFallback: top-level root without try_files defaults to $uri" 
     defer served.deinit(allocator);
     try std.testing.expectEqual(http.status.Status.ok, served.status_code);
     try std.testing.expectEqual(@as(usize, 3), served.content_length);
+}
+
+test "static_file.serve: buffered (non-file-backed) response over 256 KiB is not truncated" {
+    // Regression for #700: every buffered static-file caller (TLS-terminated
+    // HTTP/1.1, since sendfile can't write into an encrypted socket, plus H2
+    // and H3) used to pass gs.MAX_REQUEST_SIZE (256 KiB) as max_bytes here --
+    // a request-size DoS bound, not a response-size limit -- so any file over
+    // 256 KiB threw error.StreamTooLong mid-response. 1 MiB matches the real
+    // #593 campaign failure (the H3 static-large fixture).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_size: usize = 1024 * 1024;
+    const data = try allocator.alloc(u8, file_size);
+    defer allocator.free(data);
+    @memset(data, 'x');
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "large.bin", .data = data });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = http.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try http.static_file.serve(allocator, .{
+        .root = root_path,
+        .request_path = "/large.bin",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = "$uri",
+        .headers = &hdrs,
+        .prefer_file_backed = false,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(http.status.Status.ok, served.status_code);
+    try std.testing.expectEqual(file_size, served.content_length);
+    try std.testing.expectEqual(file_size, served.body.?.len);
 }
 
 test "writeStaticServedResponse: compresses buffered body when compression enabled" {

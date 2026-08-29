@@ -5,9 +5,20 @@ tls_cert_path __TLS_CERT_PATH__;
 tls_key_path __TLS_KEY_PATH__;
 metrics_path /status/metrics;
 root __STATIC_ROOT__;
+try_files $uri;
 
 location = /health {
     return 200 ok;
+}
+
+location = /tiny.txt {
+    root __STATIC_ROOT__;
+    try_files $uri;
+}
+
+location = /large.bin {
+    root __STATIC_ROOT__;
+    try_files $uri;
 }
 
 location /proxy/ {

@@ -500,15 +500,20 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
     defer if (http3_runtime) |*runtime| runtime.deinit();
-    // NOTE (#138): defaulting worker_threads to CPU count is correct for a
+    // NOTE (#708): defaulting worker_threads to CPU count is correct for a
     // non-blocking event loop, but Tardigrade currently uses a thread-per-
-    // connection blocking model where a worker is held for a connection's whole
-    // keepalive lifetime. Under that model the tail latency degrades sharply once
-    // concurrent connections exceed the worker count (measured: 4 workers + 10
-    // keepalive conns -> p90 ~26ms; 16 workers -> ~676us). Until idle keepalive
-    // parking (#138) lands, operators should raise TARDIGRADE_WORKER_THREADS to
-    // ~peak concurrent connections. Once parking lands, idle connections no
-    // longer occupy a worker and CPU-count sizing becomes correct again.
+    // connection blocking model where a worker is held for the whole active
+    // portion of a request (read -> for proxy: upstream connect/write/read too
+    // -> write response). Idle keepalive time between requests is parked off
+    // the worker pool (#138, landed), so that part no longer needs oversizing.
+    // What remains is #708: an actively-held worker's critical section is
+    // longer for the proxy path than for static serving, so real client-facing
+    // network latency (not just concurrency) degrades proxy throughput far
+    // more under worker scarcity than static throughput -- measured ~8x on a
+    // real cross-machine link, only partially mitigated by raising
+    // TARDIGRADE_WORKER_THREADS. Fixing this for real needs the active
+    // request path to become non-blocking/event-driven rather than tuning
+    // worker count.
     const worker_count: usize = blk: {
         const configured = if (cfg.worker_threads == 0)
             (std.Thread.getCpuCount() catch 1)
@@ -3591,7 +3596,10 @@ fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_confi
         .try_files = effective_try_files,
         .autoindex = false,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: that bounds inbound request size (DoS
+        // protection), not how large a file this server can legitimately
+        // serve over HTTP/2. Falls through to static_file.Options' own
+        // default.
         .prefer_file_backed = false,
     })) orelse return null;
     defer served.deinit(allocator);
@@ -3607,6 +3615,40 @@ fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_confi
     result.last_modified = if (served.last_modified_value) |v| try allocator.dupe(u8, v) else null;
     result.content_range = if (served.content_range_value) |v| try allocator.dupe(u8, v) else null;
     return result;
+}
+
+test "buildHttp2StaticResponse: buffered static response over 256 KiB is not truncated" {
+    // Regression for #700: this H2 path used to pass gs.MAX_REQUEST_SIZE
+    // (256 KiB) as static_file.Options.max_bytes -- a request-size DoS
+    // bound, not a response-size limit -- so any file over 256 KiB threw
+    // error.StreamTooLong mid-response. 1 MiB matches the real #593
+    // campaign failure (the H3 static-large fixture; H2 shares this same
+    // buffered static-file code path since H2 is also always TLS-terminated).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_size: usize = 1024 * 1024;
+    const data = try allocator.alloc(u8, file_size);
+    defer allocator.free(data);
+    @memset(data, 'x');
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "large.bin", .data = data });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.doc_root = root_path;
+    cfg.try_files = "$uri";
+
+    var head = try http.Request.parseHead(allocator, "GET /large.bin HTTP/1.1\r\nHost: example.test\r\n\r\n", 64 * 1024);
+    defer head.request.deinit();
+
+    const result = try buildHttp2StaticResponse(allocator, &cfg, &head.request);
+    try std.testing.expect(result != null);
+    var response = result.?;
+    defer response.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(file_size, response.body.?.len);
 }
 
 fn hasH2Header(headers: *const std.array_list.Managed(http.hpack.HeaderField), name: []const u8) bool {

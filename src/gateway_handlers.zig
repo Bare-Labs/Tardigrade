@@ -2314,12 +2314,10 @@ const Http3Early425ProxyContinuation = struct {
                     if (permit) |p| self.state.circuitReleasePermit(p);
                     self.circuit_permit = null;
                 }
-                const err_status: http.Status = switch (err) {
-                    error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
-                    else => .bad_gateway,
-                };
-                const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-                const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+                const upstream_err = gproxy_runtime.classifyUpstreamError(err);
+                const err_status = upstream_err.status;
+                const err_code = upstream_err.code;
+                const err_msg = upstream_err.message;
                 try rejectHttp3ProxyErrorWithState(allocator, response, self.state, err_status, err_code, err_msg, self.correlation_id);
                 return;
             };
@@ -2409,12 +2407,10 @@ fn handleHttp3LocationProxyPass(
         },
         .terminal_error => |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            const err_status: http.Status = switch (err) {
-                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
-                else => .bad_gateway,
-            };
-            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+            const upstream_err = gproxy_runtime.classifyUpstreamError(err);
+            const err_status = upstream_err.status;
+            const err_code = upstream_err.code;
+            const err_msg = upstream_err.message;
             try rejectHttp3ProxyError(allocator, response, ctx, err_status, err_code, err_msg, correlation_id);
             return;
         },
@@ -2449,7 +2445,9 @@ fn handleHttp3StaticLocation(
         .try_files = root_cfg.try_files,
         .autoindex = root_cfg.autoindex,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: that bounds inbound request size (DoS
+        // protection), not how large a file this server can legitimately
+        // serve. Falls through to static_file.Options' own default.
     })) orelse blk: {
         var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request_path, &request.headers, 404)) orelse return false;
         switch (error_page) {
@@ -2572,7 +2570,7 @@ fn handleHttp3TopLevelStaticFallback(
         .try_files = effective_try_files,
         .autoindex = false,
         .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
+        // Not MAX_REQUEST_SIZE: see handleHttp3StaticLocation above.
     })) orelse return false;
     defer served.deinit(allocator);
 
@@ -2659,6 +2657,58 @@ test "handleHttp3Connection serves the top-level static root when no location ma
 
     try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
     try std.testing.expectEqualStrings("blackbox-static-ok", response.body orelse "");
+}
+
+test "handleHttp3Connection: buffered static response over 256 KiB is not truncated" {
+    // Regression for #700: this H3 path (and its location-block sibling,
+    // handleHttp3StaticLocation) used to pass gs.MAX_REQUEST_SIZE (256 KiB)
+    // as static_file.Options.max_bytes -- a request-size DoS bound, not a
+    // response-size limit -- so any file over 256 KiB threw
+    // error.StreamTooLong mid-response. 1 MiB matches the real #593
+    // campaign failure that surfaced this (the H3 static-large fixture).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_size: usize = 1024 * 1024;
+    const data = try allocator.alloc(u8, file_size);
+    defer allocator.free(data);
+    @memset(data, 'x');
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "large.bin", .data = data });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    cfg.doc_root = root_path;
+    cfg.try_files = "$uri";
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/large.bin"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Connection(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqual(file_size, response.body.?.len);
 }
 
 test "handleHttp3Connection preserves representation length for HEAD against the top-level static fallback" {
