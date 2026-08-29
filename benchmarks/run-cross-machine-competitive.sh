@@ -305,13 +305,16 @@ cd "$1" && cat .tardigrade-source-sha 2>/dev/null || true
 # rendered config for this pass already exists and can be queried/hashed.
 capture_sut_meta() {
     local server="$1" port="$2"
-    local scheme="http"
-    [[ "$server" == "tardigrade-http3" ]] && scheme="https"
+    local scheme="http" host_header=""
+    if [[ "$server" == "tardigrade-http3" ]]; then
+        scheme="https"
+        host_header="$H3_TLS_SERVER_NAME"
+    fi
     local out
     # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
     out="$(guest_exec '
 set -uo pipefail
-cd "$1"; server="$2"; port="$3"; scheme="$4"
+cd "$1"; server="$2"; port="$3"; scheme="$4"; host_header="$5"
 kernel="$(uname -a)"
 cpu_model="$(lscpu 2>/dev/null | awk -F: "/Model name:/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}")"
 [[ -z "$cpu_model" && -r /proc/cpuinfo ]] && cpu_model="$(awk -F: "/model name/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}" /proc/cpuinfo)"
@@ -326,7 +329,12 @@ case "$server" in
     tardigrade|tardigrade-http3)
         version_output="$(./zig-out/bin/tardi version 2>&1)"
         binary_sha256="$(sha256sum zig-out/bin/tardi 2>/dev/null | cut -d" " -f1)"
-        metrics="$(curl -sk -m 3 --http1.1 "${scheme}://127.0.0.1:${port}/status/metrics" 2>/dev/null || true)"
+        # metrics_path is served on the same vhost as everything else --
+        # without a matching Host header Tardigrade 404s this exactly like
+        # any other unmatched vhost request, silently yielding no metric.
+        metrics_extra=()
+        [[ -n "$host_header" ]] && metrics_extra=(-H "Host: ${host_header}")
+        metrics="$(curl -sk -m 3 --http1.1 "${metrics_extra[@]}" "${scheme}://127.0.0.1:${port}/status/metrics" 2>/dev/null || true)"
         worker_threads="$(printf "%s" "$metrics" | awk "/^tardigrade_worker_threads /{print \$2; exit}")"
         ;;
     nginx)   version_output="$(nginx -v 2>&1)"; binary_sha256="" ;;
@@ -341,7 +349,7 @@ jq -n \
     --arg worker_threads "$worker_threads" \
     --arg version_output "$version_output" --arg binary_sha256 "$binary_sha256" \
     "{sut_kernel: \$kernel, sut_cpu_model: \$cpu_model, sut_cpu_threads: \$cpu_threads, sut_memory_mb: \$memory_mb, sut_config_sha256: \$config_sha256, sut_open_file_limit: \$open_file_limit, sut_default_route: \$default_route, sut_worker_threads: (\$worker_threads | select(. != \"\") // null), sut_server_version: \$version_output, sut_binary_sha256: \$binary_sha256}"
-' "$GUEST_WORKDIR" "$server" "$port" "$scheme" 2>/dev/null)"
+' "$GUEST_WORKDIR" "$server" "$port" "$scheme" "$host_header" 2>/dev/null)"
     if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
         out='{"sut_kernel": null, "sut_cpu_model": null, "sut_cpu_threads": null, "sut_memory_mb": null, "sut_config_sha256": null, "sut_open_file_limit": null, "sut_default_route": null, "sut_worker_threads": null, "sut_server_version": null, "sut_binary_sha256": null}'
     fi
@@ -375,11 +383,13 @@ finalize_result_file() {
     local canonical=true
     [[ "$total_errors" != "0" ]] && canonical=false
     $SMOKE && canonical=false
-    local unverified_tardigrade=false
+    local unverified_tardigrade=false missing_sut_metadata=false
     if [[ "$server" == "tardigrade" || "$server" == "tardigrade-http3" ]]; then
         [[ "$(jq -r '.sut_tardigrade_git_sha_verified // false' <<<"$sut_meta_json")" == "true" ]] || unverified_tardigrade=true
+        [[ "$(jq -r '.sut_worker_threads // "null"' <<<"$sut_meta_json")" == "null" ]] && missing_sut_metadata=true
     fi
     $unverified_tardigrade && canonical=false
+    $missing_sut_metadata && canonical=false
     jq --argjson sut "$sut_meta_json" --argjson total_errors "$total_errors" --argjson canonical "$canonical" --argjson smoke "$SMOKE" \
         '._meta += $sut | ._meta.total_errors = $total_errors | ._meta.canonical = $canonical | ._meta.smoke = $smoke' \
         "$save_file" > "${save_file}.tmp" && mv "${save_file}.tmp" "$save_file"
@@ -387,6 +397,7 @@ finalize_result_file() {
         local why="${total_errors} total error(s) across scenarios"
         $SMOKE && why="--smoke run"
         $unverified_tardigrade && why="Tardigrade source identity not verified (pass --tardigrade-git-sha)"
+        $missing_sut_metadata && why="required SUT metadata (sut_worker_threads) is missing"
         echo "note: ${save_file} marked _meta.canonical=false (${why})" >&2
     fi
 }
