@@ -49,6 +49,8 @@ DURATION=15
 CONNECTIONS=32
 THREADS=4
 SMOKE=false
+WITH_H3=false
+H3_TLS_SERVER_NAME="tardigrade.test"
 OUT_DIR="${BENCH_DIR}/results/$(date -u +%Y%m%d-%H%M%S)-crossmachine"
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --threads)        THREADS="$2"; shift 2 ;;
         --out-dir)        OUT_DIR="$2"; shift 2 ;;
         --smoke)          SMOKE=true; shift ;;
+        --with-h3)        WITH_H3=true; shift ;;
         -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -266,6 +269,81 @@ for idx in "${!SERVER_LIST[@]}"; do
     echo "-- guest state after stop --"
     verify_idle
 done
+
+has_tardigrade() {
+    local s
+    for s in "${SERVER_LIST[@]}"; do
+        [[ "$s" == "tardigrade" ]] && return 0
+    done
+    return 1
+}
+
+if $WITH_H3 && has_tardigrade; then
+    h3_port=$((LISTEN_BASE + 250))
+    echo ""
+    echo "== tardigrade-http3 (guest port ${h3_port}, TLS+QUIC) =="
+    echo "-- guest state before start --"
+    verify_idle
+
+    guest_exec '
+set -euo pipefail
+cd "$1"; port="$2"; upstream="$3"; sni="$4"
+dir="benchmarks/results/crossmachine"
+static_root="${dir}/public"
+certdir="${dir}/h3-certs"
+scripts/interop/gen-certs.sh "$certdir" >/dev/null
+cfgfile="${dir}/tardigrade-http3.conf"
+sed \
+    -e "s|__LISTEN_PORT__|${port}|g" \
+    -e "s|__UPSTREAM_PORT__|${upstream}|g" \
+    -e "s|__STATIC_ROOT__|${static_root}|g" \
+    -e "s|__PID_FILE__|${dir}/tardigrade-http3.pid|g" \
+    -e "s|__TLS_SERVER_NAME__|${sni}|g" \
+    -e "s|__TLS_CERT_PATH__|${certdir}/ed25519-cert.pem|g" \
+    -e "s|__TLS_KEY_PATH__|${certdir}/ed25519-key.pem|g" \
+    benchmarks/competitive/configs/tardigrade-http3.conf.in > "$cfgfile"
+env TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_PROXY_STREAMING_MODE=response \
+    TARDIGRADE_HTTP3_ENABLED=true TARDIGRADE_QUIC_PORT="$port" \
+    TARDIGRADE_TLS_SERVER_NAME="$sni" TARDIGRADE_HTTP3_ALT_SVC=auto \
+    nohup ./zig-out/bin/tardi run -c "$cfgfile" >"${dir}/tardigrade-http3.server.log" 2>&1 &
+disown
+echo $! > "${dir}/tardigrade-http3.pid.wrapper"
+for _ in $(seq 1 30); do
+    curl -sk -o /dev/null -m 3 --http1.1 -H "Host: ${sni}" "https://127.0.0.1:${port}/health" && { echo "tardigrade-http3 ok"; exit 0; }
+    sleep 0.5
+done
+echo "tardigrade-http3 failed to become healthy" >&2
+cat "${dir}/tardigrade-http3.server.log" >&2 2>/dev/null || true
+exit 1
+' "$GUEST_WORKDIR" "$h3_port" "$UPSTREAM_PORT" "$H3_TLS_SERVER_NAME"
+
+    echo "-- verifying reachable from this machine over the network (real QUIC, via h2load) --"
+    # macOS's system curl (LibreSSL) fails the TLS handshake against this
+    # Ed25519 cert even though it's valid -- h2load (built with a real
+    # OpenSSL-backed QUIC stack) is both the actual load tool and a working
+    # preflight, so use it for verification instead of curl here.
+    if ! h2load --h3 -n1 -c1 -t1 -H "Host: ${H3_TLS_SERVER_NAME}" "https://${GUEST_IP}:${h3_port}/health" 2>&1 | grep -q "1 succeeded"; then
+        echo "FATAL: tardigrade-http3 not reachable at ${GUEST_IP}:${h3_port} from this machine" >&2
+        stop_server "tardigrade-http3"
+        exit 1
+    fi
+
+    h3_save_file="${OUT_DIR}/tardigrade-http3.json"
+    echo "-- running benchmarks/run.sh (h2load --h3) from this machine against ${GUEST_IP}:${h3_port} --"
+    bash "${BENCH_DIR}/run.sh" \
+        --host "$GUEST_IP" --port "$h3_port" --tls --tool h2load \
+        --host-header "$H3_TLS_SERVER_NAME" \
+        --scenarios "static-http3,proxy-http3" \
+        --duration "$DURATION" --connections "$CONNECTIONS" --threads "$THREADS" \
+        --static-path "/tiny.txt" --proxy-path "/proxy/health" \
+        --driver "macbook-5gbe-crossmachine" --config-label "tardigrade-http3" \
+        --save "$h3_save_file" || echo "warning: benchmarks/run.sh reported a non-zero exit for tardigrade-http3" >&2
+    RESULT_FILES+=("$h3_save_file")
+
+    stop_server "tardigrade-http3"
+    echo "-- guest state after stop --"
+    verify_idle
+fi
 
 guest_exec '
 set -uo pipefail
