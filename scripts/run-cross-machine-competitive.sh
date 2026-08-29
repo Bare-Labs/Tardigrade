@@ -220,7 +220,7 @@ ps -ef | grep -E "tardi run|nginx: master|/usr/sbin/haproxy|caddy run" | grep -v
 ' "$GUEST_WORKDIR"
 }
 
-SCENARIOS="static-http1,proxy-http1,keepalive"
+SCENARIOS="static-http1,proxy-http1,keepalive,proxy-payload-16m"
 if $SMOKE; then
     DURATION=5
     CONNECTIONS=8

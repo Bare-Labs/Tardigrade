@@ -1,0 +1,88 @@
+{
+  "static-http1": {
+    "rps": 32813.14,
+    "p50_ms": 0.919,
+    "p95_ms": 2.300,
+    "p99_ms": 4.247,
+    "p999_ms": 8.110,
+    "errors": 0,
+    "throughput_mbps": 6.85,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "proxy-http1": {
+    "rps": 5514.82,
+    "p50_ms": 5.365,
+    "p95_ms": 14.126,
+    "p99_ms": 397.679,
+    "p999_ms": 1344.024,
+    "errors": 1,
+    "throughput_mbps": 0.81,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "keepalive": {
+    "rps": 33101.59,
+    "p50_ms": 0.913,
+    "p95_ms": 2.257,
+    "p99_ms": 4.192,
+    "p999_ms": 7.942,
+    "errors": 0,
+    "throughput_mbps": 6.91,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "proxy-payload-16m": {
+    "rps": 34.38,
+    "p50_ms": 904.786,
+    "p95_ms": 969.639,
+    "p99_ms": 994.147,
+    "p999_ms": 1043.076,
+    "errors": 0,
+    "throughput_mbps": 560.82,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "_meta": {
+    "tag": "v0.6.4-24-gd2e62b74",
+    "timestamp": "2026-08-29T00:41:55Z",
+    "host": "192.168.86.58",
+    "port": "19083",
+    "tool": "wrk",
+    "duration_s": 20,
+    "connections": 32,
+    "threads": 4,
+    "runs": 1,
+    "host_header": "",
+    "driver": "macbook-5gbe-crossmachine",
+    "worker_count": null,
+    "config_label": "caddy",
+    "process_metrics": {
+      "enabled": false,
+      "pid_source": "none",
+      "pid_tree": false,
+      "sample_interval_ms": 500
+    },
+    "zig_version": "0.16.0",
+    "h2load_version": "h2load nghttp2/1.69.0",
+    "h2load_h3_supported": false,
+    "h2load_output_file_supported": true,
+    "environment": {
+      "os": "Darwin",
+      "kernel": "25.3.0",
+      "arch": "arm64",
+      "cpu_model": "Apple M4",
+      "cpu_threads": "10",
+      "memory_mb": "16384"
+    },
+    "static_path": "/tiny.txt",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/tiny.txt",
+    "h2_path": "/tiny.txt",
+    "h3_path": "/tiny.txt"
+  }
+}
