@@ -52,14 +52,27 @@ remain the canonical baseline.
   (client on this actual Mac, over the general LAN, against a separate
   guest's normal address) were the topologically correct physical path all
   along — the real, remaining gap is tool (`wrk` vs. `loadgen.py` on that
-  leg specifically), not path. **This acceptance criterion is left
-  explicitly open**: a genuine `wrk`-instrumented MacBook→guest physical-network
-  reproduction was not achieved in this session and is not achievable from
-  it — it would need either a different Claude Code session/environment
-  without this outbound-socket restriction, or a human running `wrk`
-  manually from a real client machine. The `loadgen.py` Mac→guest rows
-  remain the best available evidence for that specific leg and are
-  presented as such, not as a `wrk`-equivalent substitute.
+  leg specifically), not path. v4 left this acceptance criterion
+  explicitly open pending either a `wrk` run from a real MacBook or an
+  amendment to what #709 actually requires.
+- **v5 (this version)**: the repo owner amended #709's acceptance
+  criteria directly
+  ([issue comment](https://github.com/Bare-Systems/Tardigrade/issues/709#issuecomment-5464246634)):
+  "cross-machine client -> Tardigrade using the same path that reproduced
+  #708" does not require literally reproducing #708's original physical
+  MacBook/NIC running `wrk` — #709/#708 are not scoped to require hardware
+  or a system setup beyond what the existing Proxmox-to-Mac connection
+  (`root@10.250.250.2`, confirmed live and used throughout this diagnosis
+  to provision the KVM guest and LXC pair below) can provide. A disposable
+  KVM guest exercised over a real network hop reachable via that
+  connection satisfies the criterion. Under that clarification, this
+  diagnosis's existing evidence — the matched-`wrk` KVM matrix (loopback
+  vs. host→guest), the independent LXC-pair matrix, the `tc netem` sweep,
+  and the Mac-client `loadgen.py` matrix over the real Proxmox-to-Mac
+  general-LAN path — together satisfy this criterion. `wrk` specifically
+  from the actual Mac remains blocked by this session's environment (see
+  the definitive test below), and that limitation is documented as such,
+  but it no longer blocks this criterion under the amended scope.
 
 ## tl;dr
 
@@ -447,19 +460,21 @@ residual I/O-model limitation.
   against it succeeded (`200`) while `wrk` against the identical target
   failed (`No route to host`) — ruling out target/routing choice as the
   cause. This is specific to `wrk`'s own connection pattern being blocked
-  by this session's environment and is not fixable from within it.
-  **The #709 acceptance criterion calling for a `wrk`-instrumented
-  MacBook→guest physical-network reproduction is therefore left explicitly
-  open** — not satisfied by this diagnosis, and not achievable from this
-  session. Mac-side evidence instead uses `loadgen.py`, run as a matched
-  pair with the same tool at both placements, and is not directly
-  comparable in absolute terms to the `wrk` rows. (Re-reading #708's own
-  artifact metadata: its "5GbE path" was the general LAN reaching the
-  guest's ordinary DHCP address, the same topology as these `loadgen.py`
-  Mac→guest rows — not this repo's dedicated `10.250.250.x` link, which is
-  a control-traffic path, not a benchmark-client one. So the topology gap
-  on this leg was smaller than earlier revisions of this report implied;
-  the tool gap is the part that remains genuinely open.)
+  by this session's environment and is not fixable from within it. A
+  literal `wrk`-instrumented run from this session's actual Mac client is
+  therefore not part of this diagnosis's evidence and is not achievable
+  from this session. Per the repo owner's amendment to #709's acceptance
+  criteria (see Revision history, v5), this does not block the
+  cross-machine criterion: #709/#708 do not require hardware or a system
+  setup beyond what the Proxmox-to-Mac connection provides, and the KVM
+  guest / LXC-pair `wrk` evidence plus the Mac-client `loadgen.py`
+  evidence together satisfy it. Mac-side evidence uses `loadgen.py`, run
+  as a matched pair with the same tool at both placements, and is not
+  directly comparable in absolute terms to the `wrk` rows. (Re-reading
+  #708's own artifact metadata: its "5GbE path" was the general LAN
+  reaching the guest's ordinary DHCP address, the same topology as these
+  `loadgen.py` Mac→guest rows — not this repo's dedicated `10.250.250.x`
+  link, which is a control-traffic path, not a benchmark-client one.)
 - The `off`+close-control run on the Mac (`mac-crossmachine-off-close.json`,
   1495 req/s) did not reproduce the 32-error pattern within its 15s
   window, while the `response`-mode run at a similar rate (1401 req/s)
