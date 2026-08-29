@@ -63,15 +63,6 @@ Install at least one load-generation tool. The runner auto-detects in this order
 
 `jq` is required for result formatting, baseline comparison, and report generation.
 
-If none of the above are usable on a given client host (e.g. a host network
-policy blocks the tool's outbound connections but plain HTTP clients still
-work), `benchmarks/loadgen.py` is a dependency-free Python fallback: a
-keep-alive-aware HTTP/1.1 load driver that also directly counts client-side
-TCP reconnects, which is useful when the thing under investigation is
-connection churn itself (see the #709 diagnosis in
-`benchmarks/results/2026-08-29-709-diagnosis/`). It is not a replacement for
-the tools above in canonical runs.
-
 ## Proxmox performance campaign
 
 `scripts/run-proxmox-performance-campaign.sh` is the repeatable #593
