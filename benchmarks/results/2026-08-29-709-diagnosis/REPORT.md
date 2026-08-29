@@ -19,14 +19,47 @@ remain the canonical baseline.
   #708's original MacBook was; and (b) the 32-error root cause was
   speculated ("most plausibly listen-backlog pressure") rather than
   established with syscall-level evidence.
-- **This version (v3)** closes both gaps, entirely through `ssh proxmox`
-  per explicit instruction (no other LAN host was used): two disposable
-  LXC containers were created on the Proxmox host — one as SUT, one as a
-  genuinely separate client (separate kernel network namespace/process,
-  separate IP, real traffic over the bridge) — giving a `wrk`
-  client that is not the physical host's own process. And `wrk` itself was
-  traced with `strace` during a reproduction of the failing case, which
-  identified the exact errno for every one of the 32 `connect` failures.
+- **v3** made progress on both gaps, entirely through `ssh proxmox` per
+  explicit instruction: two disposable LXC containers were created on the
+  Proxmox host — one as SUT, one as a genuinely separate client (separate
+  kernel network namespace/process, separate IP, real traffic over the
+  bridge) — and `wrk` itself was traced with `strace`, identifying the
+  exact errno for every one of the 32 `connect` failures. A further review
+  correctly pointed out that v3's own text overclaimed "closes both gaps":
+  the LXC pair, while a genuinely separate namespace/process/IP, still
+  runs on the *same physical host* as the Proxmox server — not a client on
+  actually separate hardware the way #708's original MacBook was. That
+  review also flagged `.claude/skills/proxmox-benchmark-diagnosis/SKILL.md`
+  as scope creep (a persistent environment/tooling skill bundled into a
+  diagnosis-only PR) — moved to this operator's personal
+  `~/.claude/skills/` in this revision, not part of the diagnosis
+  deliverable.
+- **This version (v4)** settles the physical-client-path question rather
+  than working around it further: `wrk` is **confirmed, definitively,
+  still unable to run from this session's actual Mac client** — re-tested
+  against a fresh listener on the Proxmox host's dedicated 5GbE address
+  (`10.250.250.2`, the link the new skill documents), with `curl` against
+  the exact same target succeeding (`200`) while `wrk` fails identically
+  (`No route to host`) in the same breath. This rules out routing/interface
+  choice as the cause; it is specific to `wrk`'s connection pattern being
+  blocked by this session's environment, not fixable from within it.
+  Separately, re-reading #708's own committed artifact metadata clarifies
+  that its "5GbE path" was the **general LAN** (client reached the guest's
+  ordinary `192.168.86.58` DHCP address) — not this repo's dedicated
+  `10.250.250.x` link, which `benchmarks/README.md`/the campaign script
+  describe as a *control-traffic* link, not a benchmark-client path. That
+  means the `loadgen.py` Mac→guest rows already collected in v2/v3
+  (client on this actual Mac, over the general LAN, against a separate
+  guest's normal address) were the topologically correct physical path all
+  along — the real, remaining gap is tool (`wrk` vs. `loadgen.py` on that
+  leg specifically), not path. **This acceptance criterion is left
+  explicitly open**: a genuine `wrk`-instrumented MacBook→guest physical-network
+  reproduction was not achieved in this session and is not achievable from
+  it — it would need either a different Claude Code session/environment
+  without this outbound-socket restriction, or a human running `wrk`
+  manually from a real client machine. The `loadgen.py` Mac→guest rows
+  remain the best available evidence for that specific leg and are
+  presented as such, not as a `wrk`-equivalent substitute.
 
 ## tl;dr
 
@@ -408,10 +441,25 @@ residual I/O-model limitation.
   unreachable host) were considered and explicitly ruled out in favor of
   the `ssh proxmox`-only LXC approach above, per direct instruction to use
   only the Proxmox host.
-- `wrk` could not be run from this session's own Mac client (confirmed
-  again after rebuilding from source); Mac-side evidence uses `loadgen.py`
-  instead, run as a matched pair with the same tool at both placements,
-  and is not directly comparable in absolute terms to the `wrk` rows.
+- `wrk` could not be run from this session's own Mac client. Confirmed
+  definitively in v4: a fresh listener was started on the Proxmox host's
+  dedicated-5GbE address (`10.250.250.2`), and in the same breath `curl`
+  against it succeeded (`200`) while `wrk` against the identical target
+  failed (`No route to host`) — ruling out target/routing choice as the
+  cause. This is specific to `wrk`'s own connection pattern being blocked
+  by this session's environment and is not fixable from within it.
+  **The #709 acceptance criterion calling for a `wrk`-instrumented
+  MacBook→guest physical-network reproduction is therefore left explicitly
+  open** — not satisfied by this diagnosis, and not achievable from this
+  session. Mac-side evidence instead uses `loadgen.py`, run as a matched
+  pair with the same tool at both placements, and is not directly
+  comparable in absolute terms to the `wrk` rows. (Re-reading #708's own
+  artifact metadata: its "5GbE path" was the general LAN reaching the
+  guest's ordinary DHCP address, the same topology as these `loadgen.py`
+  Mac→guest rows — not this repo's dedicated `10.250.250.x` link, which is
+  a control-traffic path, not a benchmark-client one. So the topology gap
+  on this leg was smaller than earlier revisions of this report implied;
+  the tool gap is the part that remains genuinely open.)
 - The `off`+close-control run on the Mac (`mac-crossmachine-off-close.json`,
   1495 req/s) did not reproduce the 32-error pattern within its 15s
   window, while the `response`-mode run at a similar rate (1401 req/s)
