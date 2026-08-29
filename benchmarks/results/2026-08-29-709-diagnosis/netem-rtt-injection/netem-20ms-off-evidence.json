@@ -1,0 +1,13 @@
+{
+  "impairment": {
+    "interface": "eth0",
+    "loss_percent": null,
+    "reorder_percent": null,
+    "delay_ms": 20,
+    "tc_command": "tc qdisc add dev eth0 root netem delay 20ms"
+  },
+  "started_at": "2026-08-29T13:53:45Z",
+  "finished_at": "2026-08-29T13:54:03Z",
+  "wrapped_command": "sleep 18",
+  "wrapped_command_exit_status": 0
+}

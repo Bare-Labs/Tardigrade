@@ -1,0 +1,31 @@
+{
+  "requests": 16304,
+  "rps": 1401.06,
+  "elapsed_s": 11.637,
+  "reconnects": 16304,
+  "reconnects_per_sec": 1401.06,
+  "p50_ms": 11.376,
+  "p95_ms": 20.39,
+  "p99_ms": 23.458,
+  "errors_total": 32,
+  "errors_by_class": {"reconnect:OSError": 32},
+  "error_samples": [
+    {"stage": "reconnect", "type": "OSError", "errno": 49, "message": "[Errno 49] Can't assign requested address"}
+  ],
+  "error_samples_note": "all 32 error_samples were identical to the one shown above (errno 49 / EADDRNOTAVAIL, 'Can't assign requested address'); truncated here for file size, full list of 32 was captured in the live tool output",
+  "response_connection_header_counts": {"close": 16304},
+  "connections": 32,
+  "duration_requested_s": 15.0,
+  "_meta": {
+    "tool": "benchmarks/loadgen.py",
+    "label": "mac-crossmachine-response",
+    "host": "192.168.86.37",
+    "port": 8069,
+    "path": "/proxy/health",
+    "client_sends_connection_close": false,
+    "started_at": "2026-08-29T13:57:17Z",
+    "run_location": "client on this Mac (general LAN, en0), server on the diagnosis guest VM 192.168.86.37, TARDIGRADE_PROXY_STREAMING_MODE=response",
+    "tardigrade_git_sha": "3a2a7a520c0677e20a425b396f84c9944a020f1e",
+    "note": "run ended at 11.637s (not the requested 15s) when all 32 client worker threads hit EADDRNOTAVAIL within milliseconds of each other -- 16383 mac ephemeral ports / ~1401 new-conns-sec matches the observed 11.6s almost exactly"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "requests": 22462,
+  "rps": 1495.45,
+  "elapsed_s": 15.02,
+  "reconnects": 22462,
+  "reconnects_per_sec": 1495.45,
+  "p50_ms": 10.373,
+  "p95_ms": 14.203,
+  "p99_ms": 16.689,
+  "errors_total": 0,
+  "errors_by_class": {},
+  "error_samples": [],
+  "response_connection_header_counts": {"close": 22462},
+  "connections": 32,
+  "duration_requested_s": 15.0,
+  "_meta": {
+    "tool": "benchmarks/loadgen.py",
+    "label": "mac-crossmachine-off-close",
+    "host": "192.168.86.37",
+    "port": 8069,
+    "path": "/proxy/health",
+    "client_sends_connection_close": true,
+    "started_at": "2026-08-29T13:56:11Z",
+    "run_location": "client on this Mac (general LAN, en0), server on the diagnosis guest VM 192.168.86.37",
+    "tardigrade_git_sha": "3a2a7a520c0677e20a425b396f84c9944a020f1e",
+    "note": "0 errors here despite forcing full churn at a similar rate to mac-crossmachine-response.json, which did hit 32 EADDRNOTAVAIL errors -- see REPORT.md's honest discussion of run-to-run variance in exactly when local ephemeral-port/TIME_WAIT exhaustion is hit"
+  }
+}

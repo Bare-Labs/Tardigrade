@@ -1,0 +1,13 @@
+Running 10s test @ http://192.168.86.37:8069/proxy/health
+  4 threads and 32 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    42.27ms    1.70ms  67.21ms   85.38%
+    Req/Sec   122.24     29.18   161.00     54.25%
+  Latency Distribution
+     50%   41.92ms
+     75%   43.03ms
+     90%   44.13ms
+     99%   47.98ms
+  4896 requests in 10.06s, 2.71MB read
+Requests/sec:    486.87
+Transfer/sec:    276.36KB
