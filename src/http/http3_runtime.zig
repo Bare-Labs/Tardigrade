@@ -2093,6 +2093,19 @@ pub const Runtime = struct {
         body: []const u8,
         label: []const u8,
     ) void {
+        var state = H3.ResponseSendState.init(status, headers, body);
+        const done = entry.h3.sendResponseProgress(entry.conn, stream_id, &state) catch |err| {
+            self.logger.warn(null, "http3: {s} response send failed: {s}", .{ label, @errorName(err) });
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
+            self.noteRequestCompletedWithLatency(started_us, nowUs());
+            return;
+        };
+        if (done) {
+            self.noteRequestCompletedWithLatency(started_us, nowUs());
+            return;
+        }
+
         var pending = PendingH3Response.init(self.allocator, stream_id, started_us, status, headers, body) catch |err| {
             self.logger.warn(null, "http3: {s} response allocation failed: {s}", .{ label, @errorName(err) });
             entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
@@ -2100,20 +2113,10 @@ pub const Runtime = struct {
             self.noteRequestCompletedWithLatency(started_us, nowUs());
             return;
         };
+        pending.send_state = state;
+        pending.send_state.headers = pending.headers;
+        pending.send_state.body = pending.body;
 
-        const done = entry.h3.sendResponseProgress(entry.conn, stream_id, &pending.send_state) catch |err| {
-            self.logger.warn(null, "http3: {s} response send failed: {s}", .{ label, @errorName(err) });
-            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
-            entry.h3.finishRequest(stream_id);
-            self.noteRequestCompletedWithLatency(started_us, nowUs());
-            pending.deinit(self.allocator);
-            return;
-        };
-        if (done) {
-            self.noteRequestCompletedWithLatency(started_us, nowUs());
-            pending.deinit(self.allocator);
-            return;
-        }
         entry.pending_h3_responses.append(self.allocator, pending) catch |err| {
             self.logger.warn(null, "http3: failed to park {s} response after backpressure: {s}", .{ label, @errorName(err) });
             entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
@@ -5255,8 +5258,10 @@ const TestH3ResumeSession = struct {
     internal_error_sends: usize = 0,
     finish_calls: usize = 0,
     send_fail: bool = false,
+    backpressure_before_success: usize = 0,
     last_status: u16 = 0,
     last_stream_id: u64 = 0,
+    last_body_len: usize = 0,
 
     fn sendResponseProgress(
         self: *TestH3ResumeSession,
@@ -5268,9 +5273,14 @@ const TestH3ResumeSession = struct {
         self.send_calls += 1;
         self.last_status = state.status;
         self.last_stream_id = stream_id;
+        self.last_body_len = state.body.len;
         if (state.status == 200) self.ok_sends += 1;
         if (state.status == 500) self.internal_error_sends += 1;
         if (self.send_fail) return error.StreamBackpressure;
+        if (self.backpressure_before_success > 0) {
+            self.backpressure_before_success -= 1;
+            return false;
+        }
         self.finishRequest(stream_id);
         return true;
     }
@@ -5403,6 +5413,49 @@ test "parked H3 retry resumes only after connection establishment" {
     try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
     try testing.expectEqual(@as(u16, 200), entry.h3.last_status);
     try testing.expectEqual(@as(u64, 11), entry.h3.last_stream_id);
+    try testing.expectEqual(@as(usize, 1), latency.count);
+    try testing.expect(latency.last_ms > 0);
+}
+
+test "H3 runtime parks backpressured response and resumes completion once" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-response-backpressure-test");
+    var latency = H3LatencyCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .h3_request_latency_metrics_ctx = &latency,
+        .h3_request_latency_metrics_cb = H3LatencyCapture.onLatency,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{
+        .conn = &conn,
+        .h3 = .{ .backpressure_before_success = 1 },
+    };
+    defer entry.deinit(allocator);
+
+    const body = try allocator.alloc(u8, quic.connection.max_stream_send_buffer + 1);
+    defer allocator.free(body);
+    @memset(body, 0xab);
+
+    runtime.queueH3Response(&entry, 17, 1, 200, &.{.{ .name = "server", .value = "tardigrade" }}, body, "test");
+
+    try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 1), entry.pending_h3_responses.items.len);
+    try testing.expectEqual(@as(usize, 0), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 0), entry.h3.finish_calls);
+    try testing.expectEqual(@as(usize, 0), latency.count);
+    try testing.expectEqual(@as(usize, quic.connection.max_stream_send_buffer + 1), entry.h3.last_body_len);
+
+    runtime.resumePendingH3Responses(&entry, 2);
+
+    try testing.expectEqual(@as(usize, 2), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 0), entry.pending_h3_responses.items.len);
+    try testing.expectEqual(@as(usize, 0), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.finish_calls);
+    try testing.expectEqual(@as(u64, 17), entry.h3.last_stream_id);
     try testing.expectEqual(@as(usize, 1), latency.count);
     try testing.expect(latency.last_ms > 0);
 }
