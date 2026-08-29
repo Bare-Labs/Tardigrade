@@ -302,14 +302,16 @@ cd "$1" && cat .tardigrade-source-sha 2>/dev/null || true
 # this machine's own git state (which describes the load generator, not the
 # system under test, and can silently drift from what --guest-workdir was
 # actually built from). Called after render_and_start_server, so the
-# rendered config for this pass already exists and can be hashed too.
+# rendered config for this pass already exists and can be queried/hashed.
 capture_sut_meta() {
-    local server="$1"
+    local server="$1" port="$2"
+    local scheme="http"
+    [[ "$server" == "tardigrade-http3" ]] && scheme="https"
     local out
     # shellcheck disable=SC2016 # intentional: this runs on the guest, not here
     out="$(guest_exec '
 set -uo pipefail
-cd "$1"; server="$2"
+cd "$1"; server="$2"; port="$3"; scheme="$4"
 kernel="$(uname -a)"
 cpu_model="$(lscpu 2>/dev/null | awk -F: "/Model name:/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}")"
 [[ -z "$cpu_model" && -r /proc/cpuinfo ]] && cpu_model="$(awk -F: "/model name/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}" /proc/cpuinfo)"
@@ -317,10 +319,15 @@ cpu_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown)"
 memory_mb="unknown"
 [[ -r /proc/meminfo ]] && memory_mb="$(awk "/MemTotal:/{printf \"%.0f\", \$2 / 1024}" /proc/meminfo)"
 config_sha256="$(sha256sum "benchmarks/results/crossmachine/${server}.conf" 2>/dev/null | cut -d" " -f1)"
+open_file_limit="$(ulimit -n 2>/dev/null || echo unknown)"
+default_route="$(ip route show default 2>/dev/null | head -1)"
+worker_threads=""
 case "$server" in
     tardigrade|tardigrade-http3)
         version_output="$(./zig-out/bin/tardi version 2>&1)"
         binary_sha256="$(sha256sum zig-out/bin/tardi 2>/dev/null | cut -d" " -f1)"
+        metrics="$(curl -sk -m 3 --http1.1 "${scheme}://127.0.0.1:${port}/status/metrics" 2>/dev/null || true)"
+        worker_threads="$(printf "%s" "$metrics" | awk "/^tardigrade_worker_threads /{print \$2; exit}")"
         ;;
     nginx)   version_output="$(nginx -v 2>&1)"; binary_sha256="" ;;
     haproxy) version_output="$(haproxy -v 2>&1 | head -1)"; binary_sha256="" ;;
@@ -330,13 +337,18 @@ esac
 jq -n \
     --arg kernel "$kernel" --arg cpu_model "$cpu_model" --arg cpu_threads "$cpu_threads" \
     --arg memory_mb "$memory_mb" --arg config_sha256 "$config_sha256" \
+    --arg open_file_limit "$open_file_limit" --arg default_route "$default_route" \
+    --arg worker_threads "$worker_threads" \
     --arg version_output "$version_output" --arg binary_sha256 "$binary_sha256" \
-    "{sut_kernel: \$kernel, sut_cpu_model: \$cpu_model, sut_cpu_threads: \$cpu_threads, sut_memory_mb: \$memory_mb, sut_config_sha256: \$config_sha256, sut_server_version: \$version_output, sut_binary_sha256: \$binary_sha256}"
-' "$GUEST_WORKDIR" "$server" 2>/dev/null)"
+    "{sut_kernel: \$kernel, sut_cpu_model: \$cpu_model, sut_cpu_threads: \$cpu_threads, sut_memory_mb: \$memory_mb, sut_config_sha256: \$config_sha256, sut_open_file_limit: \$open_file_limit, sut_default_route: \$default_route, sut_worker_threads: (\$worker_threads | select(. != \"\") // null), sut_server_version: \$version_output, sut_binary_sha256: \$binary_sha256}"
+' "$GUEST_WORKDIR" "$server" "$port" "$scheme" 2>/dev/null)"
     if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
-        out='{"sut_kernel": null, "sut_cpu_model": null, "sut_cpu_threads": null, "sut_memory_mb": null, "sut_config_sha256": null, "sut_server_version": null, "sut_binary_sha256": null}'
+        out='{"sut_kernel": null, "sut_cpu_model": null, "sut_cpu_threads": null, "sut_memory_mb": null, "sut_config_sha256": null, "sut_open_file_limit": null, "sut_default_route": null, "sut_worker_threads": null, "sut_server_version": null, "sut_binary_sha256": null}'
     fi
-    if [[ -n "$TARDIGRADE_GIT_SHA" ]]; then
+    # The Tardigrade source-identity claim only describes the tardigrade
+    # binary -- attaching it to nginx/HAProxy/Caddy results would falsely
+    # imply their SUT identity was verified the same way.
+    if [[ -n "$TARDIGRADE_GIT_SHA" && ( "$server" == "tardigrade" || "$server" == "tardigrade-http3" ) ]]; then
         out="$(jq --arg sha "$TARDIGRADE_GIT_SHA" '. + {sut_tardigrade_git_sha: $sha, sut_tardigrade_git_sha_verified: true}' <<<"$out")"
     fi
     printf '%s' "$out"
@@ -349,7 +361,7 @@ jq -n \
 # happened to come back error-free), so a clean baseline and an
 # exploratory/reduced run are never ambiguous from the JSON alone.
 finalize_result_file() {
-    local save_file="$1" sut_meta_json="$2"
+    local save_file="$1" sut_meta_json="$2" server="$3"
     if [[ ! -f "$save_file" ]]; then
         echo "FATAL: benchmarks/run.sh did not write ${save_file} -- it likely aborted" >&2
         echo "  partway through (this machine's own outbound connection churn from" >&2
@@ -363,12 +375,18 @@ finalize_result_file() {
     local canonical=true
     [[ "$total_errors" != "0" ]] && canonical=false
     $SMOKE && canonical=false
+    local unverified_tardigrade=false
+    if [[ "$server" == "tardigrade" || "$server" == "tardigrade-http3" ]]; then
+        [[ "$(jq -r '.sut_tardigrade_git_sha_verified // false' <<<"$sut_meta_json")" == "true" ]] || unverified_tardigrade=true
+    fi
+    $unverified_tardigrade && canonical=false
     jq --argjson sut "$sut_meta_json" --argjson total_errors "$total_errors" --argjson canonical "$canonical" --argjson smoke "$SMOKE" \
         '._meta += $sut | ._meta.total_errors = $total_errors | ._meta.canonical = $canonical | ._meta.smoke = $smoke' \
         "$save_file" > "${save_file}.tmp" && mv "${save_file}.tmp" "$save_file"
     if ! $canonical; then
         local why="${total_errors} total error(s) across scenarios"
         $SMOKE && why="--smoke run"
+        $unverified_tardigrade && why="Tardigrade source identity not verified (pass --tardigrade-git-sha)"
         echo "note: ${save_file} marked _meta.canonical=false (${why})" >&2
     fi
 }
@@ -403,7 +421,7 @@ for idx in "${!SERVER_LIST[@]}"; do
     tiny_ok=true
     curl -sf -o /dev/null -m 5 "http://${GUEST_IP}:${port}/tiny.txt" || tiny_ok=false
 
-    sut_meta="$(capture_sut_meta "$server")"
+    sut_meta="$(capture_sut_meta "$server" "$port")"
 
     save_file="${OUT_DIR}/${server}.json"
     echo "-- running benchmarks/run.sh from this machine against ${GUEST_IP}:${port} --"
@@ -414,7 +432,7 @@ for idx in "${!SERVER_LIST[@]}"; do
         --static-path "/tiny.txt" --proxy-path "/proxy/health" --keepalive-path "/tiny.txt" \
         --driver "macbook-5gbe-crossmachine" --config-label "$server" \
         --save "$save_file" || echo "warning: benchmarks/run.sh reported a non-zero exit for ${server}" >&2
-    finalize_result_file "$save_file" "$sut_meta"
+    finalize_result_file "$save_file" "$sut_meta" "$server"
     RESULT_FILES+=("$save_file")
     if ! $tiny_ok; then
         echo "note: ${server} /tiny.txt was not reachable before this pass (see ${save_file} for what actually ran)" >&2
@@ -484,7 +502,7 @@ exit 1
         exit 1
     fi
 
-    h3_sut_meta="$(capture_sut_meta "tardigrade-http3")"
+    h3_sut_meta="$(capture_sut_meta "tardigrade-http3" "$h3_port")"
 
     h3_save_file="${OUT_DIR}/tardigrade-http3.json"
     echo "-- running benchmarks/run.sh (h2load --h3) from this machine against ${GUEST_IP}:${h3_port} --"
@@ -496,7 +514,7 @@ exit 1
         --static-path "/tiny.txt" --proxy-path "/proxy/health" \
         --driver "macbook-5gbe-crossmachine" --config-label "tardigrade-http3" \
         --save "$h3_save_file" || echo "warning: benchmarks/run.sh reported a non-zero exit for tardigrade-http3" >&2
-    finalize_result_file "$h3_save_file" "$h3_sut_meta"
+    finalize_result_file "$h3_save_file" "$h3_sut_meta" "tardigrade-http3"
     RESULT_FILES+=("$h3_save_file")
 
     stop_server "tardigrade-http3"

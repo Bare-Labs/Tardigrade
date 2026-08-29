@@ -668,6 +668,13 @@ load_source_and_zig() {
   push_guest "${REMOTE_STAGE}/source.tgz" /root/source.tgz
   push_guest "${REMOTE_STAGE}/source.tgz.sha256" /root/source.tgz.sha256
   run_guest "cd /root && sha256sum -c source.tgz.sha256 && tar -xzf /root/source.tgz -C /work/Tardigrade"
+  # TARDIGRADE_SHA is always a `git rev-parse` output (pure hex), never
+  # caller-controlled shell content, so no extra quoting is needed here.
+  # This marker lets benchmarks/run-cross-machine-competitive.sh's
+  # require_verified_source() assert its --tardigrade-git-sha against what
+  # this campaign actually extracted, instead of trusting an unverified
+  # operator-supplied label.
+  run_guest "printf '%s' '${TARDIGRADE_SHA}' > /work/Tardigrade/.tardigrade-source-sha"
 
   if [[ -f "${REMOTE_STAGE}/zig.tgz" ]]; then
     say "==> installing staged Zig $ZIG_VERSION in guest"
