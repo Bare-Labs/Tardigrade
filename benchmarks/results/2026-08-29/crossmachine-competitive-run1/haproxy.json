@@ -1,0 +1,76 @@
+{
+  "static-http1": {
+    "rps": 82216.17,
+    "p50_ms": 0.360,
+    "p95_ms": 0.573,
+    "p99_ms": 1.086,
+    "p999_ms": 2.332,
+    "errors": 0,
+    "throughput_mbps": 5.25,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "proxy-http1": {
+    "rps": 7407.47,
+    "p50_ms": 4.018,
+    "p95_ms": 10.452,
+    "p99_ms": 576.777,
+    "p999_ms": 1026.953,
+    "errors": 2,
+    "throughput_mbps": 0.98,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "keepalive": {
+    "rps": 81513.65,
+    "p50_ms": 0.363,
+    "p95_ms": 0.590,
+    "p99_ms": 1.175,
+    "p999_ms": 2.440,
+    "errors": 0,
+    "throughput_mbps": 5.21,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "_meta": {
+    "tag": "v0.6.4-23-g8ebe553f",
+    "timestamp": "2026-08-29T00:30:44Z",
+    "host": "192.168.86.58",
+    "port": "19081",
+    "tool": "wrk",
+    "duration_s": 20,
+    "connections": 32,
+    "threads": 4,
+    "runs": 1,
+    "host_header": "",
+    "driver": "macbook-5gbe-crossmachine",
+    "worker_count": null,
+    "config_label": "haproxy",
+    "process_metrics": {
+      "enabled": false,
+      "pid_source": "none",
+      "pid_tree": false,
+      "sample_interval_ms": 500
+    },
+    "zig_version": "0.16.0",
+    "h2load_version": "h2load nghttp2/1.69.0",
+    "h2load_h3_supported": false,
+    "h2load_output_file_supported": true,
+    "environment": {
+      "os": "Darwin",
+      "kernel": "25.3.0",
+      "arch": "arm64",
+      "cpu_model": "Apple M4",
+      "cpu_threads": "10",
+      "memory_mb": "16384"
+    },
+    "static_path": "/tiny.txt",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/tiny.txt",
+    "h2_path": "/tiny.txt",
+    "h3_path": "/tiny.txt"
+  }
+}
