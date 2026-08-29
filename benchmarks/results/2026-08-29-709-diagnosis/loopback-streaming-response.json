@@ -1,0 +1,52 @@
+{
+  "proxy-http1": {
+    "rps": 6519.16,
+    "p50_ms": 4.779,
+    "p95_ms": 6.842,
+    "p99_ms": 7.895,
+    "p999_ms": 9.485,
+    "errors": 0,
+    "throughput_mbps": 3.61,
+    "cpu_pct_avg": null,
+    "rss_mb_peak": null,
+    "open_fds_peak": null
+  },
+  "_meta": {
+    "tag": "unknown",
+    "timestamp": "2026-08-29T13:00:37Z",
+    "host": "127.0.0.1",
+    "port": "8069",
+    "tool": "wrk",
+    "duration_s": 15,
+    "connections": 32,
+    "threads": 4,
+    "runs": 1,
+    "host_header": "",
+    "driver": "local",
+    "worker_count": null,
+    "config_label": null,
+    "process_metrics": {
+      "enabled": false,
+      "pid_source": "none",
+      "pid_tree": false,
+      "sample_interval_ms": 500
+    },
+    "zig_version": "unknown",
+    "h2load_version": "unknown",
+    "h2load_h3_supported": false,
+    "h2load_output_file_supported": false,
+    "environment": {
+      "os": "Linux",
+      "kernel": "6.17.13-2-pve",
+      "arch": "x86_64",
+      "cpu_model": "Intel(R) N150",
+      "cpu_threads": "4",
+      "memory_mb": "15759"
+    },
+    "static_path": "/health",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/health",
+    "h2_path": "/health",
+    "h3_path": "/health"
+  }
+}

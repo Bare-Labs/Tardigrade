@@ -1,0 +1,28 @@
+{
+  "requests": 16301,
+  "rps": 7619.23,
+  "elapsed_s": 2.139,
+  "reconnects": 16301,
+  "reconnects_per_sec": 7619.23,
+  "p50_ms": 3.73,
+  "p95_ms": 5.594,
+  "p99_ms": 6.451,
+  "errors_total": 32,
+  "errors_by_class": {
+    "reconnect:OSError": 32
+  },
+  "response_connection_header_counts": {
+    "close": 16301
+  },
+  "connections": 32,
+  "duration_requested_s": 15.0,
+  "_meta": {
+    "tool": "benchmarks/loadgen.py",
+    "client": "mac (this host), via dedicated point-to-point link 10.250.250.1 -> 10.250.250.2",
+    "server": "proxmox host, TARDIGRADE_PROXY_STREAMING_MODE=response, TARDIGRADE_WORKER_THREADS=0 (default=4)",
+    "path": "/proxy/health",
+    "run_terminated_early": "all 32 client worker threads hit OSError(49, \"Can't assign requested address\") (client-side ephemeral port exhaustion) at ~2.1s and exited; run did not reach the requested 15s duration",
+    "worker_queue_wait_us_delta": {"sum_us": 100184725, "count": 32604, "avg_us_per_dispatch": 3072},
+    "accepts_total_delta": 16302
+  }
+}
