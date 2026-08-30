@@ -19538,6 +19538,8 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
         .expected_requests = 2,
     };
     const responder_thread = try std.Thread.spawn(.{}, PersistentRawPeerResponder.run, .{&responder});
+    var responder_joined = false;
+    defer if (!responder_joined) responder_thread.join();
 
     var successes: usize = 0;
     var attempts: usize = 0;
@@ -19557,8 +19559,9 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
         compat.sleepNs(100 * std.time.ns_per_ms);
     }
     responder_thread.join();
-    try std.testing.expectEqual(@as(usize, 2), responder.observed_requests);
+    responder_joined = true;
     if (responder.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), responder.observed_requests);
     try std.testing.expectEqual(@as(usize, 2), successes);
 
     var metrics = try sendRequest(allocator, tardigrade.port, .{

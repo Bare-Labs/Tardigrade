@@ -70,11 +70,36 @@ jobs:
           fi
 
           filter='native upstream https: two proxied requests reuse the pooled TLS connection'
+          log="$RUNNER_TEMP/native-tls-reuse.log"
+          : > "$log"
+          write_summary() {
+            {
+              echo "### Native TLS reuse soak"
+              echo
+              echo "- label: ${{ matrix.label }}"
+              echo "- runner.os: ${{ runner.os }}"
+              echo "- runner.arch: ${{ runner.arch }}"
+              echo "- commit: $GITHUB_SHA"
+              echo "- zig: $(zig version)"
+              echo "- command: zig build test-integration -Dintegration-test-filter=\"$filter\" --summary all --error-style verbose"
+              echo "- iterations requested: $ITERATIONS"
+              if grep -Eq 'stale=[1-9][0-9]*|quarantine_incomplete=[1-9][0-9]*|release_(lifetime|capacity|not_reusable)=[1-9][0-9]*' "$log"; then
+                echo "- nonzero stale/quarantine/release-reject: yes"
+              else
+                echo "- nonzero stale/quarantine/release-reject: no"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          set -o pipefail
           for i in $(seq 1 "$ITERATIONS"); do
             echo "native TLS reuse iteration $i/$ITERATIONS"
             zig build test-integration \
               -Dintegration-test-filter="$filter" \
               --summary all \
-              --error-style verbose \
-              || exit 1
+              --error-style verbose 2>&1 | tee -a "$log" || {
+                write_summary
+                exit 1
+              }
           done
+          write_summary
