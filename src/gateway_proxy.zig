@@ -1361,8 +1361,10 @@ fn streamViaH2Pool(
                     h2_pool.release(conn);
                     return error.ProxyBufferCapacityUnavailable;
                 };
-                gpres.writeStreamedUpstreamResponseHeadFromHeaders(
-                    downstream_writer,
+                var downstream_write = gpres.StreamingResponseWriteState{};
+                defer downstream_write.deinit();
+                try downstream_write.initHeadFromHeaders(
+                    allocator,
                     status,
                     reason,
                     stream.headers.items,
@@ -1372,7 +1374,8 @@ fn streamViaH2Pool(
                     security,
                     alt_svc,
                     sticky_set_cookie,
-                ) catch {
+                );
+                gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
                     conn.finishStreaming(stream); // resets the unfinished stream
                     h2_pool.release(conn);
                     return streamingResultAfterDownstreamAbort(status, reason, 0, ttfb_ms);
@@ -1411,7 +1414,12 @@ fn streamViaH2Pool(
                             break;
                         };
                         if (n == 0) break;
-                        gpres.writeChunk(downstream_writer, response_buf.?[0..n]) catch {
+                        downstream_write.beginChunk(response_buf.?[0..n]) catch {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
+                        };
+                        gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
@@ -1420,12 +1428,23 @@ fn streamViaH2Pool(
                         body_bytes += n;
                     }
                     if (!aborted) {
-                        gpres.writeChunk(downstream_writer, "") catch {
+                        downstream_write.beginTerminalChunk() catch {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
+                        };
+                        gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
                         };
                     }
+                } else {
+                    downstream_write.finishWithoutBody() catch {
+                        conn.finishStreaming(stream);
+                        h2_pool.release(conn);
+                        return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
+                    };
                 }
                 conn.finishStreaming(stream);
                 // A connection-level failure mid-relay leaves the connection
@@ -2554,6 +2573,7 @@ fn relayUpstreamBody(
     fd: std.posix.fd_t,
     deadline_ms: u32,
     framing: ResponseFraming,
+    downstream_write: *gpres.StreamingResponseWriteState,
     downstream_writer: anytype,
     cancel_token: ?*const CancellationToken,
 ) !RelayOutcome {
@@ -2576,7 +2596,8 @@ fn relayUpstreamBody(
                     return .{ .body_bytes = total, .aborted = true, .reusable = false };
                 }
                 const take = @min(rb.available().len, remaining);
-                gpres.writeChunk(downstream_writer, rb.available()[0..take]) catch return error.ClientAborted;
+                downstream_write.beginChunk(rb.available()[0..take]) catch return error.ClientAborted;
+                gpres.drainStreamingWriteBlocking(downstream_write, downstream_writer) catch return error.ClientAborted;
                 rb.consume(take);
                 total += take;
                 remaining -= take;
@@ -2602,7 +2623,8 @@ fn relayUpstreamBody(
                         return .{ .body_bytes = total, .aborted = true, .reusable = false };
                     }
                     const take = @min(rb.available().len, chunk_remaining);
-                    gpres.writeChunk(downstream_writer, rb.available()[0..take]) catch return error.ClientAborted;
+                    downstream_write.beginChunk(rb.available()[0..take]) catch return error.ClientAborted;
+                    gpres.drainStreamingWriteBlocking(downstream_write, downstream_writer) catch return error.ClientAborted;
                     rb.consume(take);
                     total += take;
                     chunk_remaining -= take;
@@ -2616,7 +2638,8 @@ fn relayUpstreamBody(
             while (true) {
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
                 if (rb.available().len == 0 and !try rb.fill(transport, fd, deadline_ms)) break;
-                gpres.writeChunk(downstream_writer, rb.available()) catch return error.ClientAborted;
+                downstream_write.beginChunk(rb.available()) catch return error.ClientAborted;
+                gpres.drainStreamingWriteBlocking(downstream_write, downstream_writer) catch return error.ClientAborted;
                 total += rb.available().len;
                 rb.consume(rb.available().len);
             }
@@ -2942,8 +2965,10 @@ fn streamProxyOverTransport(
     const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
     const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
 
-    gpres.writeStreamedUpstreamResponseHeadFromHeaders(
-        downstream_writer,
+    var downstream_write = gpres.StreamingResponseWriteState{};
+    defer downstream_write.deinit();
+    downstream_write.initHeadFromHeaders(
+        allocator,
         head.status_code,
         reason,
         head.headers,
@@ -2954,6 +2979,10 @@ fn streamProxyOverTransport(
         alt_svc,
         sticky_set_cookie,
     ) catch return .{
+        .result = streamingResultAfterDownstreamAbort(head.status_code, reason, 0, ttfb_ms),
+        .reusable = false,
+    };
+    gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch return .{
         .result = streamingResultAfterDownstreamAbort(head.status_code, reason, 0, ttfb_ms),
         .reusable = false,
     };
@@ -2972,7 +3001,7 @@ fn streamProxyOverTransport(
     // or a full ghost response.
     var reusable = body_allowed and head.http_1_1 and !head.connection_close;
     if (body_allowed) {
-        const outcome = relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, downstream_writer, cancel_token) catch |err| {
+        const outcome = relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, &downstream_write, downstream_writer, cancel_token) catch |err| {
             if (err == error.ClientAborted) {
                 return .{
                     .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
@@ -2984,7 +3013,18 @@ fn streamProxyOverTransport(
         body_bytes = outcome.body_bytes;
         aborted = outcome.aborted;
         reusable = reusable and outcome.reusable;
-        if (!aborted) gpres.writeChunk(downstream_writer, "") catch return .{
+        if (!aborted) {
+            downstream_write.beginTerminalChunk() catch return .{
+                .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
+                .reusable = false,
+            };
+            gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch return .{
+                .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
+                .reusable = false,
+            };
+        }
+    } else {
+        downstream_write.finishWithoutBody() catch return .{
             .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
             .reusable = false,
         };
@@ -4010,7 +4050,9 @@ fn runStreamingRelay(
     var captured = std.array_list.Managed(u8).init(allocator);
     defer captured.deinit();
     const writer = CaptureWriter{ .list = &captured };
-    const outcome = try relayUpstreamBody(&rb, transport, client_fd, 1_000, head.framing, writer, null);
+    var downstream_write = gpres.StreamingResponseWriteState.init("");
+    try gpres.drainStreamingWriteBlocking(&downstream_write, writer);
+    const outcome = try relayUpstreamBody(&rb, transport, client_fd, 1_000, head.framing, &downstream_write, writer, null);
 
     // De-chunk the captured downstream stream (relay does not emit the
     // terminating zero chunk; append it so decodeChunkedBody can parse).
