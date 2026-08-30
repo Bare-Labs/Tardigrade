@@ -625,6 +625,22 @@ deterministic regression tests:
     a controllable hostile native-TLS origin; until that exists, the
     quarantine behavior is validated by pool lifecycle tests, typed
     telemetry, and cross-platform native-TLS CI.
+
+    Issue #725 investigated the old nested-Tardigrade-origin version of the
+    native upstream HTTPS reuse test. Its preserved macOS ARM64 failure had
+    `checkout_stale_tls_drive_error_total=1`, not plaintext, peer-close, or
+    incomplete-ciphertext counters. That class maps to
+    `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()` catching a native
+    record-layer `drive()` failure; for the nested fixture this is the
+    fail-closed abrupt-EOF path (`TruncatedStream`) when the origin-side TLS
+    connection disappears without a peer `close_notify` between pool release
+    and the next checkout. That is a fixture lifecycle condition, not a
+    production relaxation target: checkout must continue to reject every
+    drive error because it cannot prove the connection is still synchronized.
+    The focused #698/#724 soak therefore uses a persistent raw OpenSSL peer,
+    which keeps one HTTP/1.1 TLS connection alive across both expected
+    requests and isolates the upstream client/pool reuse invariant from a
+    second Tardigrade process's readiness/teardown behavior.
 28. `isValidHeaderName()` -- the function `isValidTrailerLine()` (defect 26)
     delegates field-name validation to -- claimed to implement RFC 7230
     §3.2.6's `token`/`tchar` grammar but actually only rejected control

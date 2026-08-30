@@ -19503,6 +19503,13 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
     defer allocator.free(ca_cert);
 
+    // #725: this reuse invariant needs a deterministic persistent TLS peer.
+    // The earlier nested-Tardigrade-origin fixture could close the TLS
+    // connection without a peer `close_notify` between release and checkout on
+    // macOS CI, which the native record layer correctly surfaced as a
+    // fail-closed `TruncatedStream`/`tls_drive_error` stale checkout. The raw
+    // peer below keeps the same HTTP/1.1 TLS connection alive for both
+    // requests and isolates the upstream client/pool invariant.
     var origin = try OpensslRawPeer.start(allocator, &.{ "-cert", leaf_cert, "-key", leaf_key });
     defer origin.stop();
 
