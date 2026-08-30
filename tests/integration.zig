@@ -19571,6 +19571,14 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
 
         if (reused_total >= 1 or reuse_round >= 5) break;
 
+        // `UpstreamPool.checkout()` counts a reuse as soon as it selects a
+        // pooled connection, before the HTTP exchange over it completes --
+        // so a non-200 attempt could otherwise still bump `reused_total`
+        // and let the next metrics scrape above accept an attempted-but-
+        // failed reuse as passing evidence. Require an explicit 200 here,
+        // and fail outright if this retry budget can't produce one, rather
+        // than silently falling through to another metrics scrape.
+        var extra_success = false;
         var extra_attempts: usize = 0;
         while (extra_attempts < 20) : (extra_attempts += 1) {
             var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
@@ -19581,9 +19589,13 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
             }, 20_000);
             const status_code = response.status_code;
             response.deinit();
-            if (status_code == 200) break;
+            if (status_code == 200) {
+                extra_success = true;
+                break;
+            }
             compat.sleepNs(100 * std.time.ns_per_ms);
         }
+        if (!extra_success) return error.NativeUpstreamReuseProbeNeverCompleted;
     }
 
     try std.testing.expect(new_total >= 1);
