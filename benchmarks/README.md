@@ -614,3 +614,44 @@ the proxy metrics from `/status/metrics`: `tardigrade_proxy_streaming_requests_t
 
 If `h2load` is not available or was not built with QUIC support, the HTTP/2 and HTTP/3
 scenarios each print a clear skip message and the runner continues without error.
+
+## RTT-sensitive streaming proxy regression (#708/#714)
+
+`benchmarks/competitive/rtt-streaming-regression.sh` is the permanent,
+checked-in regression path for the client-RTT streaming-proxy collapse
+diagnosed in #708 and fixed in #710 (downstream keep-alive) and #711 (write
+coalescing). It reproduces the failure shape on demand without requiring the
+maintainer's home network or dedicated hardware: it colocates the load
+generator and Tardigrade on one Linux host and injects controlled client-
+facing RTT with `tc netem` on loopback, the same technique
+`benchmarks/competitive/netem-impair.sh` established for #256-G.
+
+```bash
+sudo benchmarks/competitive/rtt-streaming-regression.sh \
+  --delays 0,1,2,5 --duration 10 --connections 32 --threads 4 --reps 3
+```
+
+Linux-only (`tc netem`) and root/`CAP_NET_ADMIN` required. It is manual/
+scheduled by design — it must **not** gate every PR on privileged `tc`/
+dedicated hardware (see the epic's non-goals). Run it by hand, or wire it
+into a `workflow_dispatch`/scheduled job on a self-hosted Linux runner.
+
+At every RTT point it runs six rows against the small `/proxy/health` case
+and controls: `normal` (streaming, keep-alive-eligible — the original #708
+failure mode), `close` (explicit `Connection: close`, a churn control),
+`buffered` (`proxy_streaming_mode off`), `static` (tiny in-process
+response), `large` (1 MiB streamed body, #711 regression check), and `slow`
+(200ms upstream delay, correctness check for the worker-blocked design —
+#712/#713 were closed not planned, so this does not assert an event-driven
+claim). Each row records req/s, p50/p95/p99/p999, client/socket errors, and
+downstream connection churn (`tardigrade_accepts_total` /
+`tardigrade_requests_total` deltas — proof of keep-alive reuse, not just
+inferred from headers). Output is one JSON file per (delay, scenario, rep)
+plus an aggregated `REPORT.md`.
+
+The pass/fail signal to watch: `normal` should track `buffered` within a
+small margin at every RTT point (both scale down with injected RTT the same
+way), and `normal`'s downstream churn should stay near the `buffered`/
+`static` baseline (~1%) rather than approaching `close`'s ~100% — that
+divergence, present pre-#710/#711 and absent after, is the regression this
+script exists to catch.
