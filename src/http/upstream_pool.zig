@@ -19,6 +19,7 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const upstream_tls = @import("upstream_tls.zig");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
+const tls_core = @import("tls_core");
 
 pub const Config = struct {
     enabled: bool = true,
@@ -978,11 +979,312 @@ pub fn freeHostSnapshots(allocator: std.mem.Allocator, snaps: []HostSnapshot) vo
 }
 
 const testing = std.testing;
+const encrypted_stream = tls_core.encrypted_stream;
+const tls_backend = tls_core.tls13_backend;
 
 fn testPair() ![2]std.posix.fd_t {
     var fds: [2]std.posix.fd_t = undefined;
     try testing.expect(std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) == 0);
     return fds;
+}
+
+fn fixtureIdentity() tls_backend.Identity {
+    return tls_backend.Identity.initPkcs8(
+        tls_backend.testdata.certificate_der,
+        tls_backend.testdata.private_key_pkcs8_der,
+    ) catch unreachable;
+}
+
+fn setTestNonBlocking(fd: std.posix.fd_t) !void {
+    const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (status_flags < 0) return error.FcntlFailed;
+    const nonblock = @as(c_int, @bitCast(std.posix.O{ .NONBLOCK = true }));
+    if (std.c.fcntl(fd, std.c.F.SETFL, status_flags | nonblock) < 0) return error.FcntlFailed;
+}
+
+fn writeTestFd(fd: std.posix.fd_t, bytes: []const u8) encrypted_stream.Error!usize {
+    const rc = std.c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketWriteFailed;
+    }
+    return @intCast(rc);
+}
+
+fn readTestFd(fd: std.posix.fd_t, out: []u8) encrypted_stream.Error!usize {
+    const rc = std.c.read(fd, out.ptr, out.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketReadFailed;
+    }
+    return @intCast(rc);
+}
+
+fn writeAllTestFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    var rounds: usize = 0;
+    while (off < bytes.len) : (rounds += 1) {
+        if (rounds > 4096) return error.TestUnexpectedResult;
+        off += writeTestFd(fd, bytes[off..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                try std.Thread.yield();
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn waitTestFdReadable(fd: std.posix.fd_t) !void {
+    var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 }};
+    const ready = try std.posix.poll(&pfd, 1);
+    if (ready == 0) return;
+    if ((pfd[0].revents & std.posix.POLL.ERR) != 0) return error.SocketReadFailed;
+}
+
+const TestFdCarrier = struct {
+    fd: std.posix.fd_t,
+
+    fn carrier(self: *TestFdCarrier) encrypted_stream.Carrier {
+        return .{ .ptr = self, .readFn = read, .writeFn = write, .closeFn = close, .owns_handle = false };
+    }
+
+    fn read(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
+        const self: *TestFdCarrier = @ptrCast(@alignCast(ptr));
+        return readTestFd(self.fd, out);
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) encrypted_stream.Error!usize {
+        const self: *TestFdCarrier = @ptrCast(@alignCast(ptr));
+        return writeTestFd(self.fd, bytes);
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
+const NativeTlsPoolPeer = struct {
+    allocator: std.mem.Allocator,
+    fds: [2]std.posix.fd_t,
+    fds_closed: [2]bool = .{ false, false },
+    entropy_source: tls_core.production_crypto.OsEntropy = .{},
+    provider_state: tls_core.production_crypto.Provider = undefined,
+    backend: tls_backend.Tls13Backend = undefined,
+    record: encrypted_stream.PureZigRecordStream = undefined,
+    carrier: TestFdCarrier = undefined,
+    client_carrier: TestFdCarrier = undefined,
+    record_initialized: bool = false,
+    client_tls: ?*upstream_tls.UpstreamTlsConn = null,
+
+    fn create(allocator: std.mem.Allocator) !*NativeTlsPoolPeer {
+        const self = try allocator.create(NativeTlsPoolPeer);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .fds = try testPair(),
+        };
+        errdefer self.closeEndpoint(0);
+        errdefer self.closeEndpoint(1);
+        try setTestNonBlocking(self.fds[0]);
+        try setTestNonBlocking(self.fds[1]);
+
+        self.provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
+        const server_provider = self.provider_state.cryptoProvider();
+        self.backend = tls_backend.Tls13Backend.initServerConfigured(
+            tls_core.production_crypto.freshHandshakeEntropy() catch return error.TestUnexpectedResult,
+            server_provider,
+            fixtureIdentity(),
+            tls_backend.recordConfig(tls_core.policy.Policy.recordHttp1Only(false)),
+        );
+        errdefer self.backend.deinit();
+        self.carrier = .{ .fd = self.fds[1] };
+        self.record = try encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+            allocator,
+            .server,
+            server_provider,
+            .tls_aes_128_gcm_sha256,
+            self.carrier.carrier(),
+            self.backend.backend(),
+        );
+        self.record_initialized = true;
+
+        const client_state = try allocator.create(upstream_tls.TestHooks.State);
+        errdefer allocator.destroy(client_state);
+        client_state.* = .{ .allocator = allocator, .fd = self.fds[0] };
+        client_state.entropy_source = .{};
+        client_state.crypto_provider_state = tls_core.production_crypto.Provider.init(client_state.entropy_source.entropy());
+        const client_provider = client_state.crypto_provider_state.cryptoProvider();
+        const client_config = tls_backend.BackendConfig{
+            .transport = .record,
+            .policy = .{
+                .transport_mode = .record,
+                .protocol_versions = tls_backend.native_capabilities.protocol_versions,
+                .cipher_suites = tls_backend.native_capabilities.cipher_suites,
+                .named_groups = tls_backend.native_capabilities.named_groups,
+                .signature_schemes = tls_backend.native_capabilities.signature_schemes,
+                .alpn_protocols = &.{tls_core.algorithms.alpn.http_1_1},
+                .allow_absent_alpn = false,
+            },
+        };
+        client_state.backend = tls_backend.Tls13Backend.initClientConfigured(
+            tls_core.production_crypto.freshHandshakeEntropy() catch return error.TestUnexpectedResult,
+            client_provider,
+            .insecure_no_verification,
+            client_config,
+            .{ .server_name = "tardigrade.test" },
+        );
+        errdefer client_state.backend.deinit();
+        self.client_carrier = .{ .fd = self.fds[0] };
+        client_state.record = try encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+            allocator,
+            .client,
+            client_provider,
+            .tls_aes_128_gcm_sha256,
+            self.client_carrier.carrier(),
+            client_state.backend.backend(),
+        );
+        errdefer client_state.record.deinit();
+        client_state.record.allow_unverified_certificate = true;
+
+        var rounds: usize = 0;
+        while (!self.record.applicationDataOpen() or !client_state.record.applicationDataOpen()) : (rounds += 1) {
+            if (rounds > 2000) return error.TestUnexpectedResult;
+            const client_driven = try client_state.record.drive();
+            const server_driven = try self.record.drive();
+            if (!client_driven.made_progress and !server_driven.made_progress) {
+                try waitTestFdReadable(self.fds[0]);
+                try waitTestFdReadable(self.fds[1]);
+            }
+            try std.Thread.yield();
+        }
+        const tls_ptr = try allocator.create(upstream_tls.UpstreamTlsConn);
+        tls_ptr.* = .{ .state = client_state, .fd = self.fds[0], .protocol = .http1_1 };
+        self.client_tls = tls_ptr;
+        return self;
+    }
+
+    fn destroy(self: *NativeTlsPoolPeer) void {
+        if (self.client_tls) |tls| {
+            tls.deinit();
+            self.allocator.destroy(tls);
+            self.client_tls = null;
+        }
+        if (self.record_initialized) self.record.deinit();
+        self.closeEndpoint(1);
+        self.closeEndpoint(0);
+        self.allocator.destroy(self);
+    }
+
+    fn closeEndpoint(self: *NativeTlsPoolPeer, index: usize) void {
+        if (!self.fds_closed[index]) {
+            _ = std.c.close(self.fds[index]);
+            self.fds_closed[index] = true;
+        }
+    }
+
+    fn takePooledConn(self: *NativeTlsPoolPeer, now_ms: u64) PooledConn {
+        const tls_ptr = self.client_tls.?;
+        self.client_tls = null;
+        return .{
+            .stream = compat.netStreamFromFd(tls_ptr.fd),
+            .tls = tls_ptr,
+            .created_ms = now_ms,
+            .last_used_ms = now_ms,
+        };
+    }
+
+    fn driveUntilRequestContains(self: *NativeTlsPoolPeer, needle: []const u8) !void {
+        var buf: [1024]u8 = undefined;
+        var rounds: usize = 0;
+        while (rounds < 5000) : (rounds += 1) {
+            _ = try self.record.drive();
+            if (self.record.inbound_plaintext.len > 0) {
+                const n = try self.record.readPlaintext(&buf);
+                if (std.mem.indexOf(u8, buf[0..n], needle) != null) return;
+            }
+            try std.Thread.yield();
+        }
+        return error.TestUnexpectedResult;
+    }
+
+    fn writeResponse(self: *NativeTlsPoolPeer, body: []const u8) !void {
+        var response_buf: [256]u8 = undefined;
+        const response = try std.fmt.bufPrint(
+            &response_buf,
+            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+            .{ body.len, body },
+        );
+        var off: usize = 0;
+        while (off < response.len) {
+            const n = self.record.writePlaintext(response[off..]) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => return err,
+            };
+            off += n;
+            try self.flushServerCiphertext();
+        }
+        try self.flushServerCiphertext();
+    }
+
+    fn flushServerCiphertext(self: *NativeTlsPoolPeer) !void {
+        var rounds: usize = 0;
+        while (self.record.queuedCiphertextLen() > 0) : (rounds += 1) {
+            if (rounds > 4096) return error.TestUnexpectedResult;
+            _ = try self.record.drive();
+            try std.Thread.yield();
+        }
+    }
+
+    fn sealHostileApplicationRecord(self: *NativeTlsPoolPeer, bytes: []const u8, out: []u8) ![]const u8 {
+        return self.record.bridge.sealApplicationData(bytes, out);
+    }
+
+    fn sendHostileApplicationRecord(self: *NativeTlsPoolPeer, bytes: []const u8) !void {
+        var record_buf: [tls_core.record_codec.max_ciphertext_record_len]u8 = undefined;
+        const record = try self.sealHostileApplicationRecord(bytes, &record_buf);
+        try writeAllTestFd(self.fds[1], record);
+    }
+
+    fn sendHostileApplicationRecordPrefix(self: *NativeTlsPoolPeer, bytes: []const u8, split: usize) ![]const u8 {
+        var record_buf: [tls_core.record_codec.max_ciphertext_record_len]u8 = undefined;
+        const record = try self.sealHostileApplicationRecord(bytes, &record_buf);
+        try testing.expect(split > 0 and split < record.len);
+        try writeAllTestFd(self.fds[1], record[0..split]);
+        const remainder = try self.allocator.dupe(u8, record[split..]);
+        return remainder;
+    }
+
+    fn sendServerCloseNotify(self: *NativeTlsPoolPeer) !void {
+        var record_buf: [tls_core.record_codec.max_ciphertext_record_len]u8 = undefined;
+        const record = try self.record.bridge.sealProtected(.application, .alert, &.{ 1, 0 }, &record_buf);
+        try writeAllTestFd(self.fds[1], record);
+    }
+};
+
+fn expectTlsHttpBody(tls: *upstream_tls.UpstreamTlsConn, body: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    var rounds: usize = 0;
+    while (rounds < 5000) : (rounds += 1) {
+        if (len == buf.len) return error.TestUnexpectedResult;
+        const n = try tls.read(buf[len..]);
+        len += n;
+        if (std.mem.indexOf(u8, buf[0..len], body) != null) return;
+        try std.Thread.yield();
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn driveNativeTlsHttpExchange(peer: *NativeTlsPoolPeer, tls: *upstream_tls.UpstreamTlsConn, path: []const u8, body: []const u8) !void {
+    var request_buf: [128]u8 = undefined;
+    const request = try std.fmt.bufPrint(
+        &request_buf,
+        "GET {s} HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: keep-alive\r\n\r\n",
+        .{path},
+    );
+    try tls.writeAll(request);
+    try peer.driveUntilRequestContains(path);
+    try peer.writeResponse(body);
+    try expectTlsHttpBody(tls, body);
 }
 
 test "checkout on an empty pool reserves a slot for a fresh connection" {
@@ -1074,6 +1376,120 @@ test "checkout discards an idle connection with an unsolicited ghost byte instea
     try testing.expectEqual(@as(u64, 0), agg.reused_total);
     try testing.expectEqual(@as(u64, 1), agg.stale_retries_total);
     try testing.expectEqual(@as(u64, 1), agg.checkout_stale_plaintext_unexpected);
+}
+
+test "native TLS checkout reuses a clean persistent connection as the control case (#697)" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const key = "https:tardigrade.test:443";
+
+    var peer = try NativeTlsPoolPeer.create(testing.allocator);
+    defer peer.destroy();
+    try driveNativeTlsHttpExchange(peer, peer.client_tls.?, "/one", "clean-one");
+
+    try pool.reserveSlot(key);
+    pool.noteNewConnection(key);
+    pool.release(key, peer.takePooledConn(1000), true, 1000);
+
+    const got = (try pool.checkout(key, 1500)) orelse return error.TestExpectedReuse;
+    try testing.expectEqual(@as(u64, 1), pool.aggregateStats().reused_total);
+    try driveNativeTlsHttpExchange(peer, got.tls.?, "/two", "clean-two");
+    pool.release(key, got, false, 1500);
+}
+
+test "native TLS checkout rejects complete unsolicited application data before reuse (#697)" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const key = "https:tardigrade.test:443";
+
+    var poisoned = try NativeTlsPoolPeer.create(testing.allocator);
+    defer poisoned.destroy();
+    try driveNativeTlsHttpExchange(poisoned, poisoned.client_tls.?, "/one", "before-complete-ghost");
+
+    try pool.reserveSlot(key);
+    pool.noteNewConnection(key);
+    pool.release(key, poisoned.takePooledConn(1000), true, 1000);
+    try poisoned.sendHostileApplicationRecord("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nghost");
+
+    try testing.expect((try pool.checkout(key, 1500)) == null);
+    pool.releaseSlot(key);
+    const rejected = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 0), rejected.reused_total);
+    try testing.expectEqual(@as(u64, 1), rejected.stale_retries_total);
+    try testing.expectEqual(@as(u64, 1), rejected.checkout_stale_tls_application_plaintext);
+
+    var fresh = try NativeTlsPoolPeer.create(testing.allocator);
+    defer fresh.destroy();
+    try pool.reserveSlot(key);
+    pool.noteNewConnection(key);
+    try driveNativeTlsHttpExchange(fresh, fresh.client_tls.?, "/two", "fresh-not-ghost");
+    pool.release(key, fresh.takePooledConn(2000), false, 2000);
+}
+
+test "native TLS checkout quarantines a fragmented hostile application record then closes it on maintenance (#697)" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const key = "https:tardigrade.test:443";
+
+    var poisoned = try NativeTlsPoolPeer.create(testing.allocator);
+    defer poisoned.destroy();
+    try driveNativeTlsHttpExchange(poisoned, poisoned.client_tls.?, "/one", "before-fragmented-ghost");
+
+    try pool.reserveSlot(key);
+    pool.noteNewConnection(key);
+    pool.release(key, poisoned.takePooledConn(1000), true, 1000);
+
+    const remainder = try poisoned.sendHostileApplicationRecordPrefix(
+        "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nfragment-ghost",
+        7,
+    );
+    defer testing.allocator.free(remainder);
+
+    try testing.expect((try pool.checkout(key, 1500)) == null);
+    pool.releaseSlot(key);
+    var entry = pool.hosts.getPtr(key) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), entry.quarantined.items.len);
+    var stats = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 1), stats.checkout_quarantined_tls_incomplete);
+    try testing.expectEqual(@as(u64, 1), stats.stale_retries_total);
+
+    try writeAllTestFd(poisoned.fds[1], remainder);
+    pool.reapIdle(2000);
+    entry = pool.hosts.getPtr(key) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), entry.quarantined.items.len);
+    try testing.expectEqual(@as(usize, 0), entry.idle.items.len);
+    stats = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 1), stats.checkout_quarantined_tls_incomplete);
+    try testing.expectEqual(@as(u64, 1), stats.stale_retries_total);
+
+    var fresh = try NativeTlsPoolPeer.create(testing.allocator);
+    defer fresh.destroy();
+    try pool.reserveSlot(key);
+    pool.noteNewConnection(key);
+    try driveNativeTlsHttpExchange(fresh, fresh.client_tls.?, "/after", "after-fragmented-quarantine");
+    pool.release(key, fresh.takePooledConn(3000), false, 3000);
+}
+
+test "native TLS checkout classifies an idle peer close and never reuses it (#697)" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const key = "https:tardigrade.test:443";
+
+    var peer = try NativeTlsPoolPeer.create(testing.allocator);
+    defer peer.destroy();
+    try driveNativeTlsHttpExchange(peer, peer.client_tls.?, "/one", "before-close");
+
+    try pool.reserveSlot(key);
+    pool.noteNewConnection(key);
+    pool.release(key, peer.takePooledConn(1000), true, 1000);
+    try peer.sendServerCloseNotify();
+
+    try testing.expect((try pool.checkout(key, 1500)) == null);
+    pool.releaseSlot(key);
+    const stats = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 0), stats.reused_total);
+    try testing.expectEqual(@as(u64, 1), stats.stale_retries_total);
+    try testing.expectEqual(@as(u64, 1), stats.checkout_stale_tls_peer_closed);
 }
 
 test "checkout discards an idle connection the origin already closed instead of reusing it" {

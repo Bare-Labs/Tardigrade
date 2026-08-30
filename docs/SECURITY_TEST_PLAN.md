@@ -613,18 +613,17 @@ deterministic regression tests:
     calling the TLS record drain so record work does not monopolize the
     shared pool mutex.
 
-    **Known coverage gap**: this path now has deterministic pool-level
-    coverage for typed plaintext stale detection, retained-capacity
-    accounting across idle plus quarantine, and bounded quarantine
-    maintenance, plus the native-TLS integration test still requires a
-    healthy persistent origin to produce reuse. It still lacks a
-    purpose-built malicious TLS origin that can split a protected
-    application record exactly across the checkout boundary and then prove
-    the completed ghost never becomes the next response. Building that
-    requires in-process client+server TLS handshake test infrastructure or
-    a controllable hostile native-TLS origin; until that exists, the
-    quarantine behavior is validated by pool lifecycle tests, typed
-    telemetry, and cross-platform native-TLS CI.
+    The remaining deterministic coverage gap was closed by #697's
+    socketpair-backed native-TLS pool harness. That harness completes a real
+    TLS 1.3 handshake with `UpstreamTlsConn`, serves a clean persistent
+    HTTP/1.1 exchange as the reuse control, injects complete unsolicited
+    application data before checkout, splits one protected application record
+    at a caller-selected byte boundary so checkout sees incomplete
+    ciphertext, finishes that record during quarantine maintenance, and
+    emits a controlled idle `close_notify`. The assertions pin the typed
+    application-plaintext, incomplete-ciphertext quarantine, and peer-close
+    outcomes, and prove that the poisoned connection is never reused for the
+    later request path.
 28. `isValidHeaderName()` -- the function `isValidTrailerLine()` (defect 26)
     delegates field-name validation to -- claimed to implement RFC 7230
     §3.2.6's `token`/`tchar` grammar but actually only rejected control

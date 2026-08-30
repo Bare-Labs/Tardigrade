@@ -165,6 +165,10 @@ const UpstreamTlsState = struct {
     record: encrypted_stream.PureZigRecordStream = undefined,
 };
 
+pub const TestHooks = if (builtin.is_test) struct {
+    pub const State = UpstreamTlsState;
+} else struct {};
+
 pub const UpstreamTlsConn = struct {
     state: *UpstreamTlsState,
     /// Copy of the connected fd, for callers that need it directly (e.g. to
