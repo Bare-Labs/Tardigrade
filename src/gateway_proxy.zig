@@ -1363,7 +1363,7 @@ fn streamViaH2Pool(
                 };
                 var downstream_write = gpres.StreamingResponseWriteState{};
                 defer downstream_write.deinit();
-                try downstream_write.initHeadFromHeaders(
+                downstream_write.initHeadFromHeaders(
                     allocator,
                     status,
                     reason,
@@ -1374,7 +1374,12 @@ fn streamViaH2Pool(
                     security,
                     alt_svc,
                     sticky_set_cookie,
-                );
+                ) catch |err| {
+                    conn.finishStreaming(stream);
+                    if (!conn.healthy()) h2_pool.evict(key, conn);
+                    h2_pool.release(conn);
+                    return err;
+                };
                 gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
                     conn.finishStreaming(stream); // resets the unfinished stream
                     h2_pool.release(conn);

@@ -766,6 +766,24 @@ fn BlockingStreamingWriteAdapter(comptime Writer: type) type {
 }
 
 pub fn drainStreamingWriteBlocking(state: *StreamingResponseWriteState, writer: anytype) !void {
+    if (comptime writerSupportsGatheredWrite(@TypeOf(writer))) {
+        if (state.phase == .chunk_prefix and
+            state.chunk_prefix_offset == 0 and
+            state.chunk_payload_offset == 0 and
+            state.chunk_suffix_offset == 0)
+        {
+            const fragments = [_][]const u8{
+                state.chunkPrefixBytes(),
+                state.chunk_payload,
+                "\r\n",
+            };
+            _ = try writer.writeGatheredAll(&fragments);
+            state.phase = .ready;
+            state.clearChunk();
+            return;
+        }
+    }
+
     var adapter = BlockingStreamingWriteAdapter(@TypeOf(writer)){ .writer = writer };
     while (true) {
         switch (try state.advance(&adapter)) {
@@ -1045,6 +1063,23 @@ test "writeChunk uses gathered fragments and preserves empty small large bytes" 
     try std.testing.expectEqual(@as(usize, 3), writer.writev_calls);
     try std.testing.expectEqual(@as(usize, 9), writer.writev_iovecs);
     try std.testing.expectEqualStrings(expected.items, writer.output.items);
+}
+
+test "streaming drain uses gathered write for a fresh retained chunk" {
+    const allocator = std.testing.allocator;
+    var state = StreamingResponseWriteState.init("");
+    var writer = TestGatheredProxyWriter.init(allocator);
+    defer writer.deinit();
+
+    try drainStreamingWriteBlocking(&state, &writer);
+    try state.beginChunk("hello");
+    try drainStreamingWriteBlocking(&state, &writer);
+
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.ready, state.phase);
+    try std.testing.expectEqual(@as(usize, 1), writer.writev_calls);
+    try std.testing.expectEqual(@as(usize, 3), writer.writev_iovecs);
+    try std.testing.expectEqual(@as(usize, 0), writer.write_all_calls);
+    try std.testing.expectEqualStrings("5\r\nhello\r\n", writer.output.items);
 }
 
 test "streaming response write state resumes exact offsets across all phases" {
