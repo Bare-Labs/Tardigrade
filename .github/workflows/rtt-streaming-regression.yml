@@ -50,13 +50,23 @@ jobs:
           echo "zig=$(zig version)"
           uname -a
 
+      - name: Build tardi (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
       - name: Run RTT-sensitive streaming proxy regression
         env:
           DELAYS: ${{ github.event.inputs.delays || '0,1,2,5' }}
           REPS: ${{ github.event.inputs.reps || '3' }}
         run: |
+          # Built as the runner user (above) rather than under sudo: `zig`
+          # lives on the runner-user PATH set up by install-zig.sh, and
+          # `sudo` resets PATH/HOME so the script's own `zig build` call
+          # cannot find it. tc netem/network-namespace creation still needs
+          # root, so the script itself runs under sudo with a pre-built
+          # binary handed to it explicitly.
           sudo ./benchmarks/competitive/rtt-streaming-regression.sh \
             --delays "$DELAYS" --duration 10 --connections 32 --threads 4 --reps "$REPS" \
+            --tardigrade-bin "$(pwd)/zig-out/bin/tardi" \
             --out-dir "$RUNNER_TEMP/rtt-streaming-regression"
 
       - name: Publish report to job summary
