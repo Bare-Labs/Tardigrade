@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import socket
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import BaseServer
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -141,13 +145,100 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+class PreforkedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that serves an already-bound, already-listening
+    socket instead of creating its own.
+
+    One of these runs per worker process, all sharing a single listening
+    socket created before fork(). The kernel wakes exactly one blocked
+    accept() per incoming connection, spreading concurrent connections across
+    worker processes (and their GILs) instead of serializing them behind one
+    process — see #722.
+    """
+
+    def __init__(self, sock: socket.socket, handler_class: type) -> None:
+        BaseServer.__init__(self, sock.getsockname(), handler_class)
+        self.socket = sock
+
+    def server_bind(self) -> None:
+        pass
+
+    def server_activate(self) -> None:
+        pass
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        # Benchmark clients (wrk et al.) routinely reset connections under
+        # load or when a run ends; that's not a fixture bug worth a traceback.
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(
+            exc_type, (ConnectionError, TimeoutError)
+        ):
+            return
+        super().handle_error(request, client_address)
+
+
+def make_listen_socket(host: str, port: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.listen(1024)
+    return sock
+
+
+def run_worker(sock: socket.socket) -> None:
+    PreforkedServer(sock, Handler).serve_forever()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="worker processes preforked onto the shared listening socket "
+        "(default: 4); avoids a single GIL becoming the concurrency "
+        "bottleneck under proxied c32-c128 load (#722)",
+    )
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    server.serve_forever()
+    sock = make_listen_socket("127.0.0.1", args.port)
+    workers = max(1, args.workers)
+
+    if workers == 1 or not hasattr(os, "fork"):
+        run_worker(sock)
+        return
+
+    child_pids: list[int] = []
+    for _ in range(workers):
+        pid = os.fork()
+        if pid == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            run_worker(sock)
+            os._exit(0)
+        child_pids.append(pid)
+
+    def shutdown(signum: int, frame: object) -> None:
+        for pid in child_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for pid in child_pids:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    sock.close()  # only workers accept; the manager just supervises
+
+    for pid in child_pids:
+        os.waitpid(pid, 0)
 
 
 if __name__ == "__main__":
