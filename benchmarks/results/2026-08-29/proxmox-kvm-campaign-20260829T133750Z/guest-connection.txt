@@ -1,4 +1,0 @@
-guest_mode=kvm
-guest_id=105
-guest_ssh_host=fe80::be24:11ff:fe5d:4999%vmbr0
-guest_ssh_key=/tmp/tardigrade-proxmox-perf-20260829T133750Z/vm_ssh_key
