@@ -1,0 +1,75 @@
+name: RTT streaming proxy regression
+
+# Manual/scheduled-only lane for the #708/#714 client-RTT streaming-proxy
+# regression check (benchmarks/competitive/rtt-streaming-regression.sh).
+# Deliberately NOT wired to pull_request: it needs tc netem/CAP_NET_ADMIN and
+# takes several minutes, and the epic's non-goals explicitly say not to make
+# every PR depend on privileged tc/dedicated hardware.
+on:
+  workflow_dispatch:
+    inputs:
+      delays:
+        description: Comma-separated added RTT values in ms
+        required: false
+        default: "0,1,2,5"
+      reps:
+        description: Repetitions per (delay, scenario) cell
+        required: false
+        default: "3"
+  schedule:
+    # Weekly, off peak — a manual run is always available for on-demand checks.
+    - cron: "17 6 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rtt-streaming-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: RTT streaming proxy regression (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Install wrk
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq wrk
+
+      - name: Print platform and toolchain evidence
+        run: |
+          echo "commit=$GITHUB_SHA"
+          echo "zig=$(zig version)"
+          uname -a
+
+      - name: Run RTT-sensitive streaming proxy regression
+        env:
+          DELAYS: ${{ github.event.inputs.delays || '0,1,2,5' }}
+          REPS: ${{ github.event.inputs.reps || '3' }}
+        run: |
+          sudo ./benchmarks/competitive/rtt-streaming-regression.sh \
+            --delays "$DELAYS" --duration 10 --connections 32 --threads 4 --reps "$REPS" \
+            --out-dir "$RUNNER_TEMP/rtt-streaming-regression"
+
+      - name: Publish report to job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/rtt-streaming-regression/REPORT.md" ]; then
+            cat "$RUNNER_TEMP/rtt-streaming-regression/REPORT.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rtt-streaming-regression-results
+          path: ${{ runner.temp }}/rtt-streaming-regression/
+          retention-days: 30
