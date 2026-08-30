@@ -1,0 +1,28 @@
+{
+  "samples_collected": 133,
+  "gauge_max": {
+    "tardigrade_worker_active_jobs": 4.0,
+    "tardigrade_worker_queued_jobs": 29.0
+  },
+  "counter_deltas": {
+    "tardigrade_accepts_total": 644.0,
+    "tardigrade_upstream_connections_new_total": 0.0,
+    "tardigrade_upstream_connections_reused_total": 51681.0,
+    "tardigrade_worker_queue_wait_us_sum": 413935104.0,
+    "tardigrade_worker_queue_wait_us_count": 51814.0
+  },
+  "counter_first": {
+    "tardigrade_accepts_total": 37.0,
+    "tardigrade_upstream_connections_new_total": 4.0,
+    "tardigrade_upstream_connections_reused_total": 200.0,
+    "tardigrade_worker_queue_wait_us_sum": 1685103.0,
+    "tardigrade_worker_queue_wait_us_count": 211.0
+  },
+  "counter_last": {
+    "tardigrade_accepts_total": 681.0,
+    "tardigrade_upstream_connections_new_total": 4.0,
+    "tardigrade_upstream_connections_reused_total": 51881.0,
+    "tardigrade_worker_queue_wait_us_sum": 415620207.0,
+    "tardigrade_worker_queue_wait_us_count": 52025.0
+  }
+}
