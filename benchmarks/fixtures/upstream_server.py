@@ -189,6 +189,48 @@ def run_worker(sock: socket.socket) -> None:
     PreforkedServer(sock, Handler).serve_forever()
 
 
+def terminate_workers(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for pid in pids:
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+
+def exit_code_for(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def fork_workers(sock: socket.socket, count: int) -> list[int]:
+    child_pids: list[int] = []
+    try:
+        for _ in range(count):
+            pid = os.fork()
+            if pid == 0:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                run_worker(sock)
+                os._exit(0)
+            child_pids.append(pid)
+    except BaseException:
+        # A partial pool must not outlive this process: an unhandled fork()
+        # failure here would otherwise leak already-started workers that
+        # keep the shared listener open after the manager exits (#722 review).
+        terminate_workers(child_pids)
+        sock.close()
+        raise
+    return child_pids
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18080)
@@ -209,27 +251,11 @@ def main() -> None:
         run_worker(sock)
         return
 
-    child_pids: list[int] = []
-    for _ in range(workers):
-        pid = os.fork()
-        if pid == 0:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            run_worker(sock)
-            os._exit(0)
-        child_pids.append(pid)
+    child_pids = fork_workers(sock, workers)
+    remaining = set(child_pids)
 
     def shutdown(signum: int, frame: object) -> None:
-        for pid in child_pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        for pid in child_pids:
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
+        terminate_workers(list(remaining))
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
@@ -237,8 +263,16 @@ def main() -> None:
 
     sock.close()  # only workers accept; the manager just supervises
 
-    for pid in child_pids:
-        os.waitpid(pid, 0)
+    # serve_forever() never returns on its own, so the only expected way out
+    # of this call is `shutdown` above interrupting it. If a worker exits on
+    # its own instead, that's a silent capacity loss the fixture must not
+    # paper over: tear down the rest and fail loudly rather than continuing
+    # to serve benchmark traffic from a smaller, uninspected pool (#722 review).
+    pid, status = os.wait()
+    remaining.discard(pid)
+    terminate_workers(list(remaining))
+    code = exit_code_for(status)
+    raise SystemExit(code if code != 0 else 1)
 
 
 if __name__ == "__main__":
