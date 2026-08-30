@@ -41,9 +41,37 @@ pub fn writeStreamedUpstreamResponse(
     sticky_set_cookie: ?[]const u8,
 ) !void {
     var header_buf: [4096]u8 = undefined;
-    var header_stream = compat.fixedBufferStream(&header_buf);
+    const head = try buildStreamedUpstreamResponseHeadBounded(
+        &header_buf,
+        status_code,
+        reason,
+        content_type,
+        content_disposition,
+        keep_alive,
+        correlation_id,
+        security,
+        alt_svc,
+        sticky_set_cookie,
+    );
+    defer head.deinit();
+    try writer.writeAll(head.bytes);
+}
+
+fn buildStreamedUpstreamResponseHeadBounded(
+    scratch: []u8,
+    status_code: u16,
+    reason: []const u8,
+    content_type: []const u8,
+    content_disposition: ?[]const u8,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+) !HeaderBytes {
+    var stream = compat.fixedBufferStream(scratch);
     writeStreamedUpstreamResponseHead(
-        header_stream.writer(),
+        stream.writer(),
         status_code,
         reason,
         content_type,
@@ -54,8 +82,11 @@ pub fn writeStreamedUpstreamResponse(
         alt_svc,
         sticky_set_cookie,
     ) catch {
+        const fallback_allocator = std.heap.page_allocator;
+        var allocating: std.Io.Writer.Allocating = .init(fallback_allocator);
+        errdefer allocating.deinit();
         try writeStreamedUpstreamResponseHead(
-            writer,
+            &allocating.writer,
             status_code,
             reason,
             content_type,
@@ -66,9 +97,12 @@ pub fn writeStreamedUpstreamResponse(
             alt_svc,
             sticky_set_cookie,
         );
-        return;
+        return .{
+            .allocator = fallback_allocator,
+            .bytes = try allocating.toOwnedSlice(),
+        };
     };
-    try writer.writeAll(header_stream.getWritten());
+    return .{ .bytes = stream.getWritten() };
 }
 
 pub fn writeStreamedUpstreamResponseHead(
@@ -107,6 +141,83 @@ pub fn writeStreamedUpstreamResponseHead(
 }
 
 pub fn writeStreamedUpstreamResponseHeadFromHeaders(
+    writer: anytype,
+    status_code: u16,
+    reason: []const u8,
+    upstream_headers: anytype,
+    body_allowed: bool,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+) !void {
+    var header_buf: [4096]u8 = undefined;
+    const head = try buildStreamedUpstreamResponseHeadFromHeadersBounded(
+        &header_buf,
+        status_code,
+        reason,
+        upstream_headers,
+        body_allowed,
+        keep_alive,
+        correlation_id,
+        security,
+        alt_svc,
+        sticky_set_cookie,
+    );
+    defer head.deinit();
+    try writer.writeAll(head.bytes);
+}
+
+fn buildStreamedUpstreamResponseHeadFromHeadersBounded(
+    scratch: []u8,
+    status_code: u16,
+    reason: []const u8,
+    upstream_headers: anytype,
+    body_allowed: bool,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+) !HeaderBytes {
+    var stream = compat.fixedBufferStream(scratch);
+    writeStreamedUpstreamResponseHeadFromHeadersDirect(
+        stream.writer(),
+        status_code,
+        reason,
+        upstream_headers,
+        body_allowed,
+        keep_alive,
+        correlation_id,
+        security,
+        alt_svc,
+        sticky_set_cookie,
+    ) catch {
+        const fallback_allocator = std.heap.page_allocator;
+        var allocating: std.Io.Writer.Allocating = .init(fallback_allocator);
+        errdefer allocating.deinit();
+        try writeStreamedUpstreamResponseHeadFromHeadersDirect(
+            &allocating.writer,
+            status_code,
+            reason,
+            upstream_headers,
+            body_allowed,
+            keep_alive,
+            correlation_id,
+            security,
+            alt_svc,
+            sticky_set_cookie,
+        );
+        return .{
+            .allocator = fallback_allocator,
+            .bytes = try allocating.toOwnedSlice(),
+        };
+    };
+    return .{ .bytes = stream.getWritten() };
+}
+
+fn writeStreamedUpstreamResponseHeadFromHeadersDirect(
     writer: anytype,
     status_code: u16,
     reason: []const u8,
@@ -445,9 +556,241 @@ pub fn writeSecurityHeadersFiltered(
 }
 
 pub fn writeChunk(writer: anytype, bytes: []const u8) !void {
+    const Writer = @TypeOf(writer);
+    if (comptime writerSupportsGatheredWrite(Writer)) {
+        var prefix: [32]u8 = undefined;
+        const prefix_bytes = try formatChunkPrefix(&prefix, bytes.len);
+        const fragments = [_][]const u8{ prefix_bytes, bytes, "\r\n" };
+        _ = try writer.writeGatheredAll(&fragments);
+        return;
+    }
+    try writeChunkLegacy(writer, bytes);
+}
+
+fn writeChunkLegacy(writer: anytype, bytes: []const u8) !void {
     try writer.print("{x}\r\n", .{bytes.len});
     try writer.writeAll(bytes);
     try writer.writeAll("\r\n");
+}
+
+fn formatChunkPrefix(buf: []u8, len: usize) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "{x}\r\n", .{len});
+}
+
+pub const StreamingResponseWriteOutcome = enum {
+    done,
+    wait_write,
+};
+
+pub const StreamingResponseWriteState = struct {
+    phase: Phase = .response_head,
+    allocator: ?std.mem.Allocator = null,
+    response_head: []const u8 = "",
+    response_head_storage: [4096]u8 = undefined,
+    response_head_offset: usize = 0,
+    chunk_prefix: [32]u8 = undefined,
+    chunk_prefix_len: usize = 0,
+    chunk_prefix_offset: usize = 0,
+    chunk_payload: []const u8 = "",
+    chunk_payload_offset: usize = 0,
+    chunk_suffix_offset: usize = 0,
+    terminal_offset: usize = 0,
+
+    const terminal_chunk = "0\r\n\r\n";
+
+    pub const Phase = enum {
+        response_head,
+        ready,
+        chunk_prefix,
+        chunk_payload,
+        chunk_suffix,
+        terminal_chunk,
+        complete,
+    };
+
+    pub fn init(response_head: []const u8) StreamingResponseWriteState {
+        return .{ .response_head = response_head };
+    }
+
+    pub fn initHeadFromHeaders(
+        self: *StreamingResponseWriteState,
+        allocator: std.mem.Allocator,
+        status_code: u16,
+        reason: []const u8,
+        upstream_headers: anytype,
+        body_allowed: bool,
+        keep_alive: bool,
+        correlation_id: []const u8,
+        security: *const http.security_headers.SecurityHeaders,
+        alt_svc: ?[]const u8,
+        sticky_set_cookie: ?[]const u8,
+    ) !void {
+        self.* = .{};
+        var stream = compat.fixedBufferStream(&self.response_head_storage);
+        writeStreamedUpstreamResponseHeadFromHeadersDirect(
+            stream.writer(),
+            status_code,
+            reason,
+            upstream_headers,
+            body_allowed,
+            keep_alive,
+            correlation_id,
+            security,
+            alt_svc,
+            sticky_set_cookie,
+        ) catch {
+            var allocating: std.Io.Writer.Allocating = .init(allocator);
+            errdefer allocating.deinit();
+            try writeStreamedUpstreamResponseHeadFromHeadersDirect(
+                &allocating.writer,
+                status_code,
+                reason,
+                upstream_headers,
+                body_allowed,
+                keep_alive,
+                correlation_id,
+                security,
+                alt_svc,
+                sticky_set_cookie,
+            );
+            self.allocator = allocator;
+            self.response_head = try allocating.toOwnedSlice();
+            return;
+        };
+        self.response_head = self.response_head_storage[0..stream.getWritten().len];
+    }
+
+    pub fn deinit(self: *StreamingResponseWriteState) void {
+        if (self.allocator) |allocator| allocator.free(self.response_head);
+        self.* = undefined;
+    }
+
+    pub fn beginChunk(self: *StreamingResponseWriteState, payload: []const u8) !void {
+        if (self.phase != .ready) return error.PendingStreamingWrite;
+        if (payload.len == 0) return self.beginTerminalChunk();
+        const prefix = try formatChunkPrefix(&self.chunk_prefix, payload.len);
+        self.chunk_prefix_len = prefix.len;
+        self.chunk_prefix_offset = 0;
+        self.chunk_payload = payload;
+        self.chunk_payload_offset = 0;
+        self.chunk_suffix_offset = 0;
+        self.phase = .chunk_prefix;
+    }
+
+    pub fn beginTerminalChunk(self: *StreamingResponseWriteState) !void {
+        if (self.phase != .ready) return error.PendingStreamingWrite;
+        self.terminal_offset = 0;
+        self.phase = .terminal_chunk;
+    }
+
+    pub fn finishWithoutBody(self: *StreamingResponseWriteState) !void {
+        if (self.phase != .ready) return error.PendingStreamingWrite;
+        self.phase = .complete;
+    }
+
+    pub fn advance(self: *StreamingResponseWriteState, conn: anytype) !StreamingResponseWriteOutcome {
+        while (true) {
+            switch (self.phase) {
+                .response_head => {
+                    try self.advanceFragment(conn, self.response_head, &self.response_head_offset, .ready);
+                    if (self.phase == .response_head) return .wait_write;
+                },
+                .ready => return .done,
+                .chunk_prefix => {
+                    try self.advanceFragment(conn, self.chunkPrefixBytes(), &self.chunk_prefix_offset, .chunk_payload);
+                    if (self.phase == .chunk_prefix) return .wait_write;
+                },
+                .chunk_payload => {
+                    try self.advanceFragment(conn, self.chunk_payload, &self.chunk_payload_offset, .chunk_suffix);
+                    if (self.phase == .chunk_payload) return .wait_write;
+                },
+                .chunk_suffix => {
+                    try self.advanceFragment(conn, "\r\n", &self.chunk_suffix_offset, .ready);
+                    if (self.phase == .chunk_suffix) return .wait_write;
+                    self.clearChunk();
+                    return .done;
+                },
+                .terminal_chunk => {
+                    try self.advanceFragment(conn, terminal_chunk, &self.terminal_offset, .complete);
+                    if (self.phase == .terminal_chunk) return .wait_write;
+                },
+                .complete => return .done,
+            }
+        }
+    }
+
+    pub fn done(self: *const StreamingResponseWriteState) bool {
+        return self.phase == .complete;
+    }
+
+    fn chunkPrefixBytes(self: *const StreamingResponseWriteState) []const u8 {
+        return self.chunk_prefix[0..self.chunk_prefix_len];
+    }
+
+    fn clearChunk(self: *StreamingResponseWriteState) void {
+        self.chunk_prefix_len = 0;
+        self.chunk_prefix_offset = 0;
+        self.chunk_payload = "";
+        self.chunk_payload_offset = 0;
+        self.chunk_suffix_offset = 0;
+    }
+
+    fn advanceFragment(
+        self: *StreamingResponseWriteState,
+        conn: anytype,
+        bytes: []const u8,
+        offset: *usize,
+        next_phase: Phase,
+    ) !void {
+        while (offset.* < bytes.len) {
+            const n = conn.write(bytes[offset.*..]) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            };
+            if (n == 0) return;
+            offset.* += n;
+        }
+        self.phase = next_phase;
+    }
+};
+
+fn BlockingStreamingWriteAdapter(comptime Writer: type) type {
+    return struct {
+        writer: Writer,
+
+        fn write(self: *@This(), bytes: []const u8) anyerror!usize {
+            try self.writer.writeAll(bytes);
+            return bytes.len;
+        }
+    };
+}
+
+pub fn drainStreamingWriteBlocking(state: *StreamingResponseWriteState, writer: anytype) !void {
+    if (comptime writerSupportsGatheredWrite(@TypeOf(writer))) {
+        if (state.phase == .chunk_prefix and
+            state.chunk_prefix_offset == 0 and
+            state.chunk_payload_offset == 0 and
+            state.chunk_suffix_offset == 0)
+        {
+            const fragments = [_][]const u8{
+                state.chunkPrefixBytes(),
+                state.chunk_payload,
+                "\r\n",
+            };
+            _ = try writer.writeGatheredAll(&fragments);
+            state.phase = .ready;
+            state.clearChunk();
+            return;
+        }
+    }
+
+    var adapter = BlockingStreamingWriteAdapter(@TypeOf(writer)){ .writer = writer };
+    while (true) {
+        switch (try state.advance(&adapter)) {
+            .done => return,
+            .wait_write => continue,
+        }
+    }
 }
 
 pub fn responseBodyAllowed(method: []const u8, status_code: u16) bool {
@@ -526,6 +869,65 @@ const TestGatheredProxyWriter = struct {
     }
 };
 
+const TestPartialStreamingWriter = struct {
+    allocator: std.mem.Allocator,
+    output: std.ArrayList(u8) = .empty,
+    max_write: usize,
+    block_after_progress: bool = false,
+    block_next: bool = false,
+    blocks: usize = 0,
+    fail_after: ?usize = null,
+
+    fn init(allocator: std.mem.Allocator, max_write: usize) TestPartialStreamingWriter {
+        return .{
+            .allocator = allocator,
+            .max_write = max_write,
+        };
+    }
+
+    fn deinit(self: *TestPartialStreamingWriter) void {
+        self.output.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn write(self: *TestPartialStreamingWriter, bytes: []const u8) !usize {
+        if (self.block_next) {
+            self.block_next = false;
+            self.blocks += 1;
+            return error.WouldBlock;
+        }
+        if (self.fail_after) |limit| {
+            if (self.output.items.len >= limit) return error.BrokenPipe;
+        }
+        if (bytes.len == 0) return 0;
+        var n = @min(self.max_write, bytes.len);
+        if (self.fail_after) |limit| {
+            n = @min(n, limit - self.output.items.len);
+            if (n == 0) return error.BrokenPipe;
+        }
+        try self.output.appendSlice(self.allocator, bytes[0..n]);
+        if (self.block_after_progress) self.block_next = true;
+        return n;
+    }
+};
+
+fn advanceStreamingUntilDone(state: *StreamingResponseWriteState, writer: *TestPartialStreamingWriter) !void {
+    while (true) {
+        switch (try state.advance(writer)) {
+            .done => return,
+            .wait_write => continue,
+        }
+    }
+}
+
+fn appendExpectedChunk(list: *std.ArrayList(u8), allocator: std.mem.Allocator, payload: []const u8) !void {
+    var prefix: [32]u8 = undefined;
+    const prefix_bytes = try formatChunkPrefix(&prefix, payload.len);
+    try list.appendSlice(allocator, prefix_bytes);
+    try list.appendSlice(allocator, payload);
+    try list.appendSlice(allocator, "\r\n");
+}
+
 test "writeBufferedUpstreamResponse preserves oversized body bytes exactly" {
     const allocator = std.testing.allocator;
     const prefix = "/*! tailwindcss v4.1.4 | MIT License | synthetic */\n";
@@ -564,6 +966,283 @@ test "writeBufferedUpstreamResponse preserves oversized body bytes exactly" {
     const raw = output.written();
     const head_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
     try std.testing.expectEqualStrings(body, raw[head_end + 4 ..]);
+}
+
+test "streamed response head from headers writes one bounded operation on common path" {
+    const allocator = std.testing.allocator;
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "Server", .value = "origin" },
+        .{ .name = "X-Upstream-Test", .value = "1" },
+    };
+    var writer = TestGatheredProxyWriter.init(allocator);
+    defer writer.deinit();
+
+    try writeStreamedUpstreamResponseHeadFromHeaders(
+        &writer,
+        200,
+        "OK",
+        upstream_headers[0..],
+        true,
+        true,
+        "req-stream-head",
+        &http.security_headers.SecurityHeaders.api,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), writer.write_all_calls);
+    try std.testing.expect(std.mem.startsWith(u8, writer.output.items, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.find(u8, writer.output.items, "Transfer-Encoding: chunked\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, writer.output.items, "X-Upstream-Test: 1\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, writer.output.items, "Server: origin\r\n") == null);
+    try std.testing.expect(std.mem.endsWith(u8, writer.output.items, "\r\n\r\n"));
+}
+
+test "oversized streamed response head fallback preserves exact bytes" {
+    const allocator = std.testing.allocator;
+    const large_value = try allocator.alloc(u8, 5000);
+    defer allocator.free(large_value);
+    @memset(large_value, 'x');
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "X-Large", .value = large_value },
+    };
+
+    var tiny_scratch: [64]u8 = undefined;
+    const bounded = try buildStreamedUpstreamResponseHeadFromHeadersBounded(
+        &tiny_scratch,
+        200,
+        "OK",
+        upstream_headers[0..],
+        true,
+        false,
+        "req-oversized-stream-head",
+        &http.security_headers.SecurityHeaders.api,
+        "clear",
+        "tg_sticky=proxy",
+    );
+    defer bounded.deinit();
+
+    var expected: std.Io.Writer.Allocating = .init(allocator);
+    defer expected.deinit();
+    try writeStreamedUpstreamResponseHeadFromHeadersDirect(
+        &expected.writer,
+        200,
+        "OK",
+        upstream_headers[0..],
+        true,
+        false,
+        "req-oversized-stream-head",
+        &http.security_headers.SecurityHeaders.api,
+        "clear",
+        "tg_sticky=proxy",
+    );
+
+    try std.testing.expectEqualStrings(expected.written(), bounded.bytes);
+}
+
+test "writeChunk uses gathered fragments and preserves empty small large bytes" {
+    const allocator = std.testing.allocator;
+    var writer = TestGatheredProxyWriter.init(allocator);
+    defer writer.deinit();
+    const large = try allocator.alloc(u8, 9000);
+    defer allocator.free(large);
+    @memset(large, 'z');
+
+    try writeChunk(&writer, "");
+    try writeChunk(&writer, "abc");
+    try writeChunk(&writer, large);
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    try appendExpectedChunk(&expected, allocator, "");
+    try appendExpectedChunk(&expected, allocator, "abc");
+    try appendExpectedChunk(&expected, allocator, large);
+
+    try std.testing.expectEqual(@as(usize, 3), writer.writev_calls);
+    try std.testing.expectEqual(@as(usize, 9), writer.writev_iovecs);
+    try std.testing.expectEqualStrings(expected.items, writer.output.items);
+}
+
+test "streaming drain uses gathered write for a fresh retained chunk" {
+    const allocator = std.testing.allocator;
+    var state = StreamingResponseWriteState.init("");
+    var writer = TestGatheredProxyWriter.init(allocator);
+    defer writer.deinit();
+
+    try drainStreamingWriteBlocking(&state, &writer);
+    try state.beginChunk("hello");
+    try drainStreamingWriteBlocking(&state, &writer);
+
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.ready, state.phase);
+    try std.testing.expectEqual(@as(usize, 1), writer.writev_calls);
+    try std.testing.expectEqual(@as(usize, 3), writer.writev_iovecs);
+    try std.testing.expectEqual(@as(usize, 0), writer.write_all_calls);
+    try std.testing.expectEqualStrings("5\r\nhello\r\n", writer.output.items);
+}
+
+test "streaming response write state resumes exact offsets across all phases" {
+    const allocator = std.testing.allocator;
+    const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    var state = StreamingResponseWriteState.init(head);
+    var writer = TestPartialStreamingWriter.init(allocator, 2);
+    writer.block_after_progress = true;
+    defer writer.deinit();
+
+    try std.testing.expectEqual(StreamingResponseWriteOutcome.wait_write, try state.advance(&writer));
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.response_head, state.phase);
+    try advanceStreamingUntilDone(&state, &writer);
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.ready, state.phase);
+
+    try state.beginChunk("abcdef");
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.chunk_prefix, state.phase);
+    try std.testing.expectEqual(StreamingResponseWriteOutcome.wait_write, try state.advance(&writer));
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.chunk_prefix, state.phase);
+    try advanceStreamingUntilDone(&state, &writer);
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.ready, state.phase);
+
+    try state.beginTerminalChunk();
+    try advanceStreamingUntilDone(&state, &writer);
+    try std.testing.expect(state.done());
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    try expected.appendSlice(allocator, head);
+    try appendExpectedChunk(&expected, allocator, "abcdef");
+    try expected.appendSlice(allocator, "0\r\n\r\n");
+    try std.testing.expectEqualStrings(expected.items, writer.output.items);
+    try std.testing.expect(std.mem.count(u8, writer.output.items, "0\r\n\r\n") == 1);
+    try std.testing.expect(writer.blocks > 0);
+}
+
+test "streaming response write state resumes in payload and suffix without byte drift" {
+    const allocator = std.testing.allocator;
+    var state = StreamingResponseWriteState.init("");
+    var writer = TestPartialStreamingWriter.init(allocator, 16);
+    defer writer.deinit();
+    try advanceStreamingUntilDone(&state, &writer);
+
+    try state.beginChunk("hello");
+    try std.testing.expectEqual(StreamingResponseWriteOutcome.wait_write, blk: {
+        writer.max_write = 3;
+        writer.block_after_progress = true;
+        break :blk try state.advance(&writer);
+    });
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.chunk_payload, state.phase);
+    try std.testing.expectEqual(StreamingResponseWriteOutcome.wait_write, try state.advance(&writer));
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.chunk_payload, state.phase);
+    try std.testing.expectEqual(StreamingResponseWriteOutcome.wait_write, try state.advance(&writer));
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.chunk_suffix, state.phase);
+    writer.max_write = 1;
+    try std.testing.expectEqual(StreamingResponseWriteOutcome.wait_write, try state.advance(&writer));
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.chunk_suffix, state.phase);
+    try advanceStreamingUntilDone(&state, &writer);
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    try appendExpectedChunk(&expected, allocator, "hello");
+    try std.testing.expectEqualStrings(expected.items, writer.output.items);
+}
+
+test "streaming response write state treats empty chunk as terminal exactly once" {
+    const allocator = std.testing.allocator;
+    var state = StreamingResponseWriteState.init("");
+    var writer = TestPartialStreamingWriter.init(allocator, 2);
+    writer.block_after_progress = true;
+    defer writer.deinit();
+    try advanceStreamingUntilDone(&state, &writer);
+
+    try state.beginChunk("");
+    try std.testing.expectEqual(StreamingResponseWriteState.Phase.terminal_chunk, state.phase);
+    try advanceStreamingUntilDone(&state, &writer);
+    try std.testing.expect(state.done());
+    try std.testing.expectEqualStrings("0\r\n\r\n", writer.output.items);
+    try std.testing.expectError(error.PendingStreamingWrite, state.beginChunk("after"));
+    try std.testing.expectError(error.PendingStreamingWrite, state.beginTerminalChunk());
+}
+
+test "streaming response write state completes HEAD 204 and 304 without terminal chunk" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        method: []const u8,
+        status: u16,
+        reason: []const u8,
+    }{
+        .{ .method = "HEAD", .status = 200, .reason = "OK" },
+        .{ .method = "GET", .status = 204, .reason = "No Content" },
+        .{ .method = "GET", .status = 304, .reason = "Not Modified" },
+    };
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+
+    for (cases) |case| {
+        var state = StreamingResponseWriteState{};
+        defer state.deinit();
+        try state.initHeadFromHeaders(
+            allocator,
+            case.status,
+            case.reason,
+            upstream_headers[0..],
+            responseBodyAllowed(case.method, case.status),
+            true,
+            "req-bodiless-state",
+            &http.security_headers.SecurityHeaders.api,
+            null,
+            null,
+        );
+        var writer = TestPartialStreamingWriter.init(allocator, 7);
+        defer writer.deinit();
+        try advanceStreamingUntilDone(&state, &writer);
+        try state.finishWithoutBody();
+        try std.testing.expect(state.done());
+        try std.testing.expect(std.mem.find(u8, writer.output.items, "Transfer-Encoding: chunked\r\n") == null);
+        try std.testing.expect(std.mem.find(u8, writer.output.items, "0\r\n\r\n") == null);
+    }
+}
+
+test "streaming response write state surfaces downstream error after partial commitment" {
+    const allocator = std.testing.allocator;
+    var state = StreamingResponseWriteState.init("HTTP/1.1 200 OK\r\n\r\n");
+    var writer = TestPartialStreamingWriter.init(allocator, 8);
+    writer.fail_after = 10;
+    defer writer.deinit();
+
+    try std.testing.expectError(error.BrokenPipe, advanceStreamingUntilDone(&state, &writer));
+    try std.testing.expectEqual(@as(usize, 10), writer.output.items.len);
+    try std.testing.expect(!state.done());
+}
+
+test "streamed bodiless response head omits chunk framing and filters security headers" {
+    const allocator = std.testing.allocator;
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "Content-Security-Policy", .value = "default-src 'self'" },
+        .{ .name = "Connection", .value = "X-Hop" },
+        .{ .name = "X-Hop", .value = "drop" },
+    };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    try writeStreamedUpstreamResponseHeadFromHeaders(
+        &output.writer,
+        304,
+        "Not Modified",
+        upstream_headers[0..],
+        false,
+        true,
+        "req-bodiless",
+        &http.security_headers.SecurityHeaders.api,
+        null,
+        null,
+    );
+
+    const bytes = output.written();
+    try std.testing.expect(std.mem.find(u8, bytes, "Transfer-Encoding: chunked\r\n") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "X-Hop: drop\r\n") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "Content-Security-Policy:"));
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "\r\n\r\n"));
 }
 
 test "writeBufferedUpstreamResponse serializes a single forwarded response head" {
