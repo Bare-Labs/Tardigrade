@@ -158,7 +158,7 @@ resolve_build_sources() {
 
 is_nonproduction_file() {
     case "$1" in
-    .git/* | .zig/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh | scripts/run-proxmox-performance-campaign.sh | scripts/profile.sh) return 0 ;;
+    .git/* | .zig/* | .zig-cache/* | zig-out/* | tests/* | scripts/interop/* | benchmarks/* | src/*/testdata/* | scripts/remote-bench.sh | scripts/run-proxmox-performance-campaign.sh | scripts/profile.sh | scripts/upload-benchmarks-gdrive.rb) return 0 ;;
     scripts/test-deb-package.sh | scripts/test-rpm-package.sh | scripts/test-homebrew-formula.sh | scripts/test-homebrew-release-formula.sh | scripts/test-homebrew-tap-sync.sh | scripts/test-public-homebrew-tap.sh | scripts/test-install.sh | scripts/test-docker-image.sh | scripts/test-launchd-service.sh) return 0 ;;
     *) return 1 ;;
     esac
@@ -180,7 +180,7 @@ is_explicit_nonproduction_helper() {
 }
 
 explicit_nonproduction_helper_pattern() {
-    printf '%s\n' 'scripts/test-deb-package\.sh|scripts/test-rpm-package\.sh|scripts/test-homebrew-formula\.sh|scripts/test-homebrew-release-formula\.sh|scripts/test-homebrew-tap-sync\.sh|scripts/test-public-homebrew-tap\.sh|scripts/test-install\.sh|scripts/test-docker-image\.sh|scripts/test-launchd-service\.sh|scripts/run-proxmox-performance-campaign\.sh|scripts/interop/[A-Za-z0-9_./@-]+|scripts/remote-bench\.sh|scripts/profile\.sh|benchmarks/[A-Za-z0-9_./@-]+|\./\.github/workflows/[A-Za-z0-9_.@/-]+\.ya?ml'
+    printf '%s\n' 'scripts/test-deb-package\.sh|scripts/test-rpm-package\.sh|scripts/test-homebrew-formula\.sh|scripts/test-homebrew-release-formula\.sh|scripts/test-homebrew-tap-sync\.sh|scripts/test-public-homebrew-tap\.sh|scripts/test-install\.sh|scripts/test-docker-image\.sh|scripts/test-launchd-service\.sh|scripts/run-proxmox-performance-campaign\.sh|scripts/interop/[A-Za-z0-9_./@-]+|scripts/remote-bench\.sh|scripts/profile\.sh|scripts/upload-benchmarks-gdrive\.rb|benchmarks/[A-Za-z0-9_./@-]+|\./\.github/workflows/[A-Za-z0-9_.@/-]+\.ya?ml'
 }
 
 forbidden_dependency_pattern() {
@@ -1398,6 +1398,12 @@ EOF
         chmod +x "$root/scripts/interop/run.sh"
         printf 'Package docs mention libssl in prose only.\n' >"$root/packaging/README.md"
         ;;
+    pass-benchmark-gdrive-upload)
+        cat >"$root/scripts/upload-benchmarks-gdrive.rb" <<'EOF'
+DIRECTORIES = ['benchmarks/results', 'benchmarks/baselines', 'docs/evidence']
+EOF
+        chmod +x "$root/scripts/upload-benchmarks-gdrive.rb"
+        ;;
     pass-isolated-nonproduction-zig)
         mkdir -p "$root/scripts/interop"
         printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/scripts/interop/product.zig"
@@ -1437,7 +1443,7 @@ run_self_test() {
             return 1
         fi
     done
-    for kind in pass-platform pass-platform-split-cimport pass-test-peer pass-isolated-nonproduction-zig pass-pure-zig pass-toolchain-install-dir; do
+    for kind in pass-platform pass-platform-split-cimport pass-test-peer pass-benchmark-gdrive-upload pass-isolated-nonproduction-zig pass-pure-zig pass-toolchain-install-dir; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if ! "$0" --root "$tmp/$kind" >/dev/null; then
             rc=$?
