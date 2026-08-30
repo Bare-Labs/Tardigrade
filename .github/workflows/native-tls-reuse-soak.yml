@@ -1,0 +1,80 @@
+name: Native TLS reuse soak
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/native-tls-reuse-soak.yml"
+      - "tests/integration.zig"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Consecutive focused reuse-test iterations to run
+        required: false
+        default: "100"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-tls-reuse-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    name: Native TLS reuse soak (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            os: ubuntu-latest
+          - label: Linux ARM64
+            os: ubuntu-24.04-arm
+          - label: macOS ARM64
+            os: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Print platform and toolchain evidence
+        run: |
+          echo "label=${{ matrix.label }}"
+          echo "runner.os=${{ runner.os }}"
+          echo "runner.arch=${{ runner.arch }}"
+          echo "commit=$GITHUB_SHA"
+          echo "zig=$(zig version)"
+
+      - name: Run focused native HTTPS upstream reuse soak
+        env:
+          ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '100' }}
+          TARDIGRADE_NATIVE_TLS_REUSE_SOAK_DIAGNOSTICS: "1"
+        run: |
+          case "$ITERATIONS" in
+            ''|*[!0-9]*)
+              echo "iterations must be a positive integer" >&2
+              exit 2
+              ;;
+          esac
+
+          if [ "$ITERATIONS" -lt 100 ]; then
+            echo "iterations must be at least 100 for issue #698 evidence" >&2
+            exit 2
+          fi
+
+          filter='native upstream https: two proxied requests reuse the pooled TLS connection'
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "native TLS reuse iteration $i/$ITERATIONS"
+            zig build test-integration \
+              -Dintegration-test-filter="$filter" \
+              --summary all \
+              --error-style verbose \
+              || exit 1
+          done

@@ -19179,6 +19179,29 @@ const MtlsRawPeerResponder = struct {
     }
 };
 
+const PersistentRawPeerResponder = struct {
+    origin: *OpensslRawPeer,
+    allocator: std.mem.Allocator,
+    response_bytes: []const u8,
+    expected_requests: usize,
+    observed_requests: usize = 0,
+    err: ?anyerror = null,
+
+    fn run(self: *PersistentRawPeerResponder) void {
+        while (self.observed_requests < self.expected_requests) {
+            self.origin.waitForRequestHead(self.allocator, 10_000) catch |err| {
+                self.err = err;
+                return;
+            };
+            self.observed_requests += 1;
+            self.origin.sendToClient(self.response_bytes) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+};
+
 test "native upstream https: client certificate (mTLS) required by the origin" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -19471,11 +19494,16 @@ test "native upstream https: verification disabled succeeds against the same unt
 test "native upstream https: two proxied requests reuse the pooled TLS connection" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
 
+    const leaf_cert = try upstreamTlsFixture("native_ed25519_chain.crt", allocator);
+    defer allocator.free(leaf_cert);
+    const leaf_key = try upstreamTlsFixture("native_ed25519.key", allocator);
+    defer allocator.free(leaf_key);
     const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
     defer allocator.free(ca_cert);
 
-    var origin = try startNativeUpstreamTardigrade(allocator, "native_ed25519_chain.crt", "native-upstream-reuse-body");
+    var origin = try OpensslRawPeer.start(allocator, &.{ "-cert", leaf_cert, "-key", leaf_key });
     defer origin.stop();
 
     const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin.port });
@@ -19495,11 +19523,22 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     });
     defer tardigrade.stop();
 
-    // Same harness-level timing race as the H2 native-upstream test below:
-    // the first fresh upstream TLS attempt can occasionally land a transient
-    // 502 while the origin's readiness probe teardown is still settling on
-    // loaded CI runners. Retry boundedly, but still require two successful
-    // proxied requests and the reuse metric below.
+    const body = "native-upstream-reuse-body";
+    const response_bytes = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer allocator.free(response_bytes);
+
+    var responder = PersistentRawPeerResponder{
+        .origin = &origin,
+        .allocator = allocator,
+        .response_bytes = response_bytes,
+        .expected_requests = 2,
+    };
+    const responder_thread = try std.Thread.spawn(.{}, PersistentRawPeerResponder.run, .{&responder});
+
     var successes: usize = 0;
     var attempts: usize = 0;
     while (successes < 2 and attempts < 20) : (attempts += 1) {
@@ -19517,6 +19556,9 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
         }
         compat.sleepNs(100 * std.time.ns_per_ms);
     }
+    responder_thread.join();
+    try std.testing.expectEqual(@as(usize, 2), responder.observed_requests);
+    if (responder.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 2), successes);
 
     var metrics = try sendRequest(allocator, tardigrade.port, .{
@@ -19541,6 +19583,18 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     const release_lifetime = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_release_rejected_lifetime_total", &.{}) orelse 0;
     const release_capacity = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_release_rejected_capacity_total", &.{}) orelse 0;
     const release_not_reusable = prometheusLabeledMetricValue(metrics.body, "tardigrade_upstream_pool_release_not_reusable_total", &.{}) orelse 0;
+    if (compat.getEnvVarOwned(allocator, "TARDIGRADE_NATIVE_TLS_REUSE_SOAK_DIAGNOSTICS")) |enabled| {
+        defer allocator.free(enabled);
+        if (std.mem.eql(u8, enabled, "1")) {
+            std.debug.print(
+                "native upstream TLS pool reuse diagnostics: new={d} reused={d} stale={d} plaintext_unexpected={d} tls_application_plaintext={d} tls_peer_closed={d} tls_drive_error={d} tls_drain_budget={d} quarantine_incomplete={d} release_lifetime={d} release_capacity={d} release_not_reusable={d}\n",
+                .{ new_total, reused_total, stale_total, plaintext_unexpected, tls_application_plaintext, tls_peer_closed, tls_drive_error, tls_drain_budget, quarantined_incomplete, release_lifetime, release_capacity, release_not_reusable },
+            );
+        }
+    } else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {},
+        error.OutOfMemory => return err,
+    }
     try std.testing.expect(new_total >= 1);
     if (reused_total < 1) {
         std.debug.print(
