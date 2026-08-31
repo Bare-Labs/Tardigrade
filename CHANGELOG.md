@@ -6,7 +6,56 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
-- Script to upload performance resutls to Google Drive
+- **Benchmark evidence can now be uploaded to Google Drive (#720, #727,
+  #732)** —
+  historical benchmark baselines and large evidence artifacts were moved out of
+  the repository, and `scripts/upload-benchmarks-gdrive.rb` now uploads
+  performance results with regression coverage and dependency-audit allowlist
+  support for the Google API libraries.
+
+- **Proxmox KVM performance campaign tooling is available (#699)** —
+  reproducible benchmark scripts and cross-machine competitive baselines now
+  cover Tardigrade, Caddy, HAProxy, NGINX, and HTTP/3 listener-sharding
+  scenarios on the Proxmox test environment.
+
+### Changed
+
+- **Streaming proxy responses keep upstream connections reusable and write more
+  efficiently (#717, #719)** — streamed proxy responses now preserve keepalive
+  when framing permits it and coalesce downstream writes, reducing the RTT-bound
+  collapse observed in the post-0.6.4 streaming benchmark investigation.
+
+### Fixed
+
+- **HTTP/3 response backpressure resumes correctly over QUIC (#707)** — large
+  H3 responses now continue after QUIC stream send-buffer backpressure instead
+  of treating a temporarily full stream as terminal.
+
+- **Client-RTT streaming benchmark measurements are isolated from origin RTT
+  (#728, #729)** — the permanent streaming-proxy regression harness now keeps
+  client-facing RTT evidence separate from origin RTT so performance checks
+  measure the intended response path.
+
+### Testing
+
+- **Native upstream TLS reuse has deterministic hostile-record regression
+  coverage (#697, #731)** — a socketpair-backed native TLS pool harness now
+  completes a real TLS 1.3 handshake, proves clean persistent reuse, rejects
+  complete unsolicited application data, quarantines fragmented protected
+  application records across checkout, closes them after terminal hostile
+  classification, and covers idle `close_notify` classification.
+
+- **Native upstream TLS reuse soak coverage is now automated and less fixture
+  sensitive (#721, #724, #730)** — the reuse test tolerates origin startup
+  jitter, a dedicated soak workflow exercises native TLS pooling, and the
+  documented stale-checkout investigation records the old nested-origin fixture
+  lifecycle failure mode separately from production pool behavior.
+
+- **Streaming proxy performance regressions produced diagnosis and verification
+  evidence now archived in Drive (#715, #718)** — loopback and cross-machine
+  benchmark evidence documented the RTT-collapse root cause and the post-fix
+  behavior for the streamed response path before #720 moved large benchmark
+  artifacts out of Git tracking.
 
 ## [0.6.4] - 2026-08-27
 
