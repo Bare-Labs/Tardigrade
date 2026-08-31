@@ -631,12 +631,14 @@ deterministic regression tests:
     `checkout_stale_tls_drive_error_total=1`, not plaintext, peer-close, or
     incomplete-ciphertext counters. That class maps to
     `UpstreamTlsConn.drainQueuedRecordsAndCheckReady()` catching a native
-    record-layer `drive()` failure; for the nested fixture this is the
-    fail-closed abrupt-EOF path (`TruncatedStream`) when the origin-side TLS
-    connection disappears without a peer `close_notify` between pool release
-    and the next checkout. That is a fixture lifecycle condition, not a
-    production relaxation target: checkout must continue to reject every
-    drive error because it cannot prove the connection is still synchronized.
+    record-layer `drive()` failure. The supported lifecycle diagnosis is that
+    the old nested-origin fixture could leave the pooled TLS connection broken
+    during readiness-probe teardown between release and the next checkout. An
+    abrupt EOF without a peer `close_notify` maps to `TruncatedStream`, but the
+    preserved soak telemetry did not retain the exact `drive()` error. That is
+    a fixture lifecycle condition, not a production relaxation target: checkout
+    must continue to reject every drive error because it cannot prove the
+    connection is still synchronized.
     The focused #698/#724 soak therefore uses a persistent raw OpenSSL peer,
     which keeps one HTTP/1.1 TLS connection alive across both expected
     requests and isolates the upstream client/pool reuse invariant from a
