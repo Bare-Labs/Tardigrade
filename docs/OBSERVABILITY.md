@@ -1,7 +1,7 @@
 # Observability
 
 This document defines Tardigrade's operator-facing observability contract for
-the stable HTTP/1.1 gateway path.
+the stable HTTP/1.1, HTTP/2, and HTTP/3/QUIC gateway paths.
 
 ## Structured Logs
 
@@ -537,8 +537,8 @@ the rejection reason.
 ## QUIC / HTTP-3 (pure-Zig backend)
 
 The pure-Zig QUIC/H3 stack (#240) has its own transport-level observability
-seam — qlog event tracing, TLS key logging for local decryption, and planned
-Prometheus counters — designed in [`QUIC_QLOG.md`](QUIC_QLOG.md). Unlike the
-stable HTTP/1.1 contract above, these paths are **disabled by default** and are
-**sensitive/debug-only**: a key log decrypts the connection. They are for local
-debugging and the interop harness (#247), never a production default.
+surface: qlog event tracing, TLS key logging for local decryption, runtime
+snapshot counters, and Prometheus counters designed in
+[`QUIC_QLOG.md`](QUIC_QLOG.md). qlog and keylog outputs are **disabled by
+default** and **sensitive/debug-only**: a key log decrypts the connection. They
+are for local debugging and interop diagnosis, never a production default.

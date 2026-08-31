@@ -7,11 +7,13 @@ hardening checklist for both paths.
 
 ## Maturity boundary
 
-Tardigrade supports practical operator-managed deployments of its stable
-core. It is **not** claimed to be generic "production-ready", "battle-tested",
-or a drop-in nginx/Envoy replacement. The supported/stable runtime surface is
-defined by the [Core v1 support matrix](SUPPORT_MATRIX.md) — anything listed
-there as `experimental` stays experimental regardless of how you deploy it.
+Tardigrade supports practical operator-managed deployments of its stable core:
+HTTP/1.1, HTTP/2, HTTP/3/QUIC, static serving, reverse proxying, TLS
+termination, reload/drain, and the operator surfaces listed as `stable` in the
+[Core v1 support matrix](SUPPORT_MATRIX.md). It is **not** claimed to be
+generic "production-ready", "battle-tested", or a drop-in nginx/Envoy
+replacement. Anything listed in the matrix as `experimental` stays
+experimental regardless of how you deploy it.
 
 Read this guide alongside:
 
@@ -249,6 +251,19 @@ Reload vs. restart — the two are not interchangeable:
   tardigrade`. `SIGHUP` reloads the published config; it cannot change the
   environment of an already-running process, so a `tardigrade.env` edit has
   no effect until the process is restarted and re-reads it at exec time.
+
+HTTP/2 and HTTP/3 deployment limits:
+
+- HTTP/2 downstream traffic is stable only over TLS with ALPN `h2`; plaintext
+  downstream h2c is not a supported listener mode.
+- HTTP/3 uses UDP on `TARDIGRADE_QUIC_PORT`. Firewalls, security groups, NAT,
+  and load balancers must pass UDP to that port; a working TCP listener does
+  not prove H3 reachability.
+- Tardigrade owns H3 `Alt-Svc` advertisement and withdrawal. Do not forward
+  upstream `Alt-Svc` as the public edge contract.
+- H3 enablement, QUIC port, Retry, migration, 0-RTT, ECN, UDP buffer, qlog, and
+  keylog changes are restart-owned. Only H3 advertisement settings are
+  reloadable.
 
 **Master/worker mode**: every control-path example in this guide assumes
 single-process mode, which is the default (`master_process false;`). If you

@@ -2,7 +2,7 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
-## [0.6.5] - 2026-09-31
+## [0.6.5] - 2026-08-31
 
 ### Added
 
@@ -19,6 +19,17 @@ All notable user-facing changes to Tardigrade are documented here.
   scenarios on the Proxmox test environment.
 
 ### Changed
+
+- **HTTP/2 and HTTP/3/QUIC are promoted to stable (#389)** — the support
+  matrix and public/operator docs now describe the stable native downstream
+  protocol contract for HTTP/1.1, HTTP/2, and HTTP/3/QUIC. The promotion is
+  tied to the retained H2 baseline, #593/#699 real-H3 baseline, the v0.6.5
+  installed-artifact #677 sweep, ngtcp2/GnuTLS plus aioquic black-box H3
+  closeout, and the passing Public Homebrew Smoke run for the published
+  artifact path. The docs also call out the stable-contract limits explicitly:
+  H2 is TLS/ALPN-only downstream, H3 requires UDP reachability and
+  Tardigrade-owned Alt-Svc advertisement, and H3 listener-owned transport
+  changes require restart.
 
 - **Streaming proxy responses keep upstream connections reusable and write more
   efficiently (#717, #719)** — streamed proxy responses now preserve keepalive

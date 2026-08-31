@@ -13,9 +13,10 @@
 
 ---
 
-Tardigrade is a lightweight HTTP/1.1 server and reverse proxy for deployments
-that want a small native binary, config-driven routing, observable runtime
-behavior, and predictable reloads.
+Tardigrade is a lightweight Zig edge server and reverse proxy for deployments
+that want a small native binary, stable HTTP/1.1, HTTP/2, and HTTP/3/QUIC
+downstream serving, config-driven routing, observable runtime behavior, and
+predictable reloads.
 
 ## Install
 
@@ -107,7 +108,8 @@ tardi version
   symlink escape protection.
 - Reverse proxying with config-driven routing, upstream health checks, retries
   for safe connection drops, and bounded streaming for larger transfers.
-- TLS termination for the stable HTTP/1.1 edge path.
+- TLS termination for stable HTTP/1.1 and HTTP/2 over TCP, plus native
+  HTTP/3/QUIC over UDP.
 - Hot reloads and graceful drain behavior for operator-managed deployments.
 - Structured access logs, request IDs, W3C `traceparent` forwarding, and
   Prometheus metrics at `/status/metrics` by default.
@@ -116,10 +118,11 @@ tardi version
 - Native packaging with release archives, DEB/RPM packages, service files,
   checksums, SBOMs, and provenance attestation.
 
-HTTP/2, HTTP/3/QUIC, WebSocket/SSE, ACME, FastCGI, uWSGI, SCGI, memcached,
-and BearClaw-specific flows exist in-tree, but they are not all part of the
-stable Core v1 contract. Check the [support matrix](docs/SUPPORT_MATRIX.md)
-before depending on a specific surface.
+The stable Core v1 contract covers the documented HTTP/1.1, HTTP/2, and
+HTTP/3/QUIC edge paths. WebSocket/SSE, ACME, FastCGI, uWSGI, SCGI, memcached,
+and BearClaw-specific flows exist in-tree, but they are not all stable Core v1
+surfaces. Check the [support matrix](docs/SUPPORT_MATRIX.md) before depending
+on a specific feature.
 
 ## More info
 

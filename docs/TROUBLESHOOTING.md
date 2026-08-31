@@ -1649,11 +1649,11 @@ match theirs.
 ## 13. Still stuck?
 
 Before filing an issue, check whether the surface you're troubleshooting is
-listed as `stable` in the [Core v1 support matrix](SUPPORT_MATRIX.md).
-Experimental surfaces (HTTP/2, HTTP/3/QUIC, WebSocket/SSE, ACME, auth/session
-extensions, DNS-driven upstream discovery, and more) carry weaker
-operational guarantees than the stable HTTP/1.1 core, and a rough edge there
-may be expected rather than a bug.
+listed as `stable` in the [Core v1 support matrix](SUPPORT_MATRIX.md). HTTP/2
+and HTTP/3/QUIC are stable within their documented TLS/ALPN, UDP, Alt-Svc, and
+restart/drain limits. Experimental surfaces (WebSocket/SSE, ACME, auth/session
+extensions, DNS-driven upstream discovery, and more) carry weaker operational
+guarantees, and a rough edge there may be expected rather than a bug.
 
 If you're still stuck, open a [GitHub
 issue](https://github.com/Bare-Systems/Tardigrade/issues) with this filled

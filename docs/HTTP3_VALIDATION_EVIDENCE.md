@@ -1,9 +1,9 @@
 # HTTP/3 Validation Evidence
 
 This document is the closeout map for #247. It connects release-critical
-QUIC/H3 failure and lifecycle invariants to their proof of record, then defines
-the remaining evidence runs that must be attached before native HTTP/3 can be
-promoted beyond the current experimental support status.
+QUIC/H3 failure and lifecycle invariants to their proof of record. HTTP/3 was
+promoted to stable by #389 after the final evidence was mapped in
+[HTTP2_HTTP3_STABLE_PROMOTION_389.md](HTTP2_HTTP3_STABLE_PROMOTION_389.md).
 
 This is not a second interop runner, fuzz framework, benchmark harness, or
 transport implementation. Use the existing owners:
@@ -77,10 +77,10 @@ false-positive client; it is not final performance evidence.
 
 ## Dedicated-Host Evidence Tier
 
-Final #247 closeout requires a controlled host with a genuinely QUIC-capable
-H3 load generator. Accepting an `--h3` flag is not sufficient; retain the
-client name, version, build/linkage proof, and a successful QUIC/UDP readiness
-exchange in the evidence bundle.
+The final #247/#389 closeout required a controlled host with a genuinely
+QUIC-capable H3 load generator. Accepting an `--h3` flag was not sufficient;
+the evidence bundle retained the client name, version, build/linkage proof, and
+a successful QUIC/UDP readiness exchange.
 
 Run the existing harness rather than creating a parallel one:
 
@@ -343,6 +343,8 @@ Attach or link a concise report with:
 - focused issue or fix disposition for every material correctness or resource
   regression discovered, plus rerun evidence for the affected row
 
-#247 can close only when this matrix, the bounded soak, the real-client
-controlled-host H3 evidence, and the final external interop rerun are complete
-with no unresolved evidence-backed correctness or resource blocker.
+#247 and #389 are complete because this matrix, the bounded soak, the
+real-client controlled-host H3 evidence, the final external interop rerun, and
+the installed-artifact closeout are complete with no unresolved
+evidence-backed correctness or resource blocker. The final stable-promotion map
+is [HTTP2_HTTP3_STABLE_PROMOTION_389.md](HTTP2_HTTP3_STABLE_PROMOTION_389.md).
