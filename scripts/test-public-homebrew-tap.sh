@@ -148,18 +148,38 @@ emit_evidence() {
     printf 'linkage_audit=%s\n' "$audit_output"
 }
 
+brew_install_with_retry() {
+    local attempt max_attempts status
+    max_attempts=3
+    attempt=1
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$@" --verbose; then
+            return 0
+        else
+            status="$?"
+        fi
+        if [ "$attempt" -eq "$max_attempts" ]; then
+            return "$status"
+        fi
+        echo "brew install failed with status $status; retrying attempt $((attempt + 1))/$max_attempts" >&2
+        sleep "$attempt"
+        attempt=$((attempt + 1))
+    done
+}
+
 case "$INSTALL_MODE" in
 qualified)
-    HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$FORMULA_REF" --verbose
-    INSTALLED_FORMULA=true
     TAPPED=true
+    brew_install_with_retry "$FORMULA_REF"
+    INSTALLED_FORMULA=true
     ;;
 tap-short)
     HOMEBREW_NO_AUTO_UPDATE=1 brew tap "$TAP_NAME" >/dev/null
     TAPPED=true
     HOMEBREW_NO_AUTO_UPDATE=1 brew trust --formula "$FORMULA_REF" >/dev/null
     TRUSTED_FORMULA=true
-    HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula tardigrade --verbose
+    brew_install_with_retry tardigrade
     INSTALLED_FORMULA=true
     ;;
 esac
