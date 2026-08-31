@@ -1042,6 +1042,12 @@ fn waitTestFdReadable(fd: std.posix.fd_t) !void {
     if ((pfd[0].revents & std.posix.POLL.ERR) != 0) return error.SocketReadFailed;
 }
 
+fn expectFdClosed(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    try testing.expectEqual(@as(c_int, -1), flags);
+    try testing.expectEqual(std.posix.E.BADF, std.posix.errno(flags));
+}
+
 const TestFdCarrier = struct {
     fd: std.posix.fd_t,
 
@@ -1095,7 +1101,8 @@ const NativeTlsPoolPeer = struct {
             fixtureIdentity(),
             tls_backend.recordConfig(tls_core.policy.Policy.recordHttp1Only(false)),
         );
-        errdefer self.backend.deinit();
+        var server_backend_owned_by_record = false;
+        errdefer if (!server_backend_owned_by_record) self.backend.deinit();
         self.carrier = .{ .fd = self.fds[1] };
         self.record = try encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
             allocator,
@@ -1105,7 +1112,9 @@ const NativeTlsPoolPeer = struct {
             self.carrier.carrier(),
             self.backend.backend(),
         );
+        server_backend_owned_by_record = true;
         self.record_initialized = true;
+        errdefer self.record.deinit();
 
         const client_state = try allocator.create(upstream_tls.TestHooks.State);
         errdefer allocator.destroy(client_state);
@@ -1132,7 +1141,8 @@ const NativeTlsPoolPeer = struct {
             client_config,
             .{ .server_name = "tardigrade.test" },
         );
-        errdefer client_state.backend.deinit();
+        var client_backend_owned_by_record = false;
+        errdefer if (!client_backend_owned_by_record) client_state.backend.deinit();
         self.client_carrier = .{ .fd = self.fds[0] };
         client_state.record = try encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
             allocator,
@@ -1142,6 +1152,7 @@ const NativeTlsPoolPeer = struct {
             self.client_carrier.carrier(),
             client_state.backend.backend(),
         );
+        client_backend_owned_by_record = true;
         errdefer client_state.record.deinit();
         client_state.record.allow_unverified_certificate = true;
 
@@ -1184,6 +1195,7 @@ const NativeTlsPoolPeer = struct {
     fn takePooledConn(self: *NativeTlsPoolPeer, now_ms: u64) PooledConn {
         const tls_ptr = self.client_tls.?;
         self.client_tls = null;
+        self.fds_closed[0] = true;
         return .{
             .stream = compat.netStreamFromFd(tls_ptr.fd),
             .tls = tls_ptr,
@@ -1435,6 +1447,7 @@ test "native TLS checkout quarantines a fragmented hostile application record th
     defer poisoned.destroy();
     try driveNativeTlsHttpExchange(poisoned, poisoned.client_tls.?, "/one", "before-fragmented-ghost");
 
+    const poisoned_client_fd = poisoned.fds[0];
     try pool.reserveSlot(key);
     pool.noteNewConnection(key);
     pool.release(key, poisoned.takePooledConn(1000), true, 1000);
@@ -1454,13 +1467,23 @@ test "native TLS checkout quarantines a fragmented hostile application record th
     try testing.expectEqual(@as(u64, 1), stats.stale_retries_total);
 
     try writeAllTestFd(poisoned.fds[1], remainder);
+    const resolved_readiness = UpstreamPool.checkReadiness(entry.quarantined.items[0]);
+    switch (resolved_readiness) {
+        .tls => |tls| switch (tls) {
+            .application_plaintext => |n| try testing.expect(n > 0),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
     pool.reapIdle(2000);
+    try expectFdClosed(poisoned_client_fd);
     entry = pool.hosts.getPtr(key) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 0), entry.quarantined.items.len);
     try testing.expectEqual(@as(usize, 0), entry.idle.items.len);
     stats = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 1), stats.checkout_quarantined_tls_incomplete);
     try testing.expectEqual(@as(u64, 1), stats.stale_retries_total);
+    try testing.expectEqual(@as(u64, 0), stats.reused_total);
 
     var fresh = try NativeTlsPoolPeer.create(testing.allocator);
     defer fresh.destroy();
