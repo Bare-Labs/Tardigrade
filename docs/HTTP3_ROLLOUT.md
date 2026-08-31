@@ -5,11 +5,11 @@ on the configured TCP listener. Firewalls, security groups, and load balancers
 must explicitly permit UDP to the QUIC port. Allowing TCP/443 does not make
 HTTP/3 reachable.
 
-The supported v1 deployment model is one Tardigrade process owning one UDP
-runtime and one in-process Destination Connection ID routing table. NAT
-rebinding and the configured migration policy are handled inside that process.
-Multi-process `SO_REUSEPORT`, eBPF, or external DCID steering is not part of the
-current support promise.
+The stable v1 deployment model is one Tardigrade process owning one UDP runtime
+and one in-process Destination Connection ID routing table. NAT rebinding and
+the configured migration policy are handled inside that process. Multi-process
+`SO_REUSEPORT`, eBPF, or external DCID steering is not part of the current
+support promise.
 
 ## Advertisement
 

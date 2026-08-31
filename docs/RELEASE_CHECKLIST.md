@@ -54,6 +54,11 @@ release gates for the same evidence.
   `scripts/http-release-blackbox-677.sh`) against a release candidate or
   installed artifact. This is correctness/release evidence, not #389
   performance or stable-promotion ownership.
+- For any HTTP/2 or HTTP/3 support-status change, update
+  [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md), reconcile the operator limitations in
+  [CONFIGURATION.md](CONFIGURATION.md) and [HTTP3_ROLLOUT.md](HTTP3_ROLLOUT.md),
+  and retain the promotion evidence map following
+  [HTTP2_HTTP3_STABLE_PROMOTION_389.md](HTTP2_HTTP3_STABLE_PROMOTION_389.md).
 - Run the full TLS conformance/interop matrix
   (`scripts/interop/run-tls-interop.sh --profile full`) with OpenSSL and
   GnuTLS peer tooling installed, or use the manual
@@ -141,8 +146,11 @@ transient evidence solely for archival purposes.
 - [ ] `zig build test --summary all --error-style verbose`
 - [ ] `zig build test-security-corpus --summary all --error-style verbose`
 - [ ] `zig build test-integration --summary all --error-style verbose`
-- [ ] For any HTTP/3 support-status change, complete the closeout evidence
-      contract in [HTTP3_VALIDATION_EVIDENCE.md](HTTP3_VALIDATION_EVIDENCE.md)
+- [ ] For any HTTP/2 or HTTP/3 support-status change, complete the closeout
+      evidence contract in
+      [HTTP2_HTTP3_STABLE_PROMOTION_389.md](HTTP2_HTTP3_STABLE_PROMOTION_389.md)
+      and, for HTTP/3 specifically,
+      [HTTP3_VALIDATION_EVIDENCE.md](HTTP3_VALIDATION_EVIDENCE.md)
 - [ ] Run the full TLS conformance/interop matrix
       (`scripts/interop/run-tls-interop.sh --profile full`) with both OpenSSL
       and GnuTLS peer tooling installed and record a fresh hardening result
