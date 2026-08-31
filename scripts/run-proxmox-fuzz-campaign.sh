@@ -266,9 +266,9 @@ if [[ -z "$snippets_storage" ]]; then
   snippets_storage="$(pvesm status -content snippets 2>/dev/null | awk 'NR > 1 && $3 == "active" { print $1; exit }')"
 fi
 [[ -n "$snippets_storage" ]] || die "no snippets storage found; pass --snippets-storage"
-snippet_dir="$(pvesm path "${snippets_storage}:snippets" 2>/dev/null || true)"
-[[ -d "$snippet_dir" ]] || die "cannot resolve snippets storage path"
-cloud_init_snippet_path="$snippet_dir/tardigrade-fuzz-${guest_id}.yml"
+cloud_init_snippet_path="$(pvesm path "${snippets_storage}:snippets/tardigrade-fuzz-${guest_id}.yml" 2>/dev/null || true)"
+[[ -n "$cloud_init_snippet_path" ]] || die "cannot resolve snippets storage path"
+mkdir -p "$(dirname "$cloud_init_snippet_path")"
 cat >"$cloud_init_snippet_path" <<EOF
 #cloud-config
 disable_root: false
