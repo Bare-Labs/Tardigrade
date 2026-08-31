@@ -2,7 +2,7 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
-## [Unreleased]
+## [0.6.5] - 2026-09-31
 
 ### Added
 
