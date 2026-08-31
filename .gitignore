@@ -17,6 +17,7 @@ secrets.txt
 *.key
 *.p12
 *.pfx
+.secrets/
 .zig/
 !src/http/testdata/test_server.key
 !src/http/testdata/test_alt_server.key
