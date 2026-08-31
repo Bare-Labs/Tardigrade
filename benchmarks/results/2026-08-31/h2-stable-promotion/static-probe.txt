@@ -1,0 +1,17 @@
+starting benchmark...
+spawning thread #0: 1 total client(s). 1 total requests
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+progress: 100% done
+
+finished in 2.44ms, 410.17 req/s, 134.59KB/s
+requests: 1 total, 1 started, 1 done, 1 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 1 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 336B (336) total, 258B (258) headers (space savings -10.26%), 30B (30) data
+                     min         max         mean         sd        +/- sd
+time for request:      225us       225us       225us         0us   100.00%
+time for connect:     1.90ms      1.90ms      1.90ms         0us   100.00%
+time to 1st byte:     2.16ms      2.16ms      2.16ms         0us   100.00%
+req/s           :     452.16      452.16      452.16        0.00   100.00%
