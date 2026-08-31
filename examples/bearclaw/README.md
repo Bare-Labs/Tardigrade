@@ -4,8 +4,8 @@ This directory contains a deployment example for running Tardigrade in front of 
 
 This example intentionally mixes:
 
-- stable Core v1 edge behavior such as TLS termination, static delivery, and reverse proxying
-- experimental surfaces such as HTTP/2 or realtime transports when enabled
+- stable Core v1 edge behavior such as TLS termination, static delivery, reverse proxying, HTTP/2, and HTTP/3/QUIC when enabled within their documented listener/deployment contracts
+- experimental realtime transports when enabled
 - internal or product-specific BearClaw flows such as transcript, approval, session, and device plumbing
 
 Use `docs/SUPPORT_MATRIX.md` as the support contract. This example is a
@@ -43,8 +43,8 @@ Copy this into your deployment environment and replace placeholder values before
 - The config keeps Tardigrade generic by using plain reverse-proxy locations for `/v1/chat` and `/v1/commands`.
 - The intended mobile and pairing auth path is bearer-token based. Set `TARDIGRADE_AUTH_TOKEN_HASHES` to SHA-256 hashes of the raw bearer tokens your upstream issues.
 - Session state, approval state, and request transcripts can be persisted independently with `TARDIGRADE_SESSION_STORE_PATH`, `TARDIGRADE_APPROVAL_STORE_PATH`, and `TARDIGRADE_TRANSCRIPT_STORE_PATH`.
-- HTTP/2, HTTP/3, and realtime paths are outside the stable Core v1 contract unless the support matrix says otherwise.
-- If you run HTTP/3, provide a QUIC-capable client and a QUIC-compatible TLS identity (Ed25519 or ECDSA P-256 certificate); the native stack is built in.
+- HTTP/2 and HTTP/3 are stable within the support-matrix limits; realtime paths remain experimental.
+- If you run HTTP/3, provide a reachable UDP QUIC port, a QUIC-capable client, and a compatible TLS identity (Ed25519 or ECDSA P-256 certificate); the native stack is built in.
 
 ## Edge Contract
 
@@ -54,7 +54,7 @@ Use this example when Tardigrade is the public TLS terminator and the BearClaw a
 
 | Port | Protocol | Role |
 |------|----------|------|
-| 443 | HTTPS (TLS; optional experimental HTTP/2) | Public edge; all external traffic enters here |
+| 443 | HTTPS (TLS; optional stable HTTP/2 via ALPN `h2`) | Public edge; all external traffic enters here |
 | 8080 | HTTP (loopback only) | BearClaw upstream; never exposed externally |
 
 ### Base Paths

@@ -253,6 +253,23 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` | bytes | `16384` | 1-1048576; must fit proxy buffer hard limit. | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE=65536` |
 | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` | bool | `false` | Stream all upstream statuses instead of mapping non-200 responses. | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES=true` |
 
+#### Stable protocol limits
+
+HTTP/1.1, HTTP/2, and HTTP/3/QUIC are stable only within their documented
+listener contracts:
+
+- HTTP/2 downstream support is TLS/ALPN `h2`. Plaintext downstream h2c is not
+  supported, so a downstream listener that disables HTTP/1.1 and leaves only
+  HTTP/2 enabled must also configure TLS.
+- `TARDIGRADE_HTTP2_ENABLED=false` removes `h2` from the downstream ALPN offer.
+  It does not disable explicit h2c upstream origins configured separately.
+- HTTP/3 runs on a separate UDP listener controlled by
+  `TARDIGRADE_HTTP3_ENABLED` and `TARDIGRADE_QUIC_PORT`; opening the TCP
+  listener port does not make H3 reachable.
+- HTTP/3 advertisement is owned by Tardigrade. `TARDIGRADE_HTTP3_ALT_SVC=auto`
+  advertises only while the runtime is ready, and disabled/withdrawn H3 emits
+  no live H3 alternative.
+
 ### Routing And Static Serving
 
 | Env key | Type | Default | Valid values / behavior | Example |
@@ -458,6 +475,14 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 
 ### HTTP/3 And QUIC
 
+HTTP/3/QUIC is stable for the native Zig backend and the deployment model
+documented in [HTTP3_ROLLOUT.md](HTTP3_ROLLOUT.md). Operators must provide a
+compatible TLS identity, permit UDP traffic to `TARDIGRADE_QUIC_PORT`, and use
+restart rather than reload for listener-owned transport settings. The supported
+topology is one process owning one UDP runtime and one in-process Destination
+Connection ID routing table; multi-process `SO_REUSEPORT`, eBPF, or external
+DCID steering is outside the current support promise.
+
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_HTTP3_ENABLED` | bool | `false` | Enables native QUIC/H3. Requires TLS identity in native paths. HTTP/3 listener topology changes require restart. | `TARDIGRADE_HTTP3_ENABLED=true` |
@@ -659,9 +684,9 @@ workers there).
 
 ### Protocol Adapters
 
-These surfaces are in-tree and configurable, but not all are part of the stable
-Core v1 support contract. Check [support matrix](SUPPORT_MATRIX.md) before
-depending on them in production.
+These adapter surfaces are in-tree and configurable, but they are outside the
+stable HTTP/1.1, HTTP/2, and HTTP/3/QUIC Core v1 edge contract unless the
+[support matrix](SUPPORT_MATRIX.md) marks them `stable`.
 
 | Env key / directive | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |

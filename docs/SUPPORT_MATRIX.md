@@ -2,10 +2,11 @@
 
 This document defines the official Core v1 support contract for Tardigrade.
 
-Core v1 is intentionally narrow: a host-native Zig HTTP/1.1 edge server and
-reverse proxy with predictable operator behavior. Features outside that core may
-exist in-tree and may be useful, but they are not part of the stable support
-promise unless they are explicitly listed as `stable` here.
+Core v1 is intentionally narrow: a host-native Zig edge server and reverse
+proxy with stable HTTP/1.1, HTTP/2, and HTTP/3/QUIC downstream serving plus
+predictable operator behavior. Features outside that core may exist in-tree and
+may be useful, but they are not part of the stable support promise unless they
+are explicitly listed as `stable` here.
 
 ## Maturity Levels
 
@@ -45,9 +46,11 @@ surfaces that should not be marketed as generic operator-facing capabilities.
 | Feature | Representative surface | Maturity | Notes |
 | --- | --- | --- | --- |
 | HTTP/1.1 request parsing and response writing | `src/http.zig` core exports: `method`, `version`, `headers`, `request`, `response`, `status` | `stable` | This is the default runtime contract and the primary benchmark/release path. |
+| HTTP/2 downstream serving | `listen ... http2`, `TARDIGRADE_HTTP2_ENABLED`, native TLS ALPN `h2`, `hpack`, `http2_frame` | `stable` | Stable for downstream TLS/ALPN `h2` static serving, reverse proxying, HEAD/POST behavior, multiplexing, flow control, malformed-frame/HPACK failure scope, reload/shutdown/GOAWAY/RST behavior, and bounded resource-settle behavior. Downstream plaintext h2c is not supported; HTTP/2-only downstream listeners require TLS. Promotion evidence is mapped in [HTTP2_HTTP3_STABLE_PROMOTION_389.md](HTTP2_HTTP3_STABLE_PROMOTION_389.md). |
+| HTTP/3 / QUIC downstream serving | `TARDIGRADE_HTTP3_ENABLED`, `TARDIGRADE_QUIC_PORT`, `TARDIGRADE_HTTP3_ALT_SVC`, `http3_handler`, `http3_session`, `http3_runtime`, `quic`, `http3` | `stable` | Stable for the native Zig QUIC/H3 backend with QUIC v1/TLS 1.3/ALPN `h3`, static serving, reverse proxying, Alt-Svc enable/withdraw behavior, independent ngtcp2/GnuTLS and aioquic black-box validation, cancellation/recovery, GOAWAY/drain, production soak/resource-settle evidence, and controlled-host performance baseline. Requires a reachable UDP listener, compatible TLS identity, and deployment support for the documented listener/restart/drain limits. Promotion evidence is mapped in [HTTP2_HTTP3_STABLE_PROMOTION_389.md](HTTP2_HTTP3_STABLE_PROMOTION_389.md). |
 | Static file serving | `static_file`, `autoindex`, `etag`, `range` | `stable` | Covered by public docs and integration tests for path normalization, ranges, cache validation, and symlink safety. |
-| Reverse proxying and config-driven routing | `location_router`, `rewrite`, `request_context`, `config_file`; README `server` / `location` examples; `TARDIGRADE_PROXY_STREAMING_MODE` | `stable` | Core HTTP/1.1 reverse-proxy path, route matching, and opt-in bounded streaming policy are part of the product identity. |
-| TLS termination | `tls_termination` | `stable` | Core public edge capability with operator docs, config knobs, and release validation. |
+| Reverse proxying and config-driven routing | `location_router`, `rewrite`, `request_context`, `config_file`; README `server` / `location` examples; `TARDIGRADE_PROXY_STREAMING_MODE` | `stable` | Core reverse-proxy path, route matching, and opt-in bounded streaming policy are part of the product identity across the documented stable downstream protocols. |
+| TLS termination | `tls_termination` | `stable` | Core public edge capability with operator docs, config knobs, release validation, and ALPN coverage for HTTP/1.1 and HTTP/2. |
 | Config loading and validation | `config_file`; `tardi check`; README config examples | `stable` | Part of the operator workflow and startup contract. |
 | Hot reload and graceful drain | runtime reload path, drain behavior, `shutdown` | `stable` | Public CLI/runtime behavior; documented and integration-tested. |
 | Access logging and request IDs | `access_log`, `correlation_id` | `stable` | Public operational surface used in README and integration coverage. |
@@ -60,8 +63,6 @@ surfaces that should not be marketed as generic operator-facing capabilities.
 
 | Feature | Representative surface | Maturity | Why it is not Core v1 |
 | --- | --- | --- | --- |
-| HTTP/2 | `tls_termination` HTTP/2 path, `hpack`, `http2_frame` | `experimental` | Present in-tree, but not documented or release-gated at the same level as the HTTP/1.1 core. |
-| HTTP/3 / QUIC | `http3_handler`, `http3_session`, `http3_runtime`, `quic`, `http3` | `experimental` | Served by the native Zig QUIC/H3 stack (no system libraries); enable at runtime with `--http3` and a QUIC-compatible TLS identity (Ed25519 or ECDSA P-256). RFC 9218 priority hints are parsed from combined `priority` fields and valid request `PRIORITY_UPDATE` frames, retained across legal control/request stream races, and applied to QUIC response stream egress: lower urgency is sent first and equal urgency rotates from a bounded cursor. Client-side updates, invalid request targets, and push updates are connection errors because server push is unsupported. ngtcp2/nghttp3 removed under #328; they remain out-of-process interop peers only. |
 | Early-data replay handling across H1/H2/H3 | `early_data`, `request_context`, `edge_gateway` H1/H2 preflight/deferral, `http3_runtime` compatibility gate | `experimental` | Current scope: #367 HTTP-level policy, H2 safe deferral, and bounded observability (metrics/access logs). Out of scope here: #366 transport-carrier internals. |
 | Native TLS/QUIC 0-RTT anti-replay store | `early_data_replay`, `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE`/`_MAX_ENTRIES`, `edge_gateway` composition | `experimental` | #368: a process-local, bounded, mutex-guarded store providing at-most-once 0-RTT claim acceptance per Tardigrade process (not cluster-wide — see docs/OBSERVABILITY.md). Safe default is `disabled`; a distributed backend is defined by contract but not yet implemented. |
 | WebSocket, SSE, and mux realtime paths | `websocket`, `event_hub`, mux counters in `metrics` | `experimental` | Integration coverage exists, but the public operator docs are still example-scoped rather than Core v1. |
