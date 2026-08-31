@@ -40,14 +40,28 @@ a release gate, not a best-effort activity.
   signature, malformed session token input, asserted-identity rate limiting,
   approval-management route bypass from recursive approval checks.
 
-### Corpus and fuzz-style replay
+### Corpus Replay And Coverage-Guided Fuzzing
 
 - Corpus files live under `tests/corpus/http/request/`.
 - The replay and deterministic mutation harness lives in
   `tests/security/request_parser_corpus.zig`.
-- This harness is the v1 seed corpus for future true fuzzing. It replays known
-  malicious inputs and applies small deterministic byte mutations to verify that
-  the parser fails safely.
+- `zig build test-security-corpus` replays known hostile HTTP/1.1 request
+  bytes and applies deterministic byte mutations. It is intentionally bounded,
+  exact-byte, and PR-safe; it is not the repository's coverage-guided fuzz
+  campaign.
+- True Zig coverage-guided fuzz targets already exist today. They live as
+  `test "fuzz: ..."` owners next to the parser/state-machine code or in
+  focused test files, use target-local seed corpora, and become
+  coverage-guided runs under `zig build <step> -Doptimize=ReleaseFast
+  --fuzz=<runs>`.
+- Current fuzz owners include `test-tls-protocol-fuzz`,
+  `test-tls-record-fuzz`, `test-tls-resumption-fuzz`, `test-pki-fuzz`,
+  `test-crypto-provider-fuzz`, and `test-quic`. See
+  [CRYPTO_FUZZ_CONTRACT.md](CRYPTO_FUZZ_CONTRACT.md) and
+  [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md).
+- The sustained canonical 10M/50M fuzz campaign and the final
+  scheduled-versus-manual cadence decision remain owned by #675 until that
+  campaign is executed or explicitly dispositioned.
 
 ## Commands
 
@@ -81,16 +95,27 @@ Do not ship a wider public distribution unless all of the following are true:
 - The first internal pentest playbook has been executed against a local or
   isolated non-public target and the sanitized result has been recorded in
   `docs/PENTEST_PLAYBOOK.md`.
+- Scanner and pentest evidence is recorded separately from exact-byte
+  protocol harness authority. Scanners help find exposed behavior; exact
+  protocol conformance, smuggling, malformed-framing, TLS, QUIC, and H3
+  claims need the repository harnesses or documented external-peer matrices
+  that preserve the relevant bytes/state.
 - Public-edge behavior changes update tests and operator-facing docs.
 
 ## Current Gaps And Follow-Up
 
 - HTTP/2, HTTP/3, WebSocket, SSE, FastCGI, SCGI, and uWSGI malicious-input
-  coverage is still narrower than HTTP/1.1 parser coverage.
-- The corpus harness is a deterministic mutation entrypoint, not a full
-  coverage-guided fuzz target.
-- Security replay and fuzz-style runs are manual today; moving them into
-  scheduled CI or nightly automation remains follow-up work.
+  coverage is still narrower than HTTP/1.1 parser coverage. The #677 release
+  sweep added installed-artifact H2/H3 correctness, malformed-route, real
+  client, cancellation, drain, and resource-settle evidence; it does not prove
+  H1-style malicious-input parity for every H2/H3 framing edge.
+- `test-security-corpus` is a deterministic hostile HTTP/1.1 replay/mutation
+  gate. The true TLS/PKI/crypto/QUIC/H3 coverage-guided fuzz targets exist
+  today, but sustained run-count evidence and the recurring cadence decision
+  remain open under #675.
+- Keep ordinary CI bounded: deterministic seed/corpus replay is PR-safe, while
+  10M/50M/100M+ fuzz campaigns remain manual/on-demand until #675 records
+  measured cost and usefulness for any scheduled subset.
 
 ### Resolved Gaps (issue #174)
 
