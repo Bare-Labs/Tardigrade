@@ -7,13 +7,14 @@ Use this checklist before tagging and distributing a Tardigrade release.
 Use the existing commands and workflows in this section; do not add duplicate
 release gates for the same evidence.
 
-### Required Per PR / Main
+### Required Per PR
 
 - `zig fmt --check build.zig src/ tests/`
 - `zig build test --summary all --error-style verbose`
-- `zig build test-security-corpus --summary all --error-style verbose`
-- `zig build test-integration --summary all --error-style verbose` on the
-  Linux integration leg
+- `zig build test-security-corpus --summary all --error-style verbose` on the
+  Ubuntu unit-test leg
+- `zig build test-integration -Dtls-profile=appliance --summary all
+  --error-style verbose` on the Linux appliance-profile legs
 - CI packaging smokes: `./scripts/test-install.sh`,
   `./scripts/test-deb-package.sh`, `./scripts/test-rpm-package.sh`,
   `./scripts/test-docker-image.sh`, and generated/local Homebrew formula
@@ -24,6 +25,15 @@ release gates for the same evidence.
   unit, integration, native TLS reuse, resumption/restart, and release-sweep
   harness owners. Keep longer torture or soak runs manual unless the owning
   workflow documents a scheduled cadence.
+
+### Required On Main
+
+- The PR-required gates above continue to run on pushes to `main`.
+- The unprofiled Linux integration job runs only on main pushes:
+  `zig build test-integration --summary all`.
+- `.github/workflows/release.yml` is triggered after successful `main` CI or
+  by manual dispatch, and it skips publication if the selected tag already
+  exists for another commit.
 
 ### Required For Release Candidate
 
@@ -44,6 +54,12 @@ release gates for the same evidence.
   `scripts/http-release-blackbox-677.sh`) against a release candidate or
   installed artifact. This is correctness/release evidence, not #389
   performance or stable-promotion ownership.
+- Run the full TLS conformance/interop matrix
+  (`scripts/interop/run-tls-interop.sh --profile full`) with OpenSSL and
+  GnuTLS peer tooling installed, or use the manual
+  `TLS conformance/interop hardening (full profile)` workflow for the release
+  candidate SHA. Record zero FAIL and zero unexplained SKIP rows following
+  [TLS_INTEROP_HARDENING_674.md](TLS_INTEROP_HARDENING_674.md).
 
 ### Post-Release Smoke
 
@@ -62,6 +78,9 @@ release gates for the same evidence.
 - `TLS conformance/interop hardening (full profile)` runs weekly and manually.
   It runs the full OpenSSL + GnuTLS matrix plus the pinned external H3 peer and
   requires zero FAIL and zero unexplained SKIP.
+- `Resumption interop/restart/soak (heavy)` runs weekly and manually. It
+  scales the existing resumption, restart, and soak case-ID suite with
+  `TARDIGRADE_SOAK_HEAVY=1`.
 
 ### Manual Security Evidence
 
@@ -120,7 +139,8 @@ transient evidence solely for archival purposes.
 
 - [ ] `zig fmt --check build.zig src/ tests/`
 - [ ] `zig build test --summary all --error-style verbose`
-- [ ] `zig build test-integration`
+- [ ] `zig build test-security-corpus --summary all --error-style verbose`
+- [ ] `zig build test-integration --summary all --error-style verbose`
 - [ ] For any HTTP/3 support-status change, complete the closeout evidence
       contract in [HTTP3_VALIDATION_EVIDENCE.md](HTTP3_VALIDATION_EVIDENCE.md)
 - [ ] Run the full TLS conformance/interop matrix

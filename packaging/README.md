@@ -183,8 +183,9 @@ identically to `dnf install` for a local file.
 > `tardigrade-linux-x86_64.tar.gz` candidate on both `ubuntu:22.04` and
 > `rockylinux:9` before publishing it. RHEL-family systems older than the
 > glibc 2.28 floor still need a local or separately targeted build, but Rocky
-> Linux 9 / RHEL 9 compatibility is part of the current release gate rather
-> than a known limitation of the published RPM.
+> Linux 9 compatibility is part of the current release gate and serves as the
+> RHEL-family 9 compatibility representative; RHEL 9 is not executed directly
+> by CI.
 
 ### Build locally
 
