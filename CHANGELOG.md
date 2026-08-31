@@ -6,7 +6,8 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
-- **Benchmark evidence can now be uploaded to Google Drive (#720, #732)** —
+- **Benchmark evidence can now be uploaded to Google Drive (#720, #727,
+  #732)** —
   historical benchmark baselines and large evidence artifacts were moved out of
   the repository, and `scripts/upload-benchmarks-gdrive.rb` now uploads
   performance results with regression coverage and dependency-audit allowlist
@@ -50,10 +51,11 @@ All notable user-facing changes to Tardigrade are documented here.
   documented stale-checkout investigation records the old nested-origin fixture
   lifecycle failure mode separately from production pool behavior.
 
-- **Streaming proxy performance regressions have committed diagnosis and
-  verification evidence (#715, #718)** — loopback and cross-machine benchmark
-  evidence now documents the RTT-collapse root cause and the post-fix behavior
-  for the streamed response path.
+- **Streaming proxy performance regressions produced diagnosis and verification
+  evidence now archived in Drive (#715, #718)** — loopback and cross-machine
+  benchmark evidence documented the RTT-collapse root cause and the post-fix
+  behavior for the streamed response path before #720 moved large benchmark
+  artifacts out of Git tracking.
 
 ## [0.6.4] - 2026-08-27
 
