@@ -19503,6 +19503,14 @@ test "native upstream https: two proxied requests reuse the pooled TLS connectio
     const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
     defer allocator.free(ca_cert);
 
+    // #725: this reuse invariant needs a deterministic persistent TLS peer.
+    // The earlier nested-Tardigrade-origin fixture could leave the pooled TLS
+    // connection broken during readiness-probe teardown; checkout rejected it
+    // fail-closed as `tls_drive_error`. An abrupt EOF without `close_notify`
+    // maps to `TruncatedStream`, but the historical soak did not retain the
+    // concrete drive error. The raw peer below keeps the same HTTP/1.1 TLS
+    // connection alive for both requests and isolates the upstream client/pool
+    // invariant.
     var origin = try OpensslRawPeer.start(allocator, &.{ "-cert", leaf_cert, "-key", leaf_key });
     defer origin.stop();
 
