@@ -12,7 +12,7 @@ versus what is a local-build-only tool.
 | Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, per-arch SPDX SBOMs, dependency inventories, and provenance. Built with the default `-Dtls-profile=general` (pure-Zig native since #649), an explicit portable CPU baseline (`-Dcpu=baseline`), and an explicit portable glibc floor (`-Dtarget=<arch>-linux-gnu.2.28`, matching the manylinux2014/RHEL8 floor) so the published binary runs on real hardware and distros beyond the exact CI runner that built it, not just wherever a plain native build happened to link against. |
 | macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Supported, published** | `macos-15-intel` and `macos-15` release rows build `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux, with the default `-Dtls-profile=general` (pure-Zig native since #649) without Homebrew OpenSSL. Both rows audit out foreign TLS/crypto/QUIC/H3 linkage, assert the Mach-O architecture, package/extract the archive, verify native build identity, run a real static-site startup/request smoke from the extracted artifact, and exercise the checksum-verifying installer path. |
 | DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder. The packaged binary's native identity is always proven with `scripts/audit-release-binary.sh` — self-audited when the binary is host-executable, or via a SHA-256-bound `--audit-inventory` file for cross-architecture packaging — never by a caller-supplied backend flag (#650). Every package declares no OpenSSL runtime dependency; there is no other production backend to package. |
-| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`, including the native-identity audit and no OpenSSL runtime dependency (#650). Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
+| RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`, including the native-identity audit and no OpenSSL runtime dependency (#650). Built from the same Linux release binary as the archives. The release workflow pins Linux builds to glibc 2.28 and gates the exact x86_64 archive on Ubuntu 22.04 and Rocky Linux 9 before publication. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **CI-validated user LaunchAgent template** | The Darwin release-smoke workflow renders the checked-in host-style `/usr/local/...` template into an isolated prefix on the `macos-15` Apple Silicon runner, stages the native Darwin archive's `tardi` binary plus `tardigrade -> tardi` compatibility alias, and proves a real `launchctl bootstrap` -> readiness/request -> `bootout` lifecycle in the current user's launchd domain. |
 | Homebrew (`packaging/homebrew/tardigrade.rb`) | **Rendered from a native release** | `scripts/update-homebrew-formula.sh --tag <tag>` renders the formula from one release tag, verifies the referenced archives exist in that release, and validates each platform's dependency inventory proves native, OpenSSL-free artifact status before writing anything. `packaging/homebrew/tardigrade.rb` here is the canonical rendered source; publishing it to `Bare-Systems/homebrew-tap/Formula/tardigrade.rb` is a separate, explicit step. #466, not this document, owns the public tap. |
@@ -177,14 +177,15 @@ sudo systemctl enable --now tardigrade
 Use `tardigrade-<version>-1.aarch64.rpm` on `aarch64` hosts. `rpm -i` works
 identically to `dnf install` for a local file.
 
-> **glibc compatibility note**: the published `.rpm` is built from the same
-> binary as the Linux `.tar.gz` archives, compiled on the `ubuntu-latest` /
-> `ubuntu-24.04-arm` GitHub-hosted runners. It links dynamically against that
-> runner's glibc. This is fine for current Fedora and RHEL 10+ family
-> distros; it may be *too new* for RHEL 9 / Rocky 9 / AlmaLinux 9 (glibc
-> 2.34), which would need a binary built on a matching older glibc. If that
-> matters for your target, build locally instead (below) on a host with a
-> compatible glibc.
+> **glibc compatibility note**: the published Linux archives, DEBs, and RPMs
+> are built with `-Dcpu=baseline` and an explicit Zig target of
+> `*-linux-gnu.2.28`. The release workflow then executes the exact
+> `tardigrade-linux-x86_64.tar.gz` candidate on both `ubuntu:22.04` and
+> `rockylinux:9` before publishing it. RHEL-family systems older than the
+> glibc 2.28 floor still need a local or separately targeted build, but Rocky
+> Linux 9 compatibility is part of the current release gate and serves as the
+> RHEL-family 9 compatibility representative; RHEL 9 is not executed directly
+> by CI.
 
 ### Build locally
 

@@ -2,11 +2,145 @@
 
 Use this checklist before tagging and distributing a Tardigrade release.
 
+## Gate Cadence
+
+Use the existing commands and workflows in this section; do not add duplicate
+release gates for the same evidence.
+
+### Required Per PR
+
+- `zig fmt --check build.zig src/ tests/`
+- `zig build test --summary all --error-style verbose`
+- `zig build test-security-corpus --summary all --error-style verbose` on the
+  Ubuntu unit-test leg
+- `zig build test-integration -Dtls-profile=appliance --summary all
+  --error-style verbose` on the Linux appliance-profile legs
+- CI packaging smokes: `./scripts/test-install.sh`,
+  `./scripts/test-deb-package.sh`, `./scripts/test-rpm-package.sh`,
+  `./scripts/test-docker-image.sh`, and generated/local Homebrew formula
+  smoke through `./scripts/test-homebrew-formula.sh`
+- Reduced TLS conformance in `ci.yml`: `scripts/interop/run-tls-interop.sh
+  --profile ci`
+- Deterministic lifecycle/reload/resource regressions already wired through
+  unit, integration, native TLS reuse, resumption/restart, and release-sweep
+  harness owners. Keep longer torture or soak runs manual unless the owning
+  workflow documents a scheduled cadence.
+
+### Required On Main
+
+- The PR-required gates above continue to run on pushes to `main`.
+- The unprofiled Linux integration job runs only on main pushes:
+  `zig build test-integration --summary all`.
+- `.github/workflows/release.yml` is triggered after successful `main` CI or
+  by manual dispatch, and it skips publication if the selected tag already
+  exists for another commit.
+
+### Required For Release Candidate
+
+- `.github/workflows/release.yml` must build Linux and Darwin archives from
+  the selected release SHA with `-Dcpu=baseline`, the default general native
+  TLS profile, and Linux `*-linux-gnu.2.28` targets.
+- The same workflow must package DEB/RPM assets from those audited release
+  binaries, verify native dependency inventories, generate checksums/SBOMs,
+  and attest provenance.
+- The `verify-linux-archive` job must execute the exact
+  `tardigrade-linux-x86_64.tar.gz` candidate on `ubuntu:22.04` and
+  `rockylinux:9` before publication.
+- Render the Homebrew formula from the release tag, validate it with
+  `ruby -c`, run the release-backed Homebrew formula smoke, and update the
+  public tap only after the referenced release assets are visible.
+- For any HTTP/2 or HTTP/3 release behavior change, run the #677 release
+  sweep (`scripts/run-http-release-sweep.sh` and
+  `scripts/http-release-blackbox-677.sh`) against a release candidate or
+  installed artifact. This is correctness/release evidence, not #389
+  performance or stable-promotion ownership.
+- Run the full TLS conformance/interop matrix
+  (`scripts/interop/run-tls-interop.sh --profile full`) with OpenSSL and
+  GnuTLS peer tooling installed, or use the manual
+  `TLS conformance/interop hardening (full profile)` workflow for the release
+  candidate SHA. Record zero FAIL and zero unexplained SKIP rows following
+  [TLS_INTEROP_HARDENING_674.md](TLS_INTEROP_HARDENING_674.md).
+
+### Post-Release Smoke
+
+- After publishing, run the black-box public tap smoke with
+  `./scripts/test-public-homebrew-tap.sh --install-mode qualified
+  --expected-version X.Y.Z` and `./scripts/test-public-homebrew-tap.sh
+  --install-mode tap-short --expected-version X.Y.Z`, or run the manual
+  `Public Homebrew Smoke` workflow with the expected version input.
+- Exercise `scripts/install.sh` against the published release on each newly
+  supported platform or whenever install behavior changes.
+
+### Scheduled / Weekly
+
+- `Public Homebrew Smoke` runs weekly across macOS Intel, macOS Apple Silicon,
+  Linux x86_64, Linux arm64, and both supported install modes.
+- `TLS conformance/interop hardening (full profile)` runs weekly and manually.
+  It runs the full OpenSSL + GnuTLS matrix plus the pinned external H3 peer and
+  requires zero FAIL and zero unexplained SKIP.
+- `Resumption interop/restart/soak (heavy)` runs weekly and manually. It
+  scales the existing resumption, restart, and soak case-ID suite with
+  `TARDIGRADE_SOAK_HEAVY=1`.
+
+### Manual Security Evidence
+
+- Repeat F-05 live native TLS evidence when the listener, TLS defaults,
+  certificate loading, ALPN behavior, or scanner-facing TLS surface changes.
+  Record sanitized results following
+  [F05_LIVE_TLS_SURFACE_672.md](F05_LIVE_TLS_SURFACE_672.md).
+- Repeat F-06 auth/framing evidence when request parsing, proxy framing,
+  auth/session enforcement, trusted identity handling, or hostile upstream
+  response handling changes. Keep the exact-byte harness and upstream-hit-log
+  assertions authoritative.
+- Scanner or pentest findings are triage inputs. Close actionable findings
+  only after they become deterministic Tardigrade regressions or are explicitly
+  dispositioned.
+
+### Manual / On-Demand Deep Campaign
+
+- #675 owns the sustained coverage-guided fuzz campaign. Until it completes or
+  is explicitly dispositioned, keep deterministic seed/corpus replay in normal
+  CI, keep 10M/50M fuzz campaigns manual/on-demand, and keep 100M+/1G
+  saturation follow-up manual unless measured cost/effectiveness justifies a
+  scheduled subset.
+- After #675 records real runtime/effectiveness data, update this section with
+  any selected scheduled 10M/50M fuzz targets and leave 100M+/1G runs
+  manual/on-demand by default.
+- Do not add #593/Proxmox competitive-performance rows to normal
+  hardening/release CI. Performance baselines remain under the performance
+  section and their owning issues.
+
+## Hardening Evidence Convention
+
+Each durable release, hardening, fuzz, interop, or pentest evidence record
+should identify:
+
+- release tag or candidate id
+- source commit SHA
+- artifact or package path
+- artifact SHA-256 where applicable
+- Tardigrade version, profile, and backend
+- OS and architecture
+- Zig version
+- external peer or tool versions
+- exact command
+- PASS / FAIL / SKIP plus reason
+- finding, fix issue, or PR
+
+Sensitive material must not be published: private keys, TLS keylogs or traffic
+secrets, ticket keys, reusable session material, production auth tokens, and
+customer traffic stay out of public docs and committed artifacts. Sanitized
+synthetic transcripts, hashes, versions, counters, public certificate metadata,
+and bounded resource samples are acceptable. Large raw output can remain in
+Actions artifacts, issue attachments, or release artifacts; do not commit bulky
+transient evidence solely for archival purposes.
+
 ## Build and Validation
 
 - [ ] `zig fmt --check build.zig src/ tests/`
 - [ ] `zig build test --summary all --error-style verbose`
-- [ ] `zig build test-integration`
+- [ ] `zig build test-security-corpus --summary all --error-style verbose`
+- [ ] `zig build test-integration --summary all --error-style verbose`
 - [ ] For any HTTP/3 support-status change, complete the closeout evidence
       contract in [HTTP3_VALIDATION_EVIDENCE.md](HTTP3_VALIDATION_EVIDENCE.md)
 - [ ] Run the full TLS conformance/interop matrix
