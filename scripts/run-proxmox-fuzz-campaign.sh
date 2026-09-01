@@ -308,7 +308,7 @@ guest_created=true
 
 say "==> waiting for VM SSH"
 for _ in $(seq 1 180); do
-  guest_ip="$(qm guest cmd "$guest_id" network-get-interfaces 2>/dev/null | grep -Eo '"ip-address"[[:space:]]*:[[:space:]]*"([0-9]{1,3}\.){3}[0-9]{1,3}"' | head -1 | sed -E 's/.*"([^"]+)"/\1/' || true)"
+  guest_ip="$(qm guest cmd "$guest_id" network-get-interfaces 2>/dev/null | grep -Eo '"ip-address"[[:space:]]*:[[:space:]]*"([0-9]{1,3}\.){3}[0-9]{1,3}"' | sed -E 's/.*"([^"]+)"/\1/' | grep -v '^127\.' | head -1 || true)"
   if [[ -n "$guest_ip" ]] && run_guest 'true' >/dev/null 2>&1; then
     break
   fi
