@@ -460,7 +460,7 @@ fi
 # `zig build --fuzz` exits 0 even when the fuzzer finds a failing input (it
 # saves the input and stops the session early), so a fuzz finding must be
 # detected from the run output, never from the exit code alone.
-fuzz_crash_input="$(grep -Eho "input saved to '[^']+'" "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | sed -E "s/^input saved to '([^']+)'\$/\\1/")"
+fuzz_crash_input="$(grep -Eho "input saved to '[^']+'" "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | sed -E "s/^input saved to '([^']+)'\$/\\1/" || true)"
 if [[ "$status" == "pass" && -n "$fuzz_crash_input" ]]; then
   status="fail"
 fi
