@@ -457,6 +457,14 @@ elif [[ "$exit_code" -ne 0 ]]; then
   status="fail"
 fi
 
+# `zig build --fuzz` exits 0 even when the fuzzer finds a failing input (it
+# saves the input and stops the session early), so a fuzz finding must be
+# detected from the run output, never from the exit code alone.
+fuzz_crash_input="$(grep -Eho "input saved to '[^']+'" "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | sed -E "s/^input saved to '([^']+)'\$/\\1/")"
+if [[ "$status" == "pass" && -n "$fuzz_crash_input" ]]; then
+  status="fail"
+fi
+
 execs_per_sec="$(grep -Eho '[0-9]+(\.[0-9]+)?[[:space:]]+(exec|execs|executions)/s(ec)?' "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | awk '{print $1}' || true)"
 if [[ -z "$execs_per_sec" ]]; then
   execs_per_sec="null"
@@ -470,6 +478,15 @@ if [[ "$status" != "pass" ]]; then
   cp "$command_file" "$finding_dir/command.txt"
   cp "$stdout_log" "$finding_dir/stdout.log"
   cp "$stderr_log" "$finding_dir/stderr.log"
+  if [[ -n "$fuzz_crash_input" && -s "$fuzz_crash_input" ]]; then
+    cp "$fuzz_crash_input" "$finding_dir/crash-input.bin"
+    if command -v sha256sum >/dev/null 2>&1; then
+      finding_sha="$(sha256sum "$finding_dir/crash-input.bin" | awk '{print $1}')"
+    else
+      finding_sha="$(shasum -a 256 "$finding_dir/crash-input.bin" | awk '{print $1}')"
+    fi
+    finding_sha_json="\"$(json_escape "$finding_sha")\""
+  fi
   if [[ -d .zig-cache ]]; then
     tar -czf "$finding_dir/zig-cache-preserved.tgz" .zig-cache 2>/dev/null || true
   fi
@@ -484,7 +501,13 @@ if [[ "$status" != "pass" ]]; then
     printf '%q ' zig build "$step" --summary all --error-style verbose
     if [[ -n "$target" ]]; then printf '%q ' "$(family_filter_option "$family" "$target")"; fi
     printf '\n'
-    printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically; complete logs and .zig-cache state were preserved for deliberate recovery.'
+    if [[ -n "$fuzz_crash_input" && -f "$finding_dir/crash-input.bin" ]]; then
+      printf 'fuzz_crash_input=%s\n' "$fuzz_crash_input"
+      printf 'crash_input_sha256=%s\n' "$finding_sha"
+      printf 'note=%s\n' 'crash-input.bin holds the exact saved fuzz input byte-for-byte; .zig-cache state was preserved alongside it.'
+    else
+      printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically; complete logs and .zig-cache state were preserved for deliberate recovery.'
+    fi
   } >"$finding_dir/provenance.txt"
 fi
 
@@ -500,6 +523,9 @@ printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_s
 
 if [[ "$status" != "pass" ]]; then
   say "==> $status: preserved logs/state under $finding_dir"
-  exit "$exit_code"
+  if [[ "$exit_code" -ne 0 ]]; then
+    exit "$exit_code"
+  fi
+  exit 1
 fi
 say "==> pass: evidence appended to $manifest"
