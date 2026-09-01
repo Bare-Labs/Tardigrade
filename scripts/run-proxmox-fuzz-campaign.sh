@@ -110,7 +110,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "$REMOTE_STAGE" in /tmp/tardigrade-proxmox-fuzz-*) ;; *) die "unsafe REMOTE_STAGE" ;; esac
+case "$REMOTE_STAGE" in
+  /tmp/tardigrade-proxmox-fuzz-*|/var/lib/vz/tmp/tardigrade-proxmox-fuzz-*) ;;
+  *) die "unsafe REMOTE_STAGE" ;;
+esac
 [[ "$PROXMOX_VCPUS $PROXMOX_MEMORY_MB $PROXMOX_DISK_GB" =~ ^[0-9]+[[:space:]][0-9]+[[:space:]][0-9]+$ ]] || die "vcpus, memory, and disk must be positive integers"
 
 mkdir -p "$LOCAL_OUT_DIR"
