@@ -225,8 +225,8 @@ write_state() {
     printf 'guest_allocated='; printf '%q\n' "$guest_allocated"
     printf 'guest_reachable='; printf '%q\n' "$guest_reachable"
     printf 'guest_ip='; printf '%q\n' "$guest_ip"
-    printf 'artifact_tgz='; printf '%q\n' "$artifact_tgz"
-    printf 'metadata_tgz='; printf '%q\n' "$REMOTE_STAGE/proxmox-metadata.tgz"
+    printf 'remote_artifact_tgz='; printf '%q\n' "$artifact_tgz"
+    printf 'remote_metadata_tgz='; printf '%q\n' "$REMOTE_STAGE/proxmox-metadata.tgz"
   } >"$state_file"
 }
 collect_artifacts() {
