@@ -182,7 +182,8 @@ die() { echo "error: $*" >&2; exit 1; }
 
 source "$REMOTE_STAGE/campaign.env"
 guest_id="$PROXMOX_VM_ID"
-guest_created=false
+guest_allocated=false
+guest_reachable=false
 guest_ip=""
 guest_ssh_key="$REMOTE_STAGE/vm_ssh_key"
 artifact_tgz="$REMOTE_STAGE/artifacts.tgz"
@@ -205,30 +206,43 @@ push_guest() {
 pull_guest() {
   scp -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$guest_ip:$1" "$2"
 }
+discover_vm_ip_from_neighbors() {
+  local mac tap
+  mac="$(qm config "$guest_id" | awk -F '[=,]' '/^net0:/ { print tolower($2); exit }')"
+  [[ -n "$mac" ]] || return 1
+  tap="tap${guest_id}i0"
+  ip neigh show 2>/dev/null | awk -v mac="$mac" -v tap="$tap" 'tolower($0) ~ mac && $0 ~ tap { print $1; exit }'
+}
 collect_artifacts() {
-  if [[ "$guest_created" == true ]]; then
-    run_guest 'tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts Tardigrade/.zig-cache 2>/dev/null || tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts' >/dev/null 2>&1 || true
-    pull_guest /root/tardigrade-fuzz-artifacts.tgz "$artifact_tgz" >/dev/null 2>&1 || true
-    qm config "$guest_id" >"$REMOTE_STAGE/guest-config.txt" 2>&1 || true
-    {
-      printf 'date_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-      printf 'vm_id=%s\n' "$guest_id"
-      printf 'vm_name=%s\n' "$PROXMOX_VM_NAME"
-      printf 'guest_ip=%s\n' "$guest_ip"
-      printf 'tardigrade_sha=%s\n' "$TARDIGRADE_SHA"
-      printf 'source_archive_sha256=%s\n' "$(awk '{print $1}' "$REMOTE_STAGE/source.tgz.sha256")"
-      printf 'pveversion<<EOF\n'; pveversion -v 2>&1 || true; printf 'EOF\n'
-      printf 'host_uname<<EOF\n'; uname -a; printf 'EOF\n'
-      printf 'host_lscpu<<EOF\n'; lscpu 2>&1 || true; printf 'EOF\n'
-    } >"$REMOTE_STAGE/proxmox-host-metadata.txt"
-    tar -C "$REMOTE_STAGE" -czf "$REMOTE_STAGE/proxmox-metadata.tgz" proxmox-host-metadata.txt guest-config.txt 2>/dev/null || true
-  fi
+  [[ "$guest_reachable" == true ]] || return 1
+  run_guest 'tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts Tardigrade/.zig-cache 2>/dev/null || tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts'
+  pull_guest /root/tardigrade-fuzz-artifacts.tgz "$artifact_tgz"
+  [[ -s "$artifact_tgz" ]]
+  qm config "$guest_id" >"$REMOTE_STAGE/guest-config.txt" 2>&1 || true
+  {
+    printf 'date_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'vm_id=%s\n' "$guest_id"
+    printf 'vm_name=%s\n' "$PROXMOX_VM_NAME"
+    printf 'guest_ip=%s\n' "$guest_ip"
+    printf 'tardigrade_sha=%s\n' "$TARDIGRADE_SHA"
+    printf 'source_archive_sha256=%s\n' "$(awk '{print $1}' "$REMOTE_STAGE/source.tgz.sha256")"
+    printf 'pveversion<<EOF\n'; pveversion -v 2>&1 || true; printf 'EOF\n'
+    printf 'host_uname<<EOF\n'; uname -a; printf 'EOF\n'
+    printf 'host_lscpu<<EOF\n'; lscpu 2>&1 || true; printf 'EOF\n'
+  } >"$REMOTE_STAGE/proxmox-host-metadata.txt"
+  tar -C "$REMOTE_STAGE" -czf "$REMOTE_STAGE/proxmox-metadata.tgz" proxmox-host-metadata.txt guest-config.txt 2>/dev/null || true
 }
 cleanup() {
   status=$?
-  collect_artifacts
-  if [[ "$guest_created" == true ]]; then
-    if [[ "$KEEP_GUEST" == true || ( "$status" -ne 0 && "$KEEP_ON_FAILURE" == true ) ]]; then
+  collection_ok=false
+  if [[ "$guest_allocated" == true ]]; then
+    if collect_artifacts; then
+      collection_ok=true
+    else
+      say "==> artifact collection failed; keeping VM $guest_id" >&2
+      status=1
+    fi
+    if [[ "$collection_ok" != true || "$KEEP_GUEST" == true || ( "$status" -ne 0 && "$KEEP_ON_FAILURE" == true ) ]]; then
       say "==> kept VM $guest_id for inspection"
     else
       say "==> destroying VM $guest_id"
@@ -292,6 +306,7 @@ snippet_ref="${snippets_storage}:snippets/$(basename "$cloud_init_snippet_path")
 say "==> creating VM $guest_id ($PROXMOX_VM_NAME)"
 qm create "$guest_id" --name "$PROXMOX_VM_NAME" --cores "$PROXMOX_VCPUS" --memory "$PROXMOX_MEMORY_MB" \
   --net0 "virtio,bridge=${PROXMOX_BRIDGE}" --ostype l26 --agent enabled=1 --serial0 socket --vga serial0
+guest_allocated=true
 qm importdisk "$guest_id" "$image_path" "$storage" >/dev/null
 disk_ref="$(qm config "$guest_id" | awk -F ': ' '/unused[0-9]+:/ { print $2; exit }')"
 qm set "$guest_id" --scsihw virtio-scsi-pci --scsi0 "$disk_ref" >/dev/null
@@ -304,17 +319,25 @@ else
   qm set "$guest_id" --ipconfig0 "ip=${PROXMOX_VM_IP},gw=${PROXMOX_VM_GATEWAY}" >/dev/null
 fi
 qm start "$guest_id" >/dev/null
-guest_created=true
 
 say "==> waiting for VM SSH"
+reachable=false
 for _ in $(seq 1 180); do
-  guest_ip="$(qm guest cmd "$guest_id" network-get-interfaces 2>/dev/null | grep -Eo '"ip-address"[[:space:]]*:[[:space:]]*"([0-9]{1,3}\.){3}[0-9]{1,3}"' | sed -E 's/.*"([^"]+)"/\1/' | grep -v '^127\.' | head -1 || true)"
+  if [[ "$PROXMOX_VM_IP" != dhcp ]]; then
+    guest_ip="${PROXMOX_VM_IP%%/*}"
+  elif qm agent "$guest_id" ping >/dev/null 2>&1; then
+    guest_ip="$(qm guest cmd "$guest_id" network-get-interfaces 2>/dev/null | grep -Eo '"ip-address"[[:space:]]*:[[:space:]]*"([0-9]{1,3}\.){3}[0-9]{1,3}"' | sed -E 's/.*"([^"]+)"/\1/' | grep -v '^127\.' | head -1 || true)"
+  else
+    guest_ip="$(discover_vm_ip_from_neighbors || true)"
+  fi
   if [[ -n "$guest_ip" ]] && run_guest 'true' >/dev/null 2>&1; then
+    reachable=true
+    guest_reachable=true
     break
   fi
   sleep 2
 done
-[[ -n "$guest_ip" ]] || die "VM SSH did not become reachable"
+[[ "$reachable" == true ]] || die "VM SSH did not become reachable"
 
 say "==> installing Zig $ZIG_VERSION and source"
 push_guest "$REMOTE_STAGE/source.tgz" /root/source.tgz

@@ -331,13 +331,14 @@ if $resume && resume_has_pass "$manifest" "$head_sha" "$step" "$filter" "$budget
   exit 0
 fi
 
-run_dir="$output/runs/$run_key"
+attempt_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+run_dir="$output/runs/$run_key/attempts/$attempt_id"
 mkdir -p "$run_dir"
 stdout_log="$run_dir/stdout.log"
 stderr_log="$run_dir/stderr.log"
 command_file="$run_dir/command.txt"
 result_file="$run_dir/result.json"
-finding_dir="$output/findings/${family}__$(slugify "$filter")"
+finding_dir="$output/findings/${family}__$(slugify "$filter")/$attempt_id"
 
 cmd=(zig build "$step" -Doptimize=ReleaseFast "--fuzz=$budget" --summary all --error-style verbose)
 if [[ -n "$target" ]]; then
@@ -349,21 +350,46 @@ printf '\n' >>"$command_file"
 say "==> running ${cmd[*]}"
 started_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 start_epoch="$(date +%s)"
+interrupted=false
+child_pid=""
+terminate_child() {
+  if [[ -n "$child_pid" ]]; then
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -TERM -P "$child_pid" 2>/dev/null || true
+    fi
+    kill -TERM "$child_pid" 2>/dev/null || true
+  fi
+}
+on_interrupt() {
+  interrupted=true
+  terminate_child
+}
+trap on_interrupt INT TERM
 set +e
 if [[ -n "$watchdog_seconds" ]]; then
   command -v timeout >/dev/null 2>&1 || die "--watchdog requires the timeout command"
-  timeout "$watchdog_seconds" "${cmd[@]}" >"$stdout_log" 2>"$stderr_log"
+  timeout "$watchdog_seconds" "${cmd[@]}" >"$stdout_log" 2>"$stderr_log" &
 else
-  "${cmd[@]}" >"$stdout_log" 2>"$stderr_log"
+  "${cmd[@]}" >"$stdout_log" 2>"$stderr_log" &
 fi
+child_pid=$!
+wait "$child_pid"
 exit_code=$?
+if $interrupted || [[ "$exit_code" -eq 130 || "$exit_code" -eq 143 ]]; then
+  terminate_child
+  wait "$child_pid" >/dev/null 2>&1 || true
+fi
+child_pid=""
 set -e
+trap - INT TERM
 end_epoch="$(date +%s)"
 ended_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 elapsed=$((end_epoch - start_epoch))
 
 status="pass"
-if [[ "$exit_code" -eq 124 ]]; then
+if $interrupted; then
+  status="interrupted"
+elif [[ "$exit_code" -eq 124 ]]; then
   status="possible_hang"
 elif [[ "$exit_code" -eq 130 || "$exit_code" -eq 143 ]]; then
   status="interrupted"

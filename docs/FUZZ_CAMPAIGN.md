@@ -68,14 +68,15 @@ environment.txt
 targets.tsv
 preflight/
 manifest.jsonl
-runs/<family>__<target-or-family>__<budget>/
-findings/<family>__<target-or-family>/
+runs/<family>__<target-or-family>__<budget>/attempts/<attempt-id>/
+findings/<family>__<target-or-family>/<attempt-id>/
 ```
 
-`manifest.jsonl` is append-only. `--resume` skips a row only when the manifest
-contains a pass for the same source SHA, build step, exact filter, and a
-same-or-greater mutation budget. Failed, interrupted, and watchdog-expired rows
-never count as complete.
+`manifest.jsonl` is append-only, and every attempt writes unique log/result
+paths before appending its manifest row. `--resume` skips a row only when the
+manifest contains a pass for the same source SHA, build step, exact filter, and
+a same-or-greater mutation budget. Failed, interrupted, and watchdog-expired
+rows never count as complete.
 
 Canonical runs refuse to start when the checked-out SHA does not match
 `--source-sha`, the worktree is dirty, Zig is not `0.16.0`, or deterministic
