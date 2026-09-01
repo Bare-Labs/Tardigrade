@@ -31,7 +31,7 @@ sha="$(git rev-parse HEAD)"
 scripts/run-fuzz-campaign.sh \
   --tier 2 \
   --family quic \
-  --target 'fuzz: packet parser' \
+  --target 'fuzz: packet parser preserves bounded slice and progress invariants' \
   --budget 50M \
   --source-sha "$sha" \
   --output "artifacts/hardening/fuzz/${sha}-tier2-quic-packet"
@@ -113,6 +113,7 @@ scripts/run-proxmox-fuzz-campaign.sh \
   --out-dir artifacts/hardening/fuzz/proxmox-smoke
 ```
 
-Pass `--campaign-target 'fuzz: packet parser'` for exact target runs. Use
-`--keep-guest` to retain the VM unconditionally, or the default keep-on-failure
-behavior to inspect a failed campaign after artifact collection.
+Pass `--campaign-target 'fuzz: packet parser preserves bounded slice and progress invariants'`
+for exact target runs. Use `--keep-guest` to retain the VM unconditionally, or
+the default keep-on-failure behavior to inspect a failed campaign after artifact
+collection.

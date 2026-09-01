@@ -118,6 +118,8 @@ src_tgz="$LOCAL_OUT_DIR/source.tgz"
 src_sha="$LOCAL_OUT_DIR/source.tgz.sha256"
 params_file="$LOCAL_OUT_DIR/campaign.env"
 artifact_tgz="$LOCAL_OUT_DIR/guest-fuzz-artifacts.tgz"
+metadata_tgz="$LOCAL_OUT_DIR/proxmox-metadata.tgz"
+remote_state_file="$LOCAL_OUT_DIR/guest-state.env"
 
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 scp_opts=(-o BatchMode=yes -o ConnectTimeout=10)
@@ -187,6 +189,7 @@ guest_reachable=false
 guest_ip=""
 guest_ssh_key="$REMOTE_STAGE/vm_ssh_key"
 artifact_tgz="$REMOTE_STAGE/artifacts.tgz"
+state_file="$REMOTE_STAGE/guest-state.env"
 cloud_init_snippet_path=""
 
 require_tool() { command -v "$1" >/dev/null 2>&1 || die "$1 not found on Proxmox host"; }
@@ -212,6 +215,16 @@ discover_vm_ip_from_neighbors() {
   [[ -n "$mac" ]] || return 1
   tap="tap${guest_id}i0"
   ip neigh show 2>/dev/null | awk -v mac="$mac" -v tap="$tap" 'tolower($0) ~ mac && $0 ~ tap { print $1; exit }'
+}
+write_state() {
+  {
+    printf 'guest_id='; printf '%q\n' "$guest_id"
+    printf 'guest_allocated='; printf '%q\n' "$guest_allocated"
+    printf 'guest_reachable='; printf '%q\n' "$guest_reachable"
+    printf 'guest_ip='; printf '%q\n' "$guest_ip"
+    printf 'artifact_tgz='; printf '%q\n' "$artifact_tgz"
+    printf 'metadata_tgz='; printf '%q\n' "$REMOTE_STAGE/proxmox-metadata.tgz"
+  } >"$state_file"
 }
 collect_artifacts() {
   [[ "$guest_reachable" == true ]] || return 1
@@ -242,14 +255,9 @@ cleanup() {
       say "==> artifact collection failed; keeping VM $guest_id" >&2
       status=1
     fi
-    if [[ "$collection_ok" != true || "$KEEP_GUEST" == true || ( "$status" -ne 0 && "$KEEP_ON_FAILURE" == true ) ]]; then
-      say "==> kept VM $guest_id for inspection"
-    else
-      say "==> destroying VM $guest_id"
-      qm stop "$guest_id" >/dev/null 2>&1 || true
-      qm destroy "$guest_id" --purge >/dev/null 2>&1 || true
-    fi
+    say "==> staged artifacts on Proxmox for VM $guest_id; local caller owns verified collection before teardown"
   fi
+  write_state
   [[ -n "$cloud_init_snippet_path" ]] && rm -f "$cloud_init_snippet_path" >/dev/null 2>&1 || true
   exit "$status"
 }
@@ -294,6 +302,8 @@ packages:
   - ca-certificates
   - curl
   - git
+  - libssl-dev
+  - openssl
   - qemu-guest-agent
   - tar
   - xz-utils
@@ -365,12 +375,41 @@ REMOTE
 remote_status=$?
 set -e
 
-set +e
-scp_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz"
-scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$LOCAL_OUT_DIR/proxmox-metadata.tgz"
-set -e
+rm -f "$artifact_tgz" "$metadata_tgz" "$remote_state_file"
+scp_from_pve "$REMOTE_STAGE/guest-state.env" "$remote_state_file"
+guest_id=""
+guest_allocated=false
+guest_reachable=false
+# shellcheck source=/dev/null
+source "$remote_state_file"
 
-[[ -s "$artifact_tgz" ]] || die "artifact collection failed; VM was kept by remote cleanup policy if possible"
-tar -xzf "$artifact_tgz" -C "$LOCAL_OUT_DIR"
+local_collection_ok=false
+if [[ "${guest_allocated:-false}" == true && "${guest_reachable:-false}" == true ]]; then
+  if scp_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
+    scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$metadata_tgz" &&
+    [[ -s "$artifact_tgz" ]] &&
+    tar -tzf "$artifact_tgz" >/dev/null &&
+    tar -xzf "$artifact_tgz" -C "$LOCAL_OUT_DIR"; then
+    local_collection_ok=true
+  fi
+fi
+
+destroy_guest=false
+if [[ "${guest_allocated:-false}" == true && "$local_collection_ok" == true && "$KEEP_GUEST" != true ]]; then
+  if [[ "$remote_status" -eq 0 || "$KEEP_ON_FAILURE" != true ]]; then
+    destroy_guest=true
+  fi
+fi
+
+if [[ "$destroy_guest" == true ]]; then
+  say "==> destroying VM $guest_id after verified local artifact collection"
+  ssh_pve "qm stop $(printf '%q' "$guest_id") >/dev/null 2>&1 || true; qm destroy $(printf '%q' "$guest_id") --purge >/dev/null 2>&1 || true"
+else
+  if [[ "${guest_allocated:-false}" == true ]]; then
+    say "==> kept VM $guest_id for inspection"
+  fi
+fi
+
+[[ "$local_collection_ok" == true ]] || die "artifact collection failed before verified local copy; VM was left intact when allocated"
 say "==> artifacts collected in $LOCAL_OUT_DIR"
 exit "$remote_status"

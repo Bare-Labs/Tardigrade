@@ -164,7 +164,7 @@ git_status_short_value() {
 target_selects_current_fuzz() {
   local fam="$1" name="$2"
   discover_targets | awk -F '\t' -v f="$fam" -v n="$name" '
-    $1 == f && ($3 == n || index($3, n) > 0) {
+    $1 == f && $3 == n {
       count += 1
       selected = selected $3 "\n"
     }
@@ -217,6 +217,23 @@ capture_environment() {
       printf 'EOF\n'
     fi
   } >"$file"
+}
+
+cpu_identity() {
+  local cpu=""
+  if command -v lscpu >/dev/null 2>&1; then
+    cpu="$(lscpu 2>/dev/null | awk -F ': +' '/Model name:/ { print $2; exit }')"
+  fi
+  if [[ -z "$cpu" && -r /proc/cpuinfo ]]; then
+    cpu="$(awk -F ': +' '/model name/ { print $2; exit }' /proc/cpuinfo)"
+  fi
+  if [[ -z "$cpu" ]] && command -v sysctl >/dev/null 2>&1; then
+    cpu="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+  fi
+  if [[ -z "$cpu" ]]; then
+    cpu="unknown"
+  fi
+  printf '%s\n' "$cpu"
 }
 
 run_preflight() {
@@ -432,8 +449,9 @@ cat >"$result_file" <<EOF
 {"status":"$status","exit_code":$exit_code,"started_utc":"$started_utc","ended_utc":"$ended_utc","elapsed_seconds":$elapsed}
 EOF
 
-printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"stdout_path":"%s","stderr_path":"%s"}\n' \
+printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","cpu":"%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"stdout_path":"%s","stderr_path":"%s"}\n' \
   "$(json_escape "$campaign_id")" "$started_utc" "$ended_utc" "$head_sha" "$(json_escape "$(zig version)")" "$(json_escape "$(uname -s)")" "$(json_escape "$(uname -m)")" \
+  "$(json_escape "$(cpu_identity)")" \
   "$(json_escape "$family")" "$(json_escape "$step")" "$(json_escape "$filter")" "$(json_escape "$budget")" "$budget_mutations" "$elapsed" "$execs_per_sec" "$status" "$exit_code" \
   "$([[ "$status" == pass ]] && echo null || printf '"%s"' "$(json_escape "$finding_dir")")" "$finding_sha_json" "$(json_escape "$stdout_log")" "$(json_escape "$stderr_log")" >>"$manifest"
 
