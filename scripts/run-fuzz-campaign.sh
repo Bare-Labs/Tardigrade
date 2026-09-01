@@ -54,7 +54,7 @@ Discovery:
 Examples:
   scripts/run-fuzz-campaign.sh --list
   scripts/run-fuzz-campaign.sh --tier 1 --family quic --output artifacts/hardening/fuzz/smoke --noncanonical-smoke --budget 1K --skip-preflight
-  scripts/run-fuzz-campaign.sh --family quic --target 'fuzz: packet parser' --budget 50M --output artifacts/hardening/fuzz/<campaign-id>
+  scripts/run-fuzz-campaign.sh --family quic --target 'fuzz: packet parser preserves bounded slice and progress invariants' --budget 50M --output artifacts/hardening/fuzz/<campaign-id>
 EOF
 }
 
@@ -258,6 +258,58 @@ run_preflight() {
   } >"$dir/04-integration.log" 2>&1
 }
 
+ensure_campaign_metadata() {
+  local canonical_json="$1"
+  local created_utc metadata_tmp targets_tmp environment_tmp
+  created_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  mkdir -p "$output"
+  if [[ -f "$output/campaign.json" ]]; then
+    grep -F "\"source_commit_sha\":\"$head_sha\"" "$output/campaign.json" >/dev/null ||
+      die "output directory belongs to a different source SHA"
+    grep -F "\"canonical\":$canonical_json" "$output/campaign.json" >/dev/null ||
+      die "output directory belongs to a different canonical/smoke mode"
+    grep -F "\"expected_zig_version\":\"$EXPECTED_ZIG_VERSION\"" "$output/campaign.json" >/dev/null ||
+      die "output directory belongs to a different Zig version"
+  else
+    metadata_tmp="$(mktemp "${output}/campaign.json.tmp.XXXXXX")"
+    cat >"$metadata_tmp" <<EOF
+{"campaign_id":"$(json_escape "$campaign_id")","source_commit_sha":"$head_sha","canonical":$canonical_json,"expected_zig_version":"$(json_escape "$EXPECTED_ZIG_VERSION")","created_utc":"$created_utc"}
+EOF
+    mv "$metadata_tmp" "$output/campaign.json"
+  fi
+
+  if [[ ! -f "$output/targets.tsv" ]]; then
+    targets_tmp="$(mktemp "${output}/targets.tsv.tmp.XXXXXX")"
+    discover_targets >"$targets_tmp"
+    mv "$targets_tmp" "$output/targets.tsv"
+  fi
+
+  if [[ ! -f "$output/environment.txt" ]]; then
+    environment_tmp="$(mktemp "${output}/environment.txt.tmp.XXXXXX")"
+    capture_environment "$environment_tmp"
+    mv "$environment_tmp" "$output/environment.txt"
+  fi
+}
+
+ensure_preflight() {
+  local preflight_root="$output/preflight" preflight_attempt
+  if $skip_preflight; then
+    say "==> skipping deterministic preflight for non-canonical smoke"
+    return
+  fi
+  mkdir -p "$preflight_root/attempts"
+  if [[ -f "$preflight_root/complete" ]]; then
+    say "==> reusing retained deterministic preflight evidence"
+    return
+  fi
+
+  preflight_attempt="$preflight_root/attempts/$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  say "==> running deterministic preflight"
+  run_preflight "$preflight_attempt"
+  printf '%s\n' "$preflight_attempt" >"$preflight_root/complete"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier) tier="$2"; shift 2 ;;
@@ -319,21 +371,12 @@ if ! $noncanonical_smoke && git rev-parse --git-dir >/dev/null 2>&1 && [[ -n "$(
   die "canonical campaign requires a clean worktree; pass --noncanonical-smoke for setup smoke evidence"
 fi
 
-mkdir -p "$output/preflight" "$output/runs" "$output/findings"
-discover_targets >"$output/targets.tsv"
-capture_environment "$output/environment.txt"
-
 campaign_id="$(basename "$output")"
-cat >"$output/campaign.json" <<EOF
-{"campaign_id":"$(json_escape "$campaign_id")","source_commit_sha":"$head_sha","canonical":$($noncanonical_smoke && echo false || echo true),"tier":$tier,"created_utc":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
-EOF
+canonical_json="$($noncanonical_smoke && echo false || echo true)"
+ensure_campaign_metadata "$canonical_json"
+mkdir -p "$output/preflight" "$output/runs" "$output/findings"
 
-if ! $skip_preflight; then
-  say "==> running deterministic preflight"
-  run_preflight "$output/preflight"
-else
-  say "==> skipping deterministic preflight for non-canonical smoke"
-fi
+ensure_preflight
 
 filter="<family>"
 run_key="${family}__family__${budget}"
