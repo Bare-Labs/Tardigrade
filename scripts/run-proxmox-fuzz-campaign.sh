@@ -124,7 +124,7 @@ artifact_tgz="$LOCAL_OUT_DIR/guest-fuzz-artifacts.tgz"
 metadata_tgz="$LOCAL_OUT_DIR/proxmox-metadata.tgz"
 remote_state_file="$LOCAL_OUT_DIR/guest-state.env"
 
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
 scp_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 if [[ -n "$PROXMOX_SSH_BIND" ]]; then
   ssh_opts+=(-b "$PROXMOX_SSH_BIND")
@@ -204,7 +204,10 @@ storage_with_images() {
   pvesm status -content images 2>/dev/null | awk 'NR > 1 && $3 == "active" { print $1; exit }'
 }
 run_guest() {
-  ssh -n -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$guest_ip" "$1"
+  # A campaign row can run for hours with all of its output redirected to
+  # in-guest files, so the channel stays idle; keepalives stop the session
+  # (and the runner under it) from being torn down mid-row.
+  ssh -n -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "root@$guest_ip" "$1"
 }
 push_guest() {
   scp -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$1" "root@$guest_ip:$2"
