@@ -142,7 +142,7 @@ done
 
 build_ssh_opts() {
   ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
-  scp_opts=(-o BatchMode=yes -o ConnectTimeout=10)
+  scp_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
   if [[ -n "$PROXMOX_SSH_BIND" ]]; then
     ssh_opts+=(-b "$PROXMOX_SSH_BIND")
     scp_opts+=(-o "BindAddress=${PROXMOX_SSH_BIND}")
@@ -221,6 +221,17 @@ if [[ "$MODE" == "collect" ]]; then
     fi
   fi
 
+  if [[ "$local_collection_ok" == true ]]; then
+    # REMOTE_STAGE (source.tgz, orchestrate logs, and the collected
+    # artifacts.tgz — potentially hundreds of MB, since it includes the
+    # whole guest .zig-cache) is redundant once evidence is verified
+    # locally. /tmp on the Proxmox host is a small tmpfs; leaving every
+    # row's stage directory behind exhausts it within a handful of rows
+    # (observed directly: a 22h possible_hang row's real evidence was
+    # lost to "No space left on device" mid-collection before this
+    # cleanup existed).
+    ssh_pve "rm -rf $(printf '%q' "$REMOTE_STAGE")" || true
+  fi
   [[ "$local_collection_ok" == true ]] || die "artifact collection failed before verified local copy; VM was left intact when allocated"
   say "==> artifacts collected in $LOCAL_OUT_DIR"
   exit "$remote_status"
