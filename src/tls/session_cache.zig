@@ -4399,6 +4399,7 @@ const ClientLeaseTransition = struct {
     present: [pre_shared_key.max_offered_identities]bool = [_]bool{false} ** pre_shared_key.max_offered_identities,
     entry_ids: [pre_shared_key.max_offered_identities]u64 = [_]u64{0} ** pre_shared_key.max_offered_identities,
     single_use: [pre_shared_key.max_offered_identities]bool = [_]bool{false} ** pre_shared_key.max_offered_identities,
+    lease_epochs: [pre_shared_key.max_offered_identities]u64 = [_]u64{0} ** pre_shared_key.max_offered_identities,
     fingerprints: [pre_shared_key.max_offered_identities][32]u8 = undefined,
 };
 
@@ -4410,6 +4411,7 @@ fn captureClientLeaseTransition(cache: *ClientSessionCache, lease: *pre_shared_k
         const token = lease.tokens[i];
         out.entry_ids[i] = token.entry_id;
         out.single_use[i] = token.single_use;
+        out.lease_epochs[i] = token.lease_epoch;
         const idx = cache.findIndexByEntryId(token.entry_id) orelse {
             try testing.expect(!token.single_use);
             continue;
@@ -4424,7 +4426,26 @@ fn captureClientLeaseTransition(cache: *ClientSessionCache, lease: *pre_shared_k
     return out;
 }
 
-fn expectClientEntryState(cache: *ClientSessionCache, entry_id: u64, expected_fp: [32]u8, should_exist: bool, should_be_pinned: bool) !void {
+// A reusable ticket may legitimately be offered into more than one
+// concurrent lease (nothing pins it, unlike a single-use ticket), and
+// re-storing the same ticket identity can reclassify it single_use<->
+// reusable in place (storeDedup's guard only blocks reclassifying an
+// already-pinned single-use entry, not a reusable one). So a lease that
+// never itself held a pin on an entry (`.no_claim`) cannot assert
+// anything about that entry's current pin state — a different,
+// independently created lease may hold a legitimate, unrelated pin on
+// the very same (now-reclassified) entry. A lease that DID hold a pin
+// can only assert facts about its OWN epoch: that it is still exactly
+// that epoch (`.still_pinned`), or that it is no longer that epoch
+// (`.released_own` — a different, newer epoch belonging to another
+// lease is not evidence of a stuck release).
+const PinExpectation = union(enum) {
+    no_claim,
+    still_pinned: u64,
+    released_own: u64,
+};
+
+fn expectClientEntryState(cache: *ClientSessionCache, entry_id: u64, expected_fp: [32]u8, should_exist: bool, expect: PinExpectation) !void {
     const idx = cache.findIndexByEntryId(entry_id);
     if (!should_exist) {
         try testing.expect(idx == null);
@@ -4432,7 +4453,11 @@ fn expectClientEntryState(cache: *ClientSessionCache, entry_id: u64, expected_fp
     }
     const entry = cache.entries.items[idx orelse return error.ClientLeaseTransitionEntryMissing];
     try testing.expectEqualDeep(expected_fp, try fingerprintClientTicket(&entry.ticket));
-    try testing.expectEqual(should_be_pinned, entry.active_lease_epoch != null);
+    switch (expect) {
+        .no_claim => {},
+        .still_pinned => |epoch| try testing.expectEqual(@as(?u64, epoch), entry.active_lease_epoch),
+        .released_own => |epoch| try testing.expect(entry.active_lease_epoch != epoch),
+    }
 }
 
 fn expectClientLeaseTransition(cache: *ClientSessionCache, before: ClientLeaseTransition, outcome: pre_shared_key.ClientOfferOutcome) !void {
@@ -4448,7 +4473,11 @@ fn expectClientLeaseTransition(cache: *ClientSessionCache, before: ClientLeaseTr
             continue;
         }
         const consumed = selected_index != null and selected_index.? == i and before.single_use[i];
-        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], !consumed, false);
+        const expect: PinExpectation = if (!before.single_use[i])
+            .no_claim
+        else
+            .{ .released_own = before.lease_epochs[i] };
+        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], !consumed, expect);
     }
 }
 
@@ -4460,7 +4489,13 @@ fn expectClientDropOfferTransition(cache: *ClientSessionCache, before: ClientLea
             try testing.expect(cache.findIndexByEntryId(before.entry_ids[i]) == null);
             continue;
         }
-        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], true, before.single_use[i] and i != dropped_index);
+        const expect: PinExpectation = if (!before.single_use[i])
+            .no_claim
+        else if (i == dropped_index)
+            .{ .released_own = before.lease_epochs[i] }
+        else
+            .{ .still_pinned = before.lease_epochs[i] };
+        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], true, expect);
     }
 }
 
@@ -5386,6 +5421,14 @@ test "fuzz: TLS resumption: client session cache operation sequence preserves tr
             &smithCorpusWords(&.{ 15, 1, 9, 15, 10, 3 }),
             &smithCorpusWords(&.{ 16, 0, 3 }),
             &smithCorpusWords(&.{ 0, 13, 0, 17 }),
+            // Found 2026-09-02, zig build test-tls-resumption-fuzz
+            // -Doptimize=ReleaseFast --fuzz=10M (#675 campaign row t1-03):
+            // "expected false, found true" (error.TestExpectedEqual) —
+            // a reusable ticket offered into two concurrent leases, then
+            // reclassified single_use via re-storage and re-pinned by a
+            // third lease, made a stale lease's drop-offer assertion
+            // wrongly claim the entry must be globally unpinned.
+            @embedFile("vectors/fuzz/session_cache/64a30c7af358736dc4ca686532bba6b95309097c147ea7beec6ee70ae4dbc561.bin"),
         },
     });
 }
