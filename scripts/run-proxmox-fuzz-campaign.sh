@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 # Disposable Proxmox KVM wrapper for scripts/run-fuzz-campaign.sh.
+#
+# `--start` packages the source, stages it on the Proxmox host, and launches
+# the full VM lifecycle (create guest, install Zig, run the fuzz campaign,
+# collect evidence, decide the guest's fate) DETACHED on the Proxmox host via
+# setsid+nohup, then returns in seconds. It does not hold an SSH session open
+# for a row's full multi-hour duration.
+#
+# `--collect --out-dir DIR` reconnects later — a cheap, short SSH round trip
+# — to check whether the detached job has finished. If not, it reports
+# status and exits 2 without touching anything. Once finished, it pulls
+# evidence back, verifies it locally, and destroys/keeps the guest exactly as
+# `--start` would have decided synchronously.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -27,20 +39,27 @@ CAMPAIGN_TIER="${CAMPAIGN_TIER:-1}"
 CAMPAIGN_FAMILY="${CAMPAIGN_FAMILY:-quic}"
 CAMPAIGN_TARGET="${CAMPAIGN_TARGET:-}"
 CAMPAIGN_BUDGET="${CAMPAIGN_BUDGET:-1K}"
+CAMPAIGN_WATCHDOG="${CAMPAIGN_WATCHDOG:-}"
 CAMPAIGN_NONCANONICAL=false
 CAMPAIGN_SKIP_PREFLIGHT=false
 LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-$repo/artifacts/hardening/fuzz/proxmox-${timestamp}}"
 REMOTE_STAGE="${REMOTE_STAGE:-/tmp/tardigrade-proxmox-fuzz-${timestamp}}"
 KEEP_GUEST=false
 KEEP_ON_FAILURE=true
+MODE=""
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run-proxmox-fuzz-campaign.sh [OPTIONS]
+Usage:
+  scripts/run-proxmox-fuzz-campaign.sh --start [OPTIONS]
+  scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir DIR
 
-Creates a fresh disposable Proxmox KVM VM, installs Zig, runs
-scripts/run-fuzz-campaign.sh inside the guest, pulls campaign evidence back,
-and destroys the guest after successful artifact collection unless told not to.
+--start launches the full VM lifecycle (create, install Zig, run the fuzz
+campaign, collect evidence, decide guest fate) DETACHED on the Proxmox host
+and returns in seconds. --collect reconnects later (a cheap, short SSH round
+trip) to check whether the detached job has finished: not yet -> prints
+status and exits 2 without touching anything; finished -> pulls evidence
+back, verifies it locally, and destroys/keeps the guest.
 
 Proxmox:
   --target SSH_TARGET       Proxmox SSH target
@@ -57,16 +76,22 @@ Proxmox:
   --memory MB               Memory
   --disk GB                 Root disk size
 
-Campaign:
+Campaign (only meaningful with --start):
   --tardigrade-ref REF      Local ref to resolve and archive
   --zig-version VERSION     Expected Zig version
   --tier 1|2|3
   --family FAMILY
   --campaign-target NAME    Exact fuzz target filter
   --budget N|K|M|G
+  --watchdog SECONDS        Bound one fuzz process; expiry records possible_hang
+                            instead of running unbounded
   --noncanonical-smoke      Pass through to local runner
   --skip-preflight          Pass through only with --noncanonical-smoke
-  --out-dir DIR             Local artifact destination
+
+Evidence:
+  --out-dir DIR             Local artifact destination. --start records the
+                             remote connection here for a later --collect;
+                             --collect reads it back and requires this flag.
 
 Lifecycle:
   --keep-guest              Always keep VM
@@ -81,6 +106,8 @@ die() { echo "error: $*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --start) MODE="start"; shift ;;
+    --collect) MODE="collect"; shift ;;
     --target) PROXMOX_SSH_TARGET="$2"; shift 2 ;;
     --bind) PROXMOX_SSH_BIND="$2"; shift 2 ;;
     --vm-id) PROXMOX_VM_ID="$2"; shift 2 ;;
@@ -100,6 +127,7 @@ while [[ $# -gt 0 ]]; do
     --family) CAMPAIGN_FAMILY="$2"; shift 2 ;;
     --campaign-target) CAMPAIGN_TARGET="$2"; shift 2 ;;
     --budget) CAMPAIGN_BUDGET="$2"; shift 2 ;;
+    --watchdog) CAMPAIGN_WATCHDOG="$2"; shift 2 ;;
     --noncanonical-smoke) CAMPAIGN_NONCANONICAL=true; shift ;;
     --skip-preflight) CAMPAIGN_SKIP_PREFLIGHT=true; shift ;;
     --out-dir) LOCAL_OUT_DIR="$2"; shift 2 ;;
@@ -109,6 +137,97 @@ while [[ $# -gt 0 ]]; do
     *) die "unknown option: $1" ;;
   esac
 done
+
+[[ "$MODE" == "start" || "$MODE" == "collect" ]] || die "pass exactly one of --start or --collect (see --help)"
+
+build_ssh_opts() {
+  ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
+  scp_opts=(-o BatchMode=yes -o ConnectTimeout=10)
+  if [[ -n "$PROXMOX_SSH_BIND" ]]; then
+    ssh_opts+=(-b "$PROXMOX_SSH_BIND")
+    scp_opts+=(-o "BindAddress=${PROXMOX_SSH_BIND}")
+  fi
+}
+
+ssh_pve() {
+  # shellcheck disable=SC2029 # helper intentionally executes caller-supplied remote commands on the configured Proxmox host.
+  ssh "${ssh_opts[@]}" "$PROXMOX_SSH_TARGET" "$@"
+}
+scp_to_pve() { scp "${scp_opts[@]}" "$1" "${PROXMOX_SSH_TARGET}:$2"; }
+scp_from_pve() { scp "${scp_opts[@]}" "${PROXMOX_SSH_TARGET}:$1" "$2"; }
+write_param() { printf '%s=' "$1" >>"$params_file"; printf '%q\n' "$2" >>"$params_file"; }
+
+if [[ "$MODE" == "collect" ]]; then
+  [[ -n "$LOCAL_OUT_DIR" ]] || die "--out-dir is required for --collect"
+  async_state="$LOCAL_OUT_DIR/async.env"
+  [[ -f "$async_state" ]] || die "no async start recorded at $async_state; run --start first"
+  # REMOTE_STAGE/PROXMOX_SSH_TARGET/PROXMOX_SSH_BIND identify the exact
+  # remote job --start launched; the saved state is authoritative over
+  # whatever these flags default to on this invocation.
+  # shellcheck source=/dev/null
+  source "$async_state"
+  build_ssh_opts
+
+  case "$REMOTE_STAGE" in
+    /tmp/tardigrade-proxmox-fuzz-*|/var/lib/vz/tmp/tardigrade-proxmox-fuzz-*) ;;
+    *) die "unsafe REMOTE_STAGE recorded in $async_state" ;;
+  esac
+
+  if ! ssh_pve "test -f $(printf '%q' "$REMOTE_STAGE/orchestrate.done")"; then
+    say "==> still running (started ${started_utc:-unknown})"
+    ssh_pve "tail -n 20 $(printf '%q' "$REMOTE_STAGE/orchestrate.log") 2>/dev/null" || true
+    exit 2
+  fi
+
+  say "==> detached job finished; collecting evidence"
+  artifact_tgz="$LOCAL_OUT_DIR/guest-fuzz-artifacts.tgz"
+  metadata_tgz="$LOCAL_OUT_DIR/proxmox-metadata.tgz"
+  remote_state_file="$LOCAL_OUT_DIR/guest-state.env"
+
+  rm -f "$artifact_tgz" "$metadata_tgz" "$remote_state_file"
+  scp_from_pve "$REMOTE_STAGE/guest-state.env" "$remote_state_file"
+  guest_id=""
+  guest_allocated=false
+  guest_reachable=false
+  remote_exit_code=1
+  # shellcheck source=/dev/null
+  source "$remote_state_file"
+  remote_status="$remote_exit_code"
+
+  local_collection_ok=false
+  if [[ "${guest_allocated:-false}" == true && "${guest_reachable:-false}" == true ]]; then
+    if scp_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
+      scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$metadata_tgz" &&
+      [[ -s "$artifact_tgz" ]] &&
+      tar -tzf "$artifact_tgz" >/dev/null &&
+      tar -xzf "$artifact_tgz" -C "$LOCAL_OUT_DIR"; then
+      local_collection_ok=true
+    fi
+  fi
+
+  destroy_guest=false
+  if [[ "${guest_allocated:-false}" == true && "$local_collection_ok" == true && "$KEEP_GUEST" != true ]]; then
+    if [[ "$remote_status" -eq 0 || "$KEEP_ON_FAILURE" != true ]]; then
+      destroy_guest=true
+    fi
+  fi
+
+  if [[ "$destroy_guest" == true ]]; then
+    say "==> destroying VM $guest_id after verified local artifact collection"
+    ssh_pve "qm stop $(printf '%q' "$guest_id") >/dev/null 2>&1 || true; qm destroy $(printf '%q' "$guest_id") --purge >/dev/null 2>&1 || true"
+  else
+    if [[ "${guest_allocated:-false}" == true ]]; then
+      say "==> kept VM $guest_id for inspection"
+    fi
+  fi
+
+  [[ "$local_collection_ok" == true ]] || die "artifact collection failed before verified local copy; VM was left intact when allocated"
+  say "==> artifacts collected in $LOCAL_OUT_DIR"
+  exit "$remote_status"
+fi
+
+# MODE == start
+build_ssh_opts
 
 case "$REMOTE_STAGE" in
   /tmp/tardigrade-proxmox-fuzz-*|/var/lib/vz/tmp/tardigrade-proxmox-fuzz-*) ;;
@@ -120,24 +239,6 @@ mkdir -p "$LOCAL_OUT_DIR"
 src_tgz="$LOCAL_OUT_DIR/source.tgz"
 src_sha="$LOCAL_OUT_DIR/source.tgz.sha256"
 params_file="$LOCAL_OUT_DIR/campaign.env"
-artifact_tgz="$LOCAL_OUT_DIR/guest-fuzz-artifacts.tgz"
-metadata_tgz="$LOCAL_OUT_DIR/proxmox-metadata.tgz"
-remote_state_file="$LOCAL_OUT_DIR/guest-state.env"
-
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
-scp_opts=(-o BatchMode=yes -o ConnectTimeout=10)
-if [[ -n "$PROXMOX_SSH_BIND" ]]; then
-  ssh_opts+=(-b "$PROXMOX_SSH_BIND")
-  scp_opts+=(-o "BindAddress=${PROXMOX_SSH_BIND}")
-fi
-
-ssh_pve() {
-  # shellcheck disable=SC2029 # helper intentionally executes caller-supplied remote commands on the configured Proxmox host.
-  ssh "${ssh_opts[@]}" "$PROXMOX_SSH_TARGET" "$@"
-}
-scp_to_pve() { scp "${scp_opts[@]}" "$1" "${PROXMOX_SSH_TARGET}:$2"; }
-scp_from_pve() { scp "${scp_opts[@]}" "${PROXMOX_SSH_TARGET}:$1" "$2"; }
-write_param() { printf '%s=' "$1" >>"$params_file"; printf '%q\n' "$2" >>"$params_file"; }
 
 TARDIGRADE_SHA="$(git rev-parse "${TARDIGRADE_REF}^{commit}")"
 say "==> packaging source from ${TARDIGRADE_REF} (${TARDIGRADE_SHA})"
@@ -166,6 +267,7 @@ write_param CAMPAIGN_TIER "$CAMPAIGN_TIER"
 write_param CAMPAIGN_FAMILY "$CAMPAIGN_FAMILY"
 write_param CAMPAIGN_TARGET "$CAMPAIGN_TARGET"
 write_param CAMPAIGN_BUDGET "$CAMPAIGN_BUDGET"
+write_param CAMPAIGN_WATCHDOG "$CAMPAIGN_WATCHDOG"
 write_param CAMPAIGN_NONCANONICAL "$CAMPAIGN_NONCANONICAL"
 write_param CAMPAIGN_SKIP_PREFLIGHT "$CAMPAIGN_SKIP_PREFLIGHT"
 write_param KEEP_GUEST "$KEEP_GUEST"
@@ -177,9 +279,8 @@ scp_to_pve "$src_tgz" "$REMOTE_STAGE/source.tgz"
 scp_to_pve "$src_sha" "$REMOTE_STAGE/source.tgz.sha256"
 scp_to_pve "$params_file" "$REMOTE_STAGE/campaign.env"
 
-set +e
-# shellcheck disable=SC2029 # REMOTE_STAGE is locally shell-quoted before running the Proxmox-side script.
-ssh "${ssh_opts[@]}" "$PROXMOX_SSH_TARGET" "REMOTE_STAGE=$(printf '%q' "$REMOTE_STAGE") bash -s" <<'REMOTE'
+say "==> staging orchestration script on $PROXMOX_SSH_TARGET"
+ssh_pve "cat > $(printf '%q' "$REMOTE_STAGE/orchestrate.sh")" <<'REMOTE'
 set -euo pipefail
 
 say() { printf '%s\n' "$*"; }
@@ -204,9 +305,10 @@ storage_with_images() {
   pvesm status -content images 2>/dev/null | awk 'NR > 1 && $3 == "active" { print $1; exit }'
 }
 run_guest() {
-  # A campaign row can run for hours with all of its output redirected to
-  # in-guest files, so the channel stays idle; keepalives stop the session
-  # (and the runner under it) from being torn down mid-row.
+  # This SSH hop (Proxmox host -> guest VM) is now the only connection that
+  # needs to survive a row's full duration, and it runs entirely on the
+  # Proxmox host itself (a persistent server), not the controlling Mac.
+  # Keepalives still guard against idle-timeout teardown regardless.
   ssh -n -i "$guest_ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "root@$guest_ip" "$1"
 }
 push_guest() {
@@ -230,6 +332,7 @@ write_state() {
     printf 'guest_ip='; printf '%q\n' "$guest_ip"
     printf 'remote_artifact_tgz='; printf '%q\n' "$artifact_tgz"
     printf 'remote_metadata_tgz='; printf '%q\n' "$REMOTE_STAGE/proxmox-metadata.tgz"
+    printf 'remote_exit_code='; printf '%q\n' "$status"
   } >"$state_file"
 }
 collect_artifacts() {
@@ -265,6 +368,10 @@ cleanup() {
   fi
   write_state
   [[ -n "$cloud_init_snippet_path" ]] && rm -f "$cloud_init_snippet_path" >/dev/null 2>&1 || true
+  # Sole completion signal a detached --start caller polls for via
+  # --collect. Written strictly after write_state so a poller that
+  # observes this file can trust guest-state.env is already complete.
+  touch "$REMOTE_STAGE/orchestrate.done"
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -297,7 +404,7 @@ fi
 cloud_init_snippet_path="$(pvesm path "${snippets_storage}:snippets/tardigrade-fuzz-${guest_id}.yml" 2>/dev/null || true)"
 [[ -n "$cloud_init_snippet_path" ]] || die "cannot resolve snippets storage path"
 mkdir -p "$(dirname "$cloud_init_snippet_path")"
-cat >"$cloud_init_snippet_path" <<EOF
+cat >"$cloud_init_snippet_path" <<CLOUDINIT
 #cloud-config
 disable_root: false
 ssh_authorized_keys:
@@ -316,7 +423,7 @@ packages:
   - build-essential
 runcmd:
   - [ systemctl, enable, --now, qemu-guest-agent ]
-EOF
+CLOUDINIT
 snippet_ref="${snippets_storage}:snippets/$(basename "$cloud_init_snippet_path")"
 
 say "==> creating VM $guest_id ($PROXMOX_VM_NAME)"
@@ -371,6 +478,7 @@ test \"\$(zig version)\" = \"$ZIG_VERSION\"
 guest_output="/work/Tardigrade/artifacts/hardening/fuzz/proxmox-${guest_id}-${CAMPAIGN_TIER}-${CAMPAIGN_FAMILY}"
 runner_cmd=(scripts/run-fuzz-campaign.sh --tier "$CAMPAIGN_TIER" --family "$CAMPAIGN_FAMILY" --budget "$CAMPAIGN_BUDGET" --output "$guest_output" --source-sha "$TARDIGRADE_SHA")
 if [[ -n "$CAMPAIGN_TARGET" ]]; then runner_cmd+=(--target "$CAMPAIGN_TARGET"); fi
+if [[ -n "$CAMPAIGN_WATCHDOG" ]]; then runner_cmd+=(--watchdog "$CAMPAIGN_WATCHDOG"); fi
 if [[ "$CAMPAIGN_NONCANONICAL" == true ]]; then runner_cmd+=(--noncanonical-smoke); fi
 if [[ "$CAMPAIGN_SKIP_PREFLIGHT" == true ]]; then runner_cmd+=(--skip-preflight); fi
 
@@ -378,44 +486,23 @@ printf '%q ' "${runner_cmd[@]}" >"$REMOTE_STAGE/guest-command.txt"
 say "==> running fuzz campaign in VM"
 run_guest "cd /work/Tardigrade && $(cat "$REMOTE_STAGE/guest-command.txt")"
 REMOTE
-remote_status=$?
-set -e
 
-rm -f "$artifact_tgz" "$metadata_tgz" "$remote_state_file"
-scp_from_pve "$REMOTE_STAGE/guest-state.env" "$remote_state_file"
-guest_id=""
-guest_allocated=false
-guest_reachable=false
-# shellcheck source=/dev/null
-source "$remote_state_file"
+say "==> launching detached fuzz campaign lifecycle on $PROXMOX_SSH_TARGET"
+# `cd X && setsid ... &` keeps the remote shell blocked in do_wait() even
+# after disown (observed directly: a `cd dir && cmd &` background job holds
+# the ssh channel open for the child's full runtime, while `cd dir; cmd &`
+# with cd as its own statement detaches in ~1s). Keep `cd` a separate
+# statement so this call returns immediately instead of blocking for the
+# row's full duration.
+ssh_pve "cd $(printf '%q' "$REMOTE_STAGE") || exit 1; REMOTE_STAGE=$(printf '%q' "$REMOTE_STAGE") setsid nohup bash orchestrate.sh >orchestrate.log 2>&1 </dev/null & disown; sleep 1; echo launched"
 
-local_collection_ok=false
-if [[ "${guest_allocated:-false}" == true && "${guest_reachable:-false}" == true ]]; then
-  if scp_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
-    scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$metadata_tgz" &&
-    [[ -s "$artifact_tgz" ]] &&
-    tar -tzf "$artifact_tgz" >/dev/null &&
-    tar -xzf "$artifact_tgz" -C "$LOCAL_OUT_DIR"; then
-    local_collection_ok=true
-  fi
-fi
+{
+  printf 'REMOTE_STAGE=%s\n' "$(printf '%q' "$REMOTE_STAGE")"
+  printf 'PROXMOX_SSH_TARGET=%s\n' "$(printf '%q' "$PROXMOX_SSH_TARGET")"
+  printf 'PROXMOX_SSH_BIND=%s\n' "$(printf '%q' "$PROXMOX_SSH_BIND")"
+  printf 'TARDIGRADE_SHA=%s\n' "$(printf '%q' "$TARDIGRADE_SHA")"
+  printf 'started_utc=%s\n' "$(printf '%q' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")"
+} >"$LOCAL_OUT_DIR/async.env"
 
-destroy_guest=false
-if [[ "${guest_allocated:-false}" == true && "$local_collection_ok" == true && "$KEEP_GUEST" != true ]]; then
-  if [[ "$remote_status" -eq 0 || "$KEEP_ON_FAILURE" != true ]]; then
-    destroy_guest=true
-  fi
-fi
-
-if [[ "$destroy_guest" == true ]]; then
-  say "==> destroying VM $guest_id after verified local artifact collection"
-  ssh_pve "qm stop $(printf '%q' "$guest_id") >/dev/null 2>&1 || true; qm destroy $(printf '%q' "$guest_id") --purge >/dev/null 2>&1 || true"
-else
-  if [[ "${guest_allocated:-false}" == true ]]; then
-    say "==> kept VM $guest_id for inspection"
-  fi
-fi
-
-[[ "$local_collection_ok" == true ]] || die "artifact collection failed before verified local copy; VM was left intact when allocated"
-say "==> artifacts collected in $LOCAL_OUT_DIR"
-exit "$remote_status"
+say "==> launched; connection closed. poll with:"
+say "    scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir $LOCAL_OUT_DIR"
