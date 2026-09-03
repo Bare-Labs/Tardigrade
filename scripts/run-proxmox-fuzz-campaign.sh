@@ -512,6 +512,8 @@ ssh_pve "cd $(printf '%q' "$REMOTE_STAGE") || exit 1; REMOTE_STAGE=$(printf '%q'
   printf 'PROXMOX_SSH_TARGET=%s\n' "$(printf '%q' "$PROXMOX_SSH_TARGET")"
   printf 'PROXMOX_SSH_BIND=%s\n' "$(printf '%q' "$PROXMOX_SSH_BIND")"
   printf 'TARDIGRADE_SHA=%s\n' "$(printf '%q' "$TARDIGRADE_SHA")"
+  printf 'KEEP_GUEST=%s\n' "$(printf '%q' "$KEEP_GUEST")"
+  printf 'KEEP_ON_FAILURE=%s\n' "$(printf '%q' "$KEEP_ON_FAILURE")"
   printf 'started_utc=%s\n' "$(printf '%q' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")"
 } >"$LOCAL_OUT_DIR/async.env"
 

@@ -296,11 +296,12 @@ fn expectSingleKeyShare(group: algorithms.NamedGroup, data: []const u8) Error!vo
     var r = messages.Reader{ .bytes = data };
     var shares = messages.Reader{ .bytes = try r.slice(try r.u16_()) };
     try r.expectEnd();
-    // RFC 8446 §4.1.2: after an HRR that named a group, ClientHello2's
-    // key_share must contain solely one share for that group. A list that
-    // parses cleanly but is empty, holds extra shares, names a different
-    // group, or carries an empty key_exchange is a well-formed message
-    // violating that requirement — illegal_parameter, not decode_error
+    // RFC 9846 §4.2.2 (§4.3.8 for key_share): after an HRR that named a
+    // group, ClientHello2's key_share must contain solely one share for
+    // that group. A list that parses cleanly but is empty, holds extra
+    // shares, names a different group, or carries an empty key_exchange
+    // is a well-formed message violating that requirement —
+    // illegal_parameter, not decode_error
     // (#675 campaign finding: the empty list previously surfaced as a
     // Reader underflow and was misreported as MalformedHandshake).
     // Structural truncation inside the list remains MalformedHandshake.
