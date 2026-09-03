@@ -380,8 +380,12 @@ test "fuzz: TLS protocol: transcript update select and HRR rebind sequences are 
             // Found 2026-09-01, zig build test-tls-protocol-fuzz
             // -Doptimize=ReleaseFast --fuzz=10M (#675 campaign row t1-01):
             // selectFamily on an already-active transcript must keep the first
-            // family; the fuzz model previously expected it to adopt the new one.
-            @embedFile("vectors/fuzz/transcript/781e24d2548228262b6093fbf6b719383b3c5fa1aa064b21ad9cbce2f85d1e38.bin"),
+            // family; the fuzz model previously expected it to adopt the new
+            // one. Minimized from the original 528-byte discovery input
+            // (was 781e24d2...) to 166 bytes via delta-debugging against the
+            // pre-fix model, preserving the exact "expected .sha256, found
+            // .sha384" failure.
+            @embedFile("vectors/fuzz/transcript/5f01f33d7fdcab9119a62339ac496951e958ba24d7c3a77f3093ba7e8fb66951.bin"),
         },
     });
 }
