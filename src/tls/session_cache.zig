@@ -5395,6 +5395,65 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
     expectDestroyDelta(before_destroy, 0, @intCast(remaining), 0) catch return error.ServerFuzzDestroyDelta;
 }
 
+test "dropping a stale lease's offer must not assert a reusable-then-reclassified entry is globally unpinned" {
+    // Found 2026-09-02 by the #675 campaign (test-tls-resumption-fuzz
+    // --fuzz=10M, "client session cache operation sequence" target).
+    // Reproduces the exact scenario that broke the old boolean
+    // expectClientDropOfferTransition assertion, rather than a minimized
+    // raw fuzzer input: this is a fuzz-*model* defect (see c7f5b675),
+    // and the compact hand-written scenario below documents it more
+    // durably than opaque delta-minimized Smith bytes would.
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+
+    var reusable = try makeClient(testing.allocator, "shared", "example.test");
+    defer reusable.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&reusable, 0, .reusable));
+
+    // Lease A: offered while the entry is still reusable, so its own
+    // token correctly records single_use=false — it never held a pin.
+    var lease_a = cache.lookupOffers(testCandidate("example.test"), 1);
+    defer lease_a.deinit();
+    try testing.expect(lease_a == .hit);
+    const entry_id = lease_a.hit.tokens[0].entry_id;
+    try testing.expect(!lease_a.hit.tokens[0].single_use);
+
+    // Re-storing the same ticket identity reclassifies the entry in
+    // place (storeClone's replace path keeps entry_id stable) — a
+    // reusable entry is never pinned, so its own dedup guard does not
+    // block this.
+    var reclassified = try makeClient(testing.allocator, "shared", "example.test");
+    defer reclassified.deinit();
+    try testing.expectEqual(StoreResult.replaced, cache.storeClone(&reclassified, 2, .single_use));
+
+    // Lease B: an independent, later offer of the now-single_use entry
+    // legitimately pins it under a fresh epoch.
+    var lease_b = cache.lookupOffers(testCandidate("example.test"), 3);
+    defer lease_b.deinit();
+    try testing.expect(lease_b == .hit);
+    try testing.expectEqual(entry_id, lease_b.hit.tokens[0].entry_id);
+    try testing.expect(lease_b.hit.tokens[0].single_use);
+
+    const idx = cache.findIndexByEntryId(entry_id) orelse return error.TestUnexpectedResult;
+    try testing.expect(cache.entries.items[idx].active_lease_epoch != null);
+
+    // Drive the drop through the exact same helpers
+    // runClientFuzzCase's .drop_offer case uses. Before c7f5b675,
+    // expectClientDropOfferTransition asserted this entry must show
+    // active_lease_epoch == null after the drop — lease A's own token
+    // was never single_use, so per the old boolean model dropping it
+    // could not leave anything pinned. That assertion is exactly what
+    // failed against this scenario: dropping lease A's stale offer must
+    // not disturb, or be asserted to have cleared, lease B's unrelated,
+    // still-active pin.
+    const before = try captureClientLeaseTransition(&cache, &lease_a.hit);
+    lease_a.hit.dropOffer(0);
+    try expectClientDropOfferTransition(&cache, before, 0);
+
+    const still_idx = cache.findIndexByEntryId(entry_id) orelse return error.TestUnexpectedResult;
+    try testing.expect(cache.entries.items[still_idx].active_lease_epoch != null);
+}
+
 fn fuzzClientCacheSequenceInput(_: void, smith: *std.testing.Smith) !void {
     try runClientFuzzCase(smith);
 }
@@ -5421,14 +5480,6 @@ test "fuzz: TLS resumption: client session cache operation sequence preserves tr
             &smithCorpusWords(&.{ 15, 1, 9, 15, 10, 3 }),
             &smithCorpusWords(&.{ 16, 0, 3 }),
             &smithCorpusWords(&.{ 0, 13, 0, 17 }),
-            // Found 2026-09-02, zig build test-tls-resumption-fuzz
-            // -Doptimize=ReleaseFast --fuzz=10M (#675 campaign row t1-03):
-            // "expected false, found true" (error.TestExpectedEqual) —
-            // a reusable ticket offered into two concurrent leases, then
-            // reclassified single_use via re-storage and re-pinned by a
-            // third lease, made a stale lease's drop-offer assertion
-            // wrongly claim the entry must be globally unpinned.
-            @embedFile("vectors/fuzz/session_cache/64a30c7af358736dc4ca686532bba6b95309097c147ea7beec6ee70ae4dbc561.bin"),
         },
     });
 }
