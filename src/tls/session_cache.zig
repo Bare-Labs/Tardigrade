@@ -4561,7 +4561,25 @@ fn expectServerLeaseTransition(cache: *StatefulServerCache, before: ServerLeaseT
     try testing.expectEqualDeep(before.state_fingerprint, try fingerprintServerState(&live.state));
     try testing.expectEqual(@as(?u64, null), live.active_lease_epoch);
     if (action == .commit and !before.single_use) {
-        try testing.expect(live.lru_sequence != before.lru_sequence);
+        // Not `live.lru_sequence != before.lru_sequence`: `commitLease`'s
+        // `reserveFreshLruSequenceLocked()` call can trigger
+        // `renumberLruSequencesLocked()` first (when `next_lru_sequence`
+        // has saturated to `maxInt`), which resets the whole numbering
+        // scale to `0..liveCount()-1`. The freshly reserved value this
+        // entry gets can then coincidentally equal its OWN pre-renumber
+        // `before.lru_sequence` (#675 campaign FINDING F5: e.g. 3 live
+        // entries renumbered to 0/1/2 sets next_lru_sequence=3, and the
+        // entry being committed -- whose before-snapshot happened to be
+        // lru_sequence=3 from an earlier commit -- gets freshly reserved
+        // sequence 3 right back). That coincidence doesn't mean the
+        // commit failed to advance anything: `commitLease` always assigns
+        // the value `reserveFreshLruSequenceLocked()` just returned,
+        // which is unconditionally `cache.next_lru_sequence - 1` the
+        // instant this synchronous check runs (nothing else can reserve a
+        // sequence in between in this single-threaded fuzz model) --
+        // checking that directly is robust across a renumber and is what
+        // "this entry is now the freshest" actually means.
+        try testing.expectEqual(cache.next_lru_sequence - 1, live.lru_sequence);
     } else {
         try testing.expectEqual(before.lru_sequence, live.lru_sequence);
     }
@@ -5507,6 +5525,14 @@ test "fuzz: TLS resumption: stateful server cache operation sequence preserves t
             &smithCorpusWords(&.{ 20, 0 }),
             &smithCorpusWords(&.{ 4, 0, 4, 1, 4, 2, 4, 3 }),
             &smithCorpusWords(&.{ 0, 12, 0, 21 }),
+            // FINDING F5 (#675 campaign): insert 3 reusable entries, force
+            // `next_lru_sequence` to `maxInt` and drive a rejected insert
+            // (words 22, 20 select `.force_lru_renumber` then an oversized
+            // state), then commit-lease an entry whose pre-renumber
+            // `lru_sequence` coincidentally equals the post-renumber live
+            // count -- see `expectServerLeaseTransition`'s comment above
+            // for the exact collision this exercises.
+            &smithCorpusWords(&.{ 0, 1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18, 20, 6, 20, 9, 0 }),
         },
     });
 }
