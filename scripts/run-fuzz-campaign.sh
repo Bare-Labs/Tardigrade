@@ -514,6 +514,14 @@ run_one_attempt() {
   crash_snapshots_dir="$run_dir/crash-snapshots"
   mkdir -p "$crash_snapshots_dir"
   crash_file=".zig-cache/f/crash"
+  # A crash file left over from an earlier attempt (a retry reusing
+  # .zig-cache, or a kept failed VM) must not be attributed to THIS
+  # attempt: starting the watcher before the new Zig process means it
+  # would otherwise hash/copy that stale file on its very first poll and
+  # force an otherwise-clean target to status=fail. Clearing it here
+  # (after the PREVIOUS attempt already preserved whatever it needed)
+  # makes any later appearance at this path unambiguously this attempt's.
+  rm -f "$crash_file"
   crash_watch_last_hash=""
   snapshot_new_crashes() {
     local h next idx test_name
@@ -532,11 +540,23 @@ run_one_attempt() {
     printf '%s\n' "${test_name:-$target}" >"$crash_snapshots_dir/$idx.test-name.txt"
     return 0
   }
+  # crash_watch_last_hash is a plain shell variable, not a file: the loop
+  # below runs in a backgrounded subshell (a separate process), so its
+  # updates to that variable are invisible to this parent shell. Calling
+  # snapshot_new_crashes a second time from the parent after the
+  # subshell exits would see the parent's original (empty) hash and
+  # treat an already-captured crash as new again, writing a duplicate
+  # snapshot/finding for the same crash. The fix is to never call it
+  # from two different processes: the loop checks the stop flag AFTER
+  # each snapshot attempt (not before), so stopping it still guarantees
+  # one last check happens -- inside the same process that owns the
+  # hash state -- instead of needing a separate final call out here.
   crash_watch_stop="$run_dir/.crash-watch-stop"
   rm -f "$crash_watch_stop"
   (
-    while [[ ! -f "$crash_watch_stop" ]]; do
+    while :; do
       snapshot_new_crashes
+      [[ -f "$crash_watch_stop" ]] && break
       sleep 0.1
     done
   ) &
@@ -584,7 +604,6 @@ run_one_attempt() {
   trap - INT TERM
 
   touch "$crash_watch_stop"
-  snapshot_new_crashes
   wait "$crash_watcher_pid" 2>/dev/null || true
   rm -f "$crash_watch_stop"
 
