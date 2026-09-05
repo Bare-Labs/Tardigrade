@@ -556,7 +556,17 @@ run_one_attempt() {
   (
     while :; do
       snapshot_new_crashes
-      [[ -f "$crash_watch_stop" ]] && break
+      if [[ -f "$crash_watch_stop" ]]; then
+        # The child could have written its final crash file and exited
+        # in the narrow gap between the poll just above returning and
+        # this check running (stop is only set after the child has
+        # already exited, so that write, if any, is already complete on
+        # disk by now) -- one more poll before exiting guarantees it
+        # isn't missed rather than relying on the 0.1s sleep window
+        # below to have already covered it.
+        snapshot_new_crashes
+        break
+      fi
       sleep 0.1
     done
   ) &
