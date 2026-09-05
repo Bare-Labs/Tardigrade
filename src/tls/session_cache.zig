@@ -5525,16 +5525,89 @@ test "fuzz: TLS resumption: stateful server cache operation sequence preserves t
             &smithCorpusWords(&.{ 20, 0 }),
             &smithCorpusWords(&.{ 4, 0, 4, 1, 4, 2, 4, 3 }),
             &smithCorpusWords(&.{ 0, 12, 0, 21 }),
-            // FINDING F5 (#675 campaign): insert 3 reusable entries, force
-            // `next_lru_sequence` to `maxInt` and drive a rejected insert
-            // (words 22, 20 select `.force_lru_renumber` then an oversized
-            // state), then commit-lease an entry whose pre-renumber
-            // `lru_sequence` coincidentally equals the post-renumber live
-            // count -- see `expectServerLeaseTransition`'s comment above
-            // for the exact collision this exercises.
-            &smithCorpusWords(&.{ 0, 1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18, 20, 6, 20, 9, 0 }),
         },
     });
+}
+
+test "server LRU freshest-sequence check holds across a saturation-forced renumber (#675 campaign FINDING F5)" {
+    // FINDING F5: `commitLease`'s `reserveFreshLruSequenceLocked()` call
+    // can trigger `renumberLruSequencesLocked()` when `next_lru_sequence`
+    // has saturated to `maxInt(u64)` (forced here directly, exactly like
+    // the fuzz model's `.force_lru_renumber` op does to probe the
+    // boundary). Renumbering compacts every live entry into
+    // `0..liveCount()-1` and sets `next_lru_sequence` to that count. The
+    // freshly reserved value the entry being committed gets can then
+    // coincidentally equal its own PRE-renumber `lru_sequence` -- a
+    // numeric collision between two independently-scaled values, not a
+    // failure to advance anything -- which the old
+    // `live.lru_sequence != before.lru_sequence` check mistook for one.
+    // Reproduced directly (no raw fuzz bytes) with 3 live entries and an
+    // entry whose earlier commit happened to land on sequence 3, which a
+    // rejected insert (capacity) then a second commit of that same entry
+    // reproduces exactly: 3 live entries renumber to 0/1/2,
+    // next_lru_sequence becomes 3, and the entry gets that freshly
+    // reserved 3 right back.
+    var probe = try fuzzServerState(testing.allocator, 0);
+    defer probe.deinit();
+    var limits = Limits.stateful_server_default;
+    limits.max_entry_bytes = serverAccountedBytes(&probe) + 4;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var handle_a: [stateful_identity_len]u8 = undefined;
+    var handle_b: [stateful_identity_len]u8 = undefined;
+    var handle_c: [stateful_identity_len]u8 = undefined;
+
+    var state_a = try fuzzServerState(testing.allocator, 0);
+    defer state_a.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&state_a, 0, .reusable, &handle_a));
+    var state_b = try fuzzServerState(testing.allocator, 1);
+    defer state_b.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&state_b, 0, .reusable, &handle_b));
+    var state_c = try fuzzServerState(testing.allocator, 2);
+    defer state_c.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&state_c, 0, .reusable, &handle_c));
+
+    // A, B, C consumed fresh sequences 0, 1, 2 at insert time.
+    try testing.expectEqual(@as(u64, 3), cache.next_lru_sequence);
+
+    // Commit A once: it's handed the next fresh sequence, 3.
+    {
+        var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handle_a, 1);
+        defer result.deinit();
+        try testing.expect(result.hit.on_selected != null);
+        result.hit.on_selected.?.complete();
+    }
+    try testing.expectEqual(@as(u64, 4), cache.next_lru_sequence);
+
+    // Force the saturation boundary the fuzz model's .force_lru_renumber
+    // probes.
+    cache.next_lru_sequence = std.math.maxInt(u64);
+
+    // A rejected insert (state too large for this cache's limits) must
+    // not touch next_lru_sequence -- pin that assumption explicitly so a
+    // future change to insertMove's rejection path that broke it would
+    // fail loudly here instead of silently invalidating the rest of this
+    // test.
+    var oversized = try fuzzServerStateWithCompat(testing.allocator, 3);
+    defer oversized.deinit();
+    var discard_handle: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.rejected_capacity, cache.insertMove(&oversized, 0, .reusable, &discard_handle));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), cache.next_lru_sequence);
+
+    // Commit A again. `before`'s captured lru_sequence is its stale
+    // pre-renumber value (3); completing the hook renumbers the 3 live
+    // entries to 0/1/2, sets next_lru_sequence=3, and hands A that
+    // freshly reserved 3 right back -- the exact collision.
+    const before = try captureServerHandleTransition(&cache, &handle_a);
+    try testing.expectEqual(@as(u64, 3), before.lru_sequence);
+    {
+        var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handle_a, 2);
+        defer result.deinit();
+        try testing.expect(result.hit.on_selected != null);
+        result.hit.on_selected.?.complete();
+    }
+    try expectServerLeaseTransition(&cache, before, .commit);
 }
 
 test "resolveStatefulServerPsk lease-box OOM releases an acquired single-use pin and permits retry" {
