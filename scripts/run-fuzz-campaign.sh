@@ -474,7 +474,8 @@ append_manifest_line() {
 run_one_attempt() {
   local target="$1"
   local filter="$target"
-  local run_key="${family}__$(slugify "$target")__${budget}"
+  local run_key
+  run_key="${family}__$(slugify "$target")__${budget}"
 
   if $resume && resume_has_pass "$manifest" "$head_sha" "$step" "$filter" "$budget_mutations"; then
     say "==> resume: existing same-SHA pass satisfies $family $filter >= $budget"
