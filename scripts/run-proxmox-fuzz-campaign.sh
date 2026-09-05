@@ -155,6 +155,18 @@ ssh_pve() {
 }
 scp_to_pve() { scp "${scp_opts[@]}" "$1" "${PROXMOX_SSH_TARGET}:$2"; }
 scp_from_pve() { scp "${scp_opts[@]}" "${PROXMOX_SSH_TARGET}:$1" "$2"; }
+# Large pulls (the multi-hundred-MB fuzz artifact tarball) over a link that
+# resets mid-transfer need rsync's --partial resume, not scp: an interrupted
+# scp of a 500MB+ tarball starts over from zero every retry and can fail
+# indefinitely on a flaky link, while rsync picks up where it left off
+# (#675 campaign finding: a raw scp of the same tarball reset twice in a
+# row after 26+ minutes at 270/544MB; rsync --partial completed the
+# identical transfer in ~14 minutes on the same link).
+rsync_from_pve() {
+  local ssh_cmd="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
+  [[ -n "$PROXMOX_SSH_BIND" ]] && ssh_cmd+=" -b $(printf '%q' "$PROXMOX_SSH_BIND")"
+  rsync -e "$ssh_cmd" --partial "${PROXMOX_SSH_TARGET}:$1" "$2"
+}
 write_param() { printf '%s=' "$1" >>"$params_file"; printf '%q\n' "$2" >>"$params_file"; }
 
 if [[ "$MODE" == "collect" ]]; then
@@ -184,7 +196,12 @@ if [[ "$MODE" == "collect" ]]; then
   metadata_tgz="$LOCAL_OUT_DIR/proxmox-metadata.tgz"
   remote_state_file="$LOCAL_OUT_DIR/guest-state.env"
 
-  rm -f "$artifact_tgz" "$metadata_tgz" "$remote_state_file"
+  # Deliberately NOT removing $artifact_tgz here: it's the one large
+  # (multi-hundred-MB) pull, and rsync's --partial (see rsync_from_pve)
+  # only has something to resume from if a prior --collect attempt's
+  # partial download survives to the next one on the same flaky link
+  # (#675 campaign finding).
+  rm -f "$metadata_tgz" "$remote_state_file"
   scp_from_pve "$REMOTE_STAGE/guest-state.env" "$remote_state_file"
   guest_id=""
   guest_allocated=false
@@ -196,7 +213,7 @@ if [[ "$MODE" == "collect" ]]; then
 
   local_collection_ok=false
   if [[ "${guest_allocated:-false}" == true && "${guest_reachable:-false}" == true ]]; then
-    if scp_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
+    if rsync_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
       scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$metadata_tgz" &&
       [[ -s "$artifact_tgz" ]] &&
       tar -tzf "$artifact_tgz" >/dev/null &&

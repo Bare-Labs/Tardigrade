@@ -53,6 +53,7 @@ benchmarks/results/
 benchmarks/baselines/
 docs/evidence/
 benchmarks/competitive/results/
+log*.txt
 
 # #675 fuzz campaign evidence and cross-agent coordination notes — local-only,
 # multi-GB (VM source tarballs, crash inputs, logs); never committed.
