@@ -214,28 +214,39 @@ const BufferQueue = enum {
 fn PlaintextProvenanceQueue(comptime capacity: usize) type {
     return struct {
         buf: [capacity]bool = [_]bool{false} ** capacity,
+        // See ByteQueue's `head` for why: this keeps `discard` O(1) instead
+        // of O(remaining) per call, deferring the shift to `append` and
+        // only when the tail genuinely has no room left.
+        head: usize = 0,
         len: usize = 0,
 
         const Self = @This();
 
         fn append(self: *Self, byte_len: usize, transport_early: bool) Error!void {
             if (byte_len > self.available()) return error.PlaintextBufferFull;
-            @memset(self.buf[self.len..][0..byte_len], transport_early);
+            if (self.head + self.len + byte_len > capacity) {
+                std.mem.copyForwards(bool, self.buf[0..self.len], self.buf[self.head..][0..self.len]);
+                self.head = 0;
+            }
+            @memset(self.buf[self.head + self.len ..][0..byte_len], transport_early);
             self.len += byte_len;
         }
 
         fn discard(self: *Self, byte_len: usize) usize {
             const n = @min(byte_len, self.len);
             var early_prefix_len: usize = 0;
-            while (early_prefix_len < n and self.buf[early_prefix_len]) {
+            while (early_prefix_len < n and self.buf[self.head + early_prefix_len]) {
                 early_prefix_len += 1;
             }
-            const old_len = self.len;
-            const remaining = old_len - n;
-            std.mem.copyForwards(bool, self.buf[0..remaining], self.buf[n..old_len]);
-            @memset(self.buf[remaining..old_len], false);
-            self.len = remaining;
+            @memset(self.buf[self.head..][0..n], false);
+            self.head += n;
+            self.len -= n;
+            if (self.len == 0) self.head = 0;
             return early_prefix_len;
+        }
+
+        fn slice(self: *const Self) []const bool {
+            return self.buf[self.head..][0..self.len];
         }
 
         fn available(self: *const Self) usize {
@@ -243,7 +254,8 @@ fn PlaintextProvenanceQueue(comptime capacity: usize) type {
         }
 
         fn clear(self: *Self) void {
-            @memset(self.buf[0..self.len], false);
+            @memset(self.buf[0..], false);
+            self.head = 0;
             self.len = 0;
         }
     };
@@ -2148,13 +2160,24 @@ const pure_zig_record_vtable = EncryptedStream.VTable{
 fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
     return struct {
         buf: [capacity]u8 = undefined,
+        // `buf[head..][0..len]` is the valid region. `discard` used to
+        // shift that whole region down to index 0 on every call, making a
+        // partial-read drain of a full queue O(capacity) per call instead
+        // of per drain. Tracking `head` instead makes `discard` O(1); the
+        // shift is deferred to `append`, and only actually happens when
+        // the tail genuinely has no room left (#675 campaign finding).
+        head: usize = 0,
         len: usize = 0,
 
         const Self = @This();
 
         fn append(self: *Self, bytes: []const u8) Error!void {
             if (bytes.len > self.available()) return full_error;
-            @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+            if (self.head + self.len + bytes.len > capacity) {
+                std.mem.copyForwards(u8, self.buf[0..self.len], self.buf[self.head..][0..self.len]);
+                self.head = 0;
+            }
+            @memcpy(self.buf[self.head + self.len ..][0..bytes.len], bytes);
             self.len += bytes.len;
         }
 
@@ -2162,22 +2185,21 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
             if (self.len == 0) return null;
             const n = @min(out.len, self.len);
             if (n == 0) return 0;
-            @memcpy(out[0..n], self.buf[0..n]);
+            @memcpy(out[0..n], self.buf[self.head..][0..n]);
             self.discard(n) catch unreachable;
             return n;
         }
 
         fn slice(self: *const Self) []const u8 {
-            return self.buf[0..self.len];
+            return self.buf[self.head..][0..self.len];
         }
 
         fn discard(self: *Self, count: usize) Error!void {
             if (count > self.len) return error.WouldBlock;
-            const old_len = self.len;
-            const remaining = old_len - count;
-            std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[count..old_len]);
-            @memset(self.buf[remaining..old_len], 0);
-            self.len = remaining;
+            @memset(self.buf[self.head..][0..count], 0);
+            self.head += count;
+            self.len -= count;
+            if (self.len == 0) self.head = 0;
         }
 
         fn available(self: *const Self) usize {
@@ -2186,6 +2208,7 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
 
         fn clear(self: *Self) void {
             @memset(self.buf[0..], 0);
+            self.head = 0;
             self.len = 0;
         }
     };
@@ -3096,7 +3119,10 @@ test "byte queues wipe discarded and cleared storage" {
     try queue.append("secret");
     try queue.discard(3);
     try testing.expectEqualStrings("ret", queue.slice());
-    try testing.expect(std.mem.allEqual(u8, queue.buf[3..6], 0));
+    // The discarded "sec" prefix is wiped in place at its original offset
+    // (head now points past it into the still-live "ret"); nothing is
+    // shifted down until an append actually needs the reclaimed room.
+    try testing.expect(std.mem.allEqual(u8, queue.buf[0..3], 0));
 
     queue.clear();
     try testing.expectEqual(@as(usize, 0), queue.len);
@@ -6242,7 +6268,7 @@ fn cleanupTeardownCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, s
     // negation of the post-teardown check.
     try testing.expect(!std.mem.allEqual(
         bool,
-        subject.inbound_plaintext_provenance.buf[0..subject.inbound_plaintext_provenance.len],
+        subject.inbound_plaintext_provenance.slice(),
         false,
     ));
     try testing.expect(subject.inbound_handshake.len > 0);
