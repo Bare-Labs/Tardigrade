@@ -2511,6 +2511,7 @@ test "fuzz: H3 connection state command sequences preserve critical stream and r
         "\x06\x07\x08\x09",
         "\x0a\x0b\x0c\x0d",
         "\x0e\x0f\x10\x11",
+        "\x0c\x00\x00\x00\x1b\x64\x79\xb0\xa6\x0d\x4a\x76\x4a\xf7\xa1\x8e",
     } });
 }
 
@@ -2701,8 +2702,16 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
             21 => blk: {
                 if (role == .server) {
                     const id = peer_request orelse try peer_transport.openStream(.bidi);
-                    peer_request = id;
                     try local_transport.resetStreamForTest(id);
+                    // A reset stream id is dead forever (RFC 9000 stream ids
+                    // are never reused); forgetting it here mirrors the
+                    // connection's own bookkeeping, which no longer tracks
+                    // this id past this pump() call. Leaving `peer_request`
+                    // pointing at it made later ops reuse a stream the
+                    // connection has already discarded, so the harness
+                    // expected reactions (e.g. op 13's message_error) that
+                    // conn had no way to produce (#675 campaign finding).
+                    peer_request = null;
                 }
                 break :blk conn.pump(&local_transport);
             },
